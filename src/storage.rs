@@ -1,6 +1,6 @@
 use crate::ast::{
-    BinaryOperator, ColumnConstraint, DataType, Expr, Ident, Literal, ObjectName, TableConstraint,
-    UnaryOperator,
+    BinaryOperator, ColumnConstraint, DataType, Expr, Ident, IndexedColumn, Literal, ObjectName,
+    SortOrder, TableConstraint, UnaryOperator,
 };
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -10,7 +10,7 @@ const PAGE_SIZE: usize = 4096;
 const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
-const CATALOG_FORMAT_VERSION: u32 = 1;
+const CATALOG_FORMAT_VERSION: u32 = 2;
 const HEADER_PAGE_SIZE_OFFSET: usize = 8;
 const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
 const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
@@ -38,6 +38,16 @@ pub struct TableMeta {
     pub name: String,
     pub columns: Vec<Column>,
     pub constraints: Vec<TableConstraint>,
+    pub first_page: u32,
+    pub last_page: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexMeta {
+    pub name: String,
+    pub table: String,
+    pub columns: Vec<IndexedColumn>,
+    pub unique: bool,
     pub first_page: u32,
     pub last_page: u32,
 }
@@ -80,6 +90,7 @@ pub struct StorageEngine {
     schema_version: u32,
     catalog_format_version: u32,
     tables: HashMap<String, TableMeta>,
+    indexes: HashMap<String, IndexMeta>,
 }
 
 impl StorageEngine {
@@ -93,6 +104,7 @@ impl StorageEngine {
             schema_version: 0,
             catalog_format_version: CATALOG_FORMAT_VERSION,
             tables: HashMap::new(),
+            indexes: HashMap::new(),
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -118,26 +130,37 @@ impl StorageEngine {
         let mut header = vec![0; PAGE_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header)?;
-        let (next_page_id, schema_version, catalog_format_version, tables) =
+        let (next_page_id, schema_version, catalog_format_version, tables, indexes) =
             if header.starts_with(&FILE_MAGIC) {
                 let next_page_id = read_u32(&header, HEADER_NEXT_PAGE_ID_OFFSET);
                 let schema_version = read_u32(&header, HEADER_SCHEMA_VERSION_OFFSET);
                 let loaded_format_version = read_u32(&header, HEADER_CATALOG_FORMAT_OFFSET);
-                let tables =
+                let (tables, indexes) =
                     load_catalog_from_file(&mut file, next_page_id, loaded_format_version)?;
-                let catalog_format_version = if loaded_format_version == 0 {
-                    CATALOG_FORMAT_VERSION
+                let mut catalog_format_version = if loaded_format_version == 0 {
+                    1
                 } else {
                     loaded_format_version
                 };
-                (next_page_id, schema_version, catalog_format_version, tables)
+                if catalog_format_version < CATALOG_FORMAT_VERSION {
+                    catalog_format_version = CATALOG_FORMAT_VERSION;
+                }
+                (
+                    next_page_id,
+                    schema_version,
+                    catalog_format_version,
+                    tables,
+                    indexes,
+                )
         } else {
             let tables = HashMap::new();
+            let indexes = HashMap::new();
             (
                 CATALOG_PAGE_ID + 1,
                 0,
                 CATALOG_FORMAT_VERSION,
                 tables,
+                indexes,
             )
         };
 
@@ -147,6 +170,7 @@ impl StorageEngine {
             schema_version,
             catalog_format_version,
             tables,
+            indexes,
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -169,6 +193,7 @@ impl StorageEngine {
         if self.tables.remove(name).is_none() {
             return Err(StorageError::NotFound(format!("table not found: {}", name)));
         }
+        self.indexes.retain(|_, index| index.table != name);
         self.write_catalog()?;
         self.bump_schema_version()
     }
@@ -177,10 +202,20 @@ impl StorageEngine {
         self.tables.get(name)
     }
 
+    pub fn get_index(&self, name: &str) -> Option<&IndexMeta> {
+        self.indexes.get(name)
+    }
+
     pub fn list_tables(&self) -> Vec<TableMeta> {
         let mut tables: Vec<TableMeta> = self.tables.values().cloned().collect();
         tables.sort_by(|a, b| a.name.cmp(&b.name));
         tables
+    }
+
+    pub fn list_indexes(&self) -> Vec<IndexMeta> {
+        let mut indexes: Vec<IndexMeta> = self.indexes.values().cloned().collect();
+        indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        indexes
     }
 
     pub fn schema_version(&self) -> u32 {
@@ -212,6 +247,26 @@ impl StorageEngine {
         self.write_page(page_id, &page)?;
         self.write_catalog()?;
         Ok(())
+    }
+
+    pub fn create_index(&mut self, index: IndexMeta) -> Result<(), StorageError> {
+        if self.indexes.contains_key(&index.name) {
+            return Err(StorageError::Invalid(format!(
+                "index already exists: {}",
+                index.name
+            )));
+        }
+        self.indexes.insert(index.name.clone(), index);
+        self.write_catalog()?;
+        self.bump_schema_version()
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> Result<(), StorageError> {
+        if self.indexes.remove(name).is_none() {
+            return Err(StorageError::NotFound(format!("index not found: {}", name)));
+        }
+        self.write_catalog()?;
+        self.bump_schema_version()
     }
 
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Vec<Value>>, StorageError> {
@@ -298,8 +353,23 @@ impl StorageEngine {
     fn write_catalog(&mut self) -> Result<(), StorageError> {
         let mut page = init_data_page();
         for table in self.tables.values() {
-            let encoded = encode_table_meta(table)?;
-            insert_record(&mut page, &encoded)?;
+            if self.catalog_format_version >= 2 {
+                let mut encoded = Vec::new();
+                encoded.push(1);
+                encoded.extend_from_slice(&encode_table_meta(table)?);
+                insert_record(&mut page, &encoded)?;
+            } else {
+                let encoded = encode_table_meta(table)?;
+                insert_record(&mut page, &encoded)?;
+            }
+        }
+        if self.catalog_format_version >= 2 {
+            for index in self.indexes.values() {
+                let mut encoded = Vec::new();
+                encoded.push(2);
+                encoded.extend_from_slice(&encode_index_meta(index)?);
+                insert_record(&mut page, &encoded)?;
+            }
         }
         self.write_page(CATALOG_PAGE_ID, &page)
     }
@@ -314,23 +384,46 @@ fn load_catalog_from_file(
     file: &mut File,
     next_page_id: u32,
     format_version: u32,
-) -> Result<HashMap<String, TableMeta>, StorageError> {
+) -> Result<(HashMap<String, TableMeta>, HashMap<String, IndexMeta>), StorageError> {
     let mut page = vec![0; PAGE_SIZE];
     file.seek(SeekFrom::Start(CATALOG_PAGE_ID as u64 * PAGE_SIZE as u64))?;
     file.read_exact(&mut page)?;
     let mut tables = HashMap::new();
+    let mut indexes = HashMap::new();
     for record in read_records(&page) {
-        let table = if format_version == 0 {
-            decode_table_meta_v0(&record)?
+        if format_version >= 2 {
+            if record.is_empty() {
+                return Err(StorageError::Corrupt("empty catalog record".to_string()));
+            }
+            match record[0] {
+                1 => {
+                    let table = decode_table_meta(&record[1..])?;
+                    tables.insert(table.name.clone(), table);
+                }
+                2 => {
+                    let index = decode_index_meta(&record[1..])?;
+                    indexes.insert(index.name.clone(), index);
+                }
+                tag => {
+                    return Err(StorageError::Corrupt(format!(
+                        "unknown catalog record tag {}",
+                        tag
+                    )))
+                }
+            }
         } else {
-            decode_table_meta(&record)?
-        };
-        tables.insert(table.name.clone(), table);
+            let table = if format_version == 0 {
+                decode_table_meta_v0(&record)?
+            } else {
+                decode_table_meta(&record)?
+            };
+            tables.insert(table.name.clone(), table);
+        }
     }
     if next_page_id == 0 {
         return Err(StorageError::Corrupt("invalid next page id".to_string()));
     }
-    Ok(tables)
+    Ok((tables, indexes))
 }
 
 fn init_data_page() -> Vec<u8> {
@@ -1362,6 +1455,115 @@ fn decode_table_meta_v0(record: &[u8]) -> Result<TableMeta, StorageError> {
         name,
         columns,
         constraints: Vec::new(),
+        first_page,
+        last_page,
+    })
+}
+
+fn encode_indexed_column(column: &IndexedColumn, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    encode_ident(&column.name, buf)?;
+    let tag = match column.order {
+        None => 0,
+        Some(SortOrder::Asc) => 1,
+        Some(SortOrder::Desc) => 2,
+    };
+    buf.push(tag);
+    Ok(())
+}
+
+fn decode_indexed_column(record: &[u8], pos: usize) -> Result<(IndexedColumn, usize), StorageError> {
+    let (name, mut cursor) = decode_ident(record, pos)?;
+    if cursor >= record.len() {
+        return Err(StorageError::Corrupt("invalid indexed column".to_string()));
+    }
+    let order = match record[cursor] {
+        0 => None,
+        1 => Some(SortOrder::Asc),
+        2 => Some(SortOrder::Desc),
+        tag => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown sort order tag {}",
+                tag
+            )))
+        }
+    };
+    cursor += 1;
+    Ok((IndexedColumn { name, order }, cursor))
+}
+
+fn encode_index_meta(index: &IndexMeta) -> Result<Vec<u8>, StorageError> {
+    let mut buf = Vec::new();
+    if index.name.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("index name too long".to_string()));
+    }
+    buf.extend_from_slice(&(index.name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(index.name.as_bytes());
+    if index.table.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("table name too long".to_string()));
+    }
+    buf.extend_from_slice(&(index.table.len() as u16).to_le_bytes());
+    buf.extend_from_slice(index.table.as_bytes());
+    buf.push(if index.unique { 1 } else { 0 });
+    if index.columns.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many index columns".to_string()));
+    }
+    buf.extend_from_slice(&(index.columns.len() as u16).to_le_bytes());
+    for column in &index.columns {
+        encode_indexed_column(column, &mut buf)?;
+    }
+    buf.extend_from_slice(&index.first_page.to_le_bytes());
+    buf.extend_from_slice(&index.last_page.to_le_bytes());
+    Ok(buf)
+}
+
+fn decode_index_meta(record: &[u8]) -> Result<IndexMeta, StorageError> {
+    let mut pos = 0;
+    if record.len() < 2 {
+        return Err(StorageError::Corrupt("invalid index meta".to_string()));
+    }
+    let name_len = read_u16(record, pos) as usize;
+    pos += 2;
+    if pos + name_len > record.len() {
+        return Err(StorageError::Corrupt("invalid index name".to_string()));
+    }
+    let name = String::from_utf8_lossy(&record[pos..pos + name_len]).to_string();
+    pos += name_len;
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid index table".to_string()));
+    }
+    let table_len = read_u16(record, pos) as usize;
+    pos += 2;
+    if pos + table_len > record.len() {
+        return Err(StorageError::Corrupt("invalid index table".to_string()));
+    }
+    let table = String::from_utf8_lossy(&record[pos..pos + table_len]).to_string();
+    pos += table_len;
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid index uniqueness".to_string()));
+    }
+    let unique = record[pos] != 0;
+    pos += 1;
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid index columns".to_string()));
+    }
+    let column_count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut columns = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        let (column, new_pos) = decode_indexed_column(record, pos)?;
+        pos = new_pos;
+        columns.push(column);
+    }
+    if pos + 8 > record.len() {
+        return Err(StorageError::Corrupt("invalid index pages".to_string()));
+    }
+    let first_page = read_u32(record, pos);
+    let last_page = read_u32(record, pos + 4);
+    Ok(IndexMeta {
+        name,
+        table,
+        columns,
+        unique,
         first_page,
         last_page,
     })

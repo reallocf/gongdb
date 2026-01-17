@@ -2,7 +2,7 @@ use crate::ast::{
     BinaryOperator, ColumnDef, DataType, Expr, Ident, InsertSource, Select, SelectItem, Statement,
 };
 use crate::parser;
-use crate::storage::{Column, StorageEngine, StorageError, TableMeta, Value};
+use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value};
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
 use std::collections::HashMap;
@@ -77,6 +77,59 @@ impl GongDB {
                         last_page: first_page,
                     };
                     self.storage.create_table(meta)?;
+                }
+                Ok(DBOutput::StatementComplete(0))
+            }
+            Statement::CreateIndex(create) => {
+                let index_name = object_name(&create.name);
+                if self.storage.get_index(&index_name).is_some() && !create.if_not_exists {
+                    return Err(GongDBError::new(format!(
+                        "index already exists: {}",
+                        index_name
+                    )));
+                }
+                let table_name = object_name(&create.table);
+                let table = self
+                    .storage
+                    .get_table(&table_name)
+                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .clone();
+                for column in &create.columns {
+                    let exists = table.columns.iter().any(|c| {
+                        c.name
+                            .eq_ignore_ascii_case(&column.name.value)
+                    });
+                    if !exists {
+                        return Err(GongDBError::new(format!(
+                            "unknown column {}",
+                            column.name.value
+                        )));
+                    }
+                }
+                if self.storage.get_index(&index_name).is_none() {
+                    let first_page = self.storage.allocate_data_page()?;
+                    let meta = IndexMeta {
+                        name: index_name.clone(),
+                        table: table_name,
+                        columns: create.columns,
+                        unique: create.unique,
+                        first_page,
+                        last_page: first_page,
+                    };
+                    self.storage.create_index(meta)?;
+                }
+                Ok(DBOutput::StatementComplete(0))
+            }
+            Statement::DropIndex(drop) => {
+                let name = object_name(&drop.name);
+                if self.storage.get_index(&name).is_none() && !drop.if_exists {
+                    return Err(GongDBError::new(format!(
+                        "index not found: {}",
+                        name
+                    )));
+                }
+                if self.storage.get_index(&name).is_some() {
+                    self.storage.drop_index(&name)?;
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
