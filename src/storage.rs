@@ -1,4 +1,7 @@
-use crate::ast::DataType;
+use crate::ast::{
+    BinaryOperator, ColumnConstraint, DataType, Expr, Ident, Literal, ObjectName, TableConstraint,
+    UnaryOperator,
+};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -7,6 +10,12 @@ const PAGE_SIZE: usize = 4096;
 const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
+const CATALOG_FORMAT_VERSION: u32 = 1;
+const HEADER_PAGE_SIZE_OFFSET: usize = 8;
+const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
+const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
+const HEADER_SCHEMA_VERSION_OFFSET: usize = 20;
+const HEADER_CATALOG_FORMAT_OFFSET: usize = 24;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -20,12 +29,14 @@ pub enum Value {
 pub struct Column {
     pub name: String,
     pub data_type: DataType,
+    pub constraints: Vec<ColumnConstraint>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TableMeta {
     pub name: String,
     pub columns: Vec<Column>,
+    pub constraints: Vec<TableConstraint>,
     pub first_page: u32,
     pub last_page: u32,
 }
@@ -65,6 +76,8 @@ enum StorageMode {
 pub struct StorageEngine {
     mode: StorageMode,
     next_page_id: u32,
+    schema_version: u32,
+    catalog_format_version: u32,
     tables: HashMap<String, TableMeta>,
 }
 
@@ -76,6 +89,8 @@ impl StorageEngine {
         let mut engine = StorageEngine {
             mode: StorageMode::InMemory { pages },
             next_page_id: CATALOG_PAGE_ID + 1,
+            schema_version: 0,
+            catalog_format_version: CATALOG_FORMAT_VERSION,
             tables: HashMap::new(),
         };
         engine.write_header()?;
@@ -102,18 +117,34 @@ impl StorageEngine {
         let mut header = vec![0; PAGE_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header)?;
-        let (next_page_id, tables) = if header.starts_with(&FILE_MAGIC) {
-            let next_page_id = read_u32(&header, 12);
-            let tables = load_catalog_from_file(&mut file, next_page_id)?;
-            (next_page_id, tables)
+        let (next_page_id, schema_version, catalog_format_version, tables) =
+            if header.starts_with(&FILE_MAGIC) {
+                let next_page_id = read_u32(&header, HEADER_NEXT_PAGE_ID_OFFSET);
+                let schema_version = read_u32(&header, HEADER_SCHEMA_VERSION_OFFSET);
+                let loaded_format_version = read_u32(&header, HEADER_CATALOG_FORMAT_OFFSET);
+                let tables =
+                    load_catalog_from_file(&mut file, next_page_id, loaded_format_version)?;
+                let catalog_format_version = if loaded_format_version == 0 {
+                    CATALOG_FORMAT_VERSION
+                } else {
+                    loaded_format_version
+                };
+                (next_page_id, schema_version, catalog_format_version, tables)
         } else {
             let tables = HashMap::new();
-            (CATALOG_PAGE_ID + 1, tables)
+            (
+                CATALOG_PAGE_ID + 1,
+                0,
+                CATALOG_FORMAT_VERSION,
+                tables,
+            )
         };
 
         let mut engine = StorageEngine {
             mode: StorageMode::OnDisk { file },
             next_page_id,
+            schema_version,
+            catalog_format_version,
             tables,
         };
         engine.write_header()?;
@@ -129,18 +160,30 @@ impl StorageEngine {
             )));
         }
         self.tables.insert(table.name.clone(), table);
-        self.write_catalog()
+        self.write_catalog()?;
+        self.bump_schema_version()
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<(), StorageError> {
         if self.tables.remove(name).is_none() {
             return Err(StorageError::NotFound(format!("table not found: {}", name)));
         }
-        self.write_catalog()
+        self.write_catalog()?;
+        self.bump_schema_version()
     }
 
     pub fn get_table(&self, name: &str) -> Option<&TableMeta> {
         self.tables.get(name)
+    }
+
+    pub fn list_tables(&self) -> Vec<TableMeta> {
+        let mut tables: Vec<TableMeta> = self.tables.values().cloned().collect();
+        tables.sort_by(|a, b| a.name.cmp(&b.name));
+        tables
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
     }
 
     pub fn insert_row(&mut self, table_name: &str, row: &[Value]) -> Result<(), StorageError> {
@@ -239,9 +282,15 @@ impl StorageEngine {
     fn write_header(&mut self) -> Result<(), StorageError> {
         let mut header = vec![0; PAGE_SIZE];
         header[..8].copy_from_slice(&FILE_MAGIC);
-        write_u32(&mut header, 8, PAGE_SIZE as u32);
-        write_u32(&mut header, 12, self.next_page_id);
-        write_u32(&mut header, 16, CATALOG_PAGE_ID);
+        write_u32(&mut header, HEADER_PAGE_SIZE_OFFSET, PAGE_SIZE as u32);
+        write_u32(&mut header, HEADER_NEXT_PAGE_ID_OFFSET, self.next_page_id);
+        write_u32(&mut header, HEADER_CATALOG_PAGE_ID_OFFSET, CATALOG_PAGE_ID);
+        write_u32(&mut header, HEADER_SCHEMA_VERSION_OFFSET, self.schema_version);
+        write_u32(
+            &mut header,
+            HEADER_CATALOG_FORMAT_OFFSET,
+            self.catalog_format_version,
+        );
         self.write_page(HEADER_PAGE_ID, &header)
     }
 
@@ -253,18 +302,28 @@ impl StorageEngine {
         }
         self.write_page(CATALOG_PAGE_ID, &page)
     }
+
+    fn bump_schema_version(&mut self) -> Result<(), StorageError> {
+        self.schema_version = self.schema_version.saturating_add(1);
+        self.write_header()
+    }
 }
 
 fn load_catalog_from_file(
     file: &mut File,
     next_page_id: u32,
+    format_version: u32,
 ) -> Result<HashMap<String, TableMeta>, StorageError> {
     let mut page = vec![0; PAGE_SIZE];
     file.seek(SeekFrom::Start(CATALOG_PAGE_ID as u64 * PAGE_SIZE as u64))?;
     file.read_exact(&mut page)?;
     let mut tables = HashMap::new();
     for record in read_records(&page) {
-        let table = decode_table_meta(&record)?;
+        let table = if format_version == 0 {
+            decode_table_meta_v0(&record)?
+        } else {
+            decode_table_meta(&record)?
+        };
         tables.insert(table.name.clone(), table);
     }
     if next_page_id == 0 {
@@ -437,6 +496,694 @@ fn decode_value(record: &[u8], pos: usize) -> Result<(Value, usize), StorageErro
     Ok((value, cursor))
 }
 
+fn encode_ident(ident: &Ident, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    buf.push(if ident.quoted { 1 } else { 0 });
+    if ident.value.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("identifier too long".to_string()));
+    }
+    buf.extend_from_slice(&(ident.value.len() as u16).to_le_bytes());
+    buf.extend_from_slice(ident.value.as_bytes());
+    Ok(())
+}
+
+fn decode_ident(record: &[u8], pos: usize) -> Result<(Ident, usize), StorageError> {
+    if pos + 3 > record.len() {
+        return Err(StorageError::Corrupt("invalid identifier".to_string()));
+    }
+    let quoted = record[pos] != 0;
+    let len = read_u16(record, pos + 1) as usize;
+    let mut cursor = pos + 3;
+    if cursor + len > record.len() {
+        return Err(StorageError::Corrupt("invalid identifier".to_string()));
+    }
+    let value = String::from_utf8_lossy(&record[cursor..cursor + len]).to_string();
+    cursor += len;
+    Ok((Ident { value, quoted }, cursor))
+}
+
+fn encode_ident_list(idents: &[Ident], buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    if idents.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many identifiers".to_string()));
+    }
+    buf.extend_from_slice(&(idents.len() as u16).to_le_bytes());
+    for ident in idents {
+        encode_ident(ident, buf)?;
+    }
+    Ok(())
+}
+
+fn decode_ident_list(record: &[u8], pos: usize) -> Result<(Vec<Ident>, usize), StorageError> {
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid identifier list".to_string()));
+    }
+    let count = read_u16(record, pos) as usize;
+    let mut cursor = pos + 2;
+    let mut idents = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (ident, new_pos) = decode_ident(record, cursor)?;
+        cursor = new_pos;
+        idents.push(ident);
+    }
+    Ok((idents, cursor))
+}
+
+fn encode_object_name(name: &ObjectName, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    encode_ident_list(&name.0, buf)
+}
+
+fn decode_object_name(record: &[u8], pos: usize) -> Result<(ObjectName, usize), StorageError> {
+    let (parts, cursor) = decode_ident_list(record, pos)?;
+    Ok((ObjectName(parts), cursor))
+}
+
+fn encode_literal(literal: &Literal, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match literal {
+        Literal::Null => buf.push(0),
+        Literal::Integer(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Literal::Float(v) => {
+            buf.push(2);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Literal::String(s) => {
+            buf.push(3);
+            let bytes = s.as_bytes();
+            if bytes.len() > u32::MAX as usize {
+                return Err(StorageError::Invalid("string literal too long".to_string()));
+            }
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+        Literal::Boolean(v) => {
+            buf.push(4);
+            buf.push(if *v { 1 } else { 0 });
+        }
+        Literal::Blob(bytes) => {
+            buf.push(5);
+            if bytes.len() > u32::MAX as usize {
+                return Err(StorageError::Invalid("blob literal too large".to_string()));
+            }
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+    }
+    Ok(())
+}
+
+fn decode_literal(record: &[u8], pos: usize) -> Result<(Literal, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid literal".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let literal = match tag {
+        0 => Literal::Null,
+        1 => {
+            if cursor + 8 > record.len() {
+                return Err(StorageError::Corrupt("invalid integer literal".to_string()));
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&record[cursor..cursor + 8]);
+            cursor += 8;
+            Literal::Integer(i64::from_le_bytes(buf))
+        }
+        2 => {
+            if cursor + 8 > record.len() {
+                return Err(StorageError::Corrupt("invalid float literal".to_string()));
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&record[cursor..cursor + 8]);
+            cursor += 8;
+            Literal::Float(f64::from_le_bytes(buf))
+        }
+        3 => {
+            if cursor + 4 > record.len() {
+                return Err(StorageError::Corrupt("invalid string literal".to_string()));
+            }
+            let len = read_u32(record, cursor) as usize;
+            cursor += 4;
+            if cursor + len > record.len() {
+                return Err(StorageError::Corrupt("invalid string literal".to_string()));
+            }
+            let text = String::from_utf8_lossy(&record[cursor..cursor + len]).to_string();
+            cursor += len;
+            Literal::String(text)
+        }
+        4 => {
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid boolean literal".to_string()));
+            }
+            let value = record[cursor] != 0;
+            cursor += 1;
+            Literal::Boolean(value)
+        }
+        5 => {
+            if cursor + 4 > record.len() {
+                return Err(StorageError::Corrupt("invalid blob literal".to_string()));
+            }
+            let len = read_u32(record, cursor) as usize;
+            cursor += 4;
+            if cursor + len > record.len() {
+                return Err(StorageError::Corrupt("invalid blob literal".to_string()));
+            }
+            let data = record[cursor..cursor + len].to_vec();
+            cursor += len;
+            Literal::Blob(data)
+        }
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown literal tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((literal, cursor))
+}
+
+fn encode_binary_operator(op: &BinaryOperator, buf: &mut Vec<u8>) {
+    let tag = match op {
+        BinaryOperator::Plus => 1,
+        BinaryOperator::Minus => 2,
+        BinaryOperator::Multiply => 3,
+        BinaryOperator::Divide => 4,
+        BinaryOperator::Modulo => 5,
+        BinaryOperator::And => 6,
+        BinaryOperator::Or => 7,
+        BinaryOperator::Eq => 8,
+        BinaryOperator::NotEq => 9,
+        BinaryOperator::Lt => 10,
+        BinaryOperator::LtEq => 11,
+        BinaryOperator::Gt => 12,
+        BinaryOperator::GtEq => 13,
+        BinaryOperator::Like => 14,
+        BinaryOperator::NotLike => 15,
+        BinaryOperator::Is => 16,
+        BinaryOperator::IsNot => 17,
+        BinaryOperator::Concat => 18,
+    };
+    buf.push(tag);
+}
+
+fn decode_binary_operator(record: &[u8], pos: usize) -> Result<(BinaryOperator, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid binary operator".to_string()));
+    }
+    let tag = record[pos];
+    let op = match tag {
+        1 => BinaryOperator::Plus,
+        2 => BinaryOperator::Minus,
+        3 => BinaryOperator::Multiply,
+        4 => BinaryOperator::Divide,
+        5 => BinaryOperator::Modulo,
+        6 => BinaryOperator::And,
+        7 => BinaryOperator::Or,
+        8 => BinaryOperator::Eq,
+        9 => BinaryOperator::NotEq,
+        10 => BinaryOperator::Lt,
+        11 => BinaryOperator::LtEq,
+        12 => BinaryOperator::Gt,
+        13 => BinaryOperator::GtEq,
+        14 => BinaryOperator::Like,
+        15 => BinaryOperator::NotLike,
+        16 => BinaryOperator::Is,
+        17 => BinaryOperator::IsNot,
+        18 => BinaryOperator::Concat,
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown binary operator tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((op, pos + 1))
+}
+
+fn encode_unary_operator(op: &UnaryOperator, buf: &mut Vec<u8>) {
+    let tag = match op {
+        UnaryOperator::Plus => 1,
+        UnaryOperator::Minus => 2,
+        UnaryOperator::Not => 3,
+    };
+    buf.push(tag);
+}
+
+fn decode_unary_operator(record: &[u8], pos: usize) -> Result<(UnaryOperator, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid unary operator".to_string()));
+    }
+    let tag = record[pos];
+    let op = match tag {
+        1 => UnaryOperator::Plus,
+        2 => UnaryOperator::Minus,
+        3 => UnaryOperator::Not,
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown unary operator tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((op, pos + 1))
+}
+
+fn encode_expr(expr: &Expr, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match expr {
+        Expr::Identifier(ident) => {
+            buf.push(1);
+            encode_ident(ident, buf)?;
+        }
+        Expr::CompoundIdentifier(idents) => {
+            buf.push(2);
+            encode_ident_list(idents, buf)?;
+        }
+        Expr::Literal(literal) => {
+            buf.push(3);
+            encode_literal(literal, buf)?;
+        }
+        Expr::BinaryOp { left, op, right } => {
+            buf.push(4);
+            encode_binary_operator(op, buf);
+            encode_expr(left, buf)?;
+            encode_expr(right, buf)?;
+        }
+        Expr::UnaryOp { op, expr } => {
+            buf.push(5);
+            encode_unary_operator(op, buf);
+            encode_expr(expr, buf)?;
+        }
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
+            buf.push(6);
+            encode_ident(name, buf)?;
+            buf.push(if *distinct { 1 } else { 0 });
+            if args.len() > u16::MAX as usize {
+                return Err(StorageError::Invalid("too many function args".to_string()));
+            }
+            buf.extend_from_slice(&(args.len() as u16).to_le_bytes());
+            for arg in args {
+                encode_expr(arg, buf)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            buf.push(7);
+            buf.push(if operand.is_some() { 1 } else { 0 });
+            if let Some(expr) = operand {
+                encode_expr(expr, buf)?;
+            }
+            if when_then.len() > u16::MAX as usize {
+                return Err(StorageError::Invalid("too many case branches".to_string()));
+            }
+            buf.extend_from_slice(&(when_then.len() as u16).to_le_bytes());
+            for (when_expr, then_expr) in when_then {
+                encode_expr(when_expr, buf)?;
+                encode_expr(then_expr, buf)?;
+            }
+            buf.push(if else_result.is_some() { 1 } else { 0 });
+            if let Some(expr) = else_result {
+                encode_expr(expr, buf)?;
+            }
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            buf.push(8);
+            buf.push(if *negated { 1 } else { 0 });
+            encode_expr(expr, buf)?;
+            encode_expr(low, buf)?;
+            encode_expr(high, buf)?;
+        }
+        Expr::InList { expr, list, negated } => {
+            buf.push(9);
+            buf.push(if *negated { 1 } else { 0 });
+            encode_expr(expr, buf)?;
+            if list.len() > u16::MAX as usize {
+                return Err(StorageError::Invalid("too many IN values".to_string()));
+            }
+            buf.extend_from_slice(&(list.len() as u16).to_le_bytes());
+            for item in list {
+                encode_expr(item, buf)?;
+            }
+        }
+        Expr::IsNull { expr, negated } => {
+            buf.push(10);
+            buf.push(if *negated { 1 } else { 0 });
+            encode_expr(expr, buf)?;
+        }
+        Expr::Cast { expr, data_type } => {
+            buf.push(11);
+            encode_expr(expr, buf)?;
+            encode_data_type(data_type, buf)?;
+        }
+        Expr::Nested(expr) => {
+            buf.push(12);
+            encode_expr(expr, buf)?;
+        }
+        Expr::Wildcard => {
+            buf.push(13);
+        }
+        _ => {
+            return Err(StorageError::Invalid(
+                "unsupported expression in schema metadata".to_string(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn decode_expr(record: &[u8], pos: usize) -> Result<(Expr, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid expression".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let expr = match tag {
+        1 => {
+            let (ident, new_pos) = decode_ident(record, cursor)?;
+            cursor = new_pos;
+            Expr::Identifier(ident)
+        }
+        2 => {
+            let (idents, new_pos) = decode_ident_list(record, cursor)?;
+            cursor = new_pos;
+            Expr::CompoundIdentifier(idents)
+        }
+        3 => {
+            let (literal, new_pos) = decode_literal(record, cursor)?;
+            cursor = new_pos;
+            Expr::Literal(literal)
+        }
+        4 => {
+            let (op, new_pos) = decode_binary_operator(record, cursor)?;
+            cursor = new_pos;
+            let (left, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            let (right, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            }
+        }
+        5 => {
+            let (op, new_pos) = decode_unary_operator(record, cursor)?;
+            cursor = new_pos;
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            Expr::UnaryOp {
+                op,
+                expr: Box::new(expr),
+            }
+        }
+        6 => {
+            let (name, new_pos) = decode_ident(record, cursor)?;
+            cursor = new_pos;
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid function expr".to_string()));
+            }
+            let distinct = record[cursor] != 0;
+            cursor += 1;
+            if cursor + 2 > record.len() {
+                return Err(StorageError::Corrupt("invalid function args".to_string()));
+            }
+            let count = read_u16(record, cursor) as usize;
+            cursor += 2;
+            let mut args = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (arg, new_pos) = decode_expr(record, cursor)?;
+                cursor = new_pos;
+                args.push(arg);
+            }
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            }
+        }
+        7 => {
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid case expr".to_string()));
+            }
+            let has_operand = record[cursor] != 0;
+            cursor += 1;
+            let operand = if has_operand {
+                let (expr, new_pos) = decode_expr(record, cursor)?;
+                cursor = new_pos;
+                Some(Box::new(expr))
+            } else {
+                None
+            };
+            if cursor + 2 > record.len() {
+                return Err(StorageError::Corrupt("invalid case expr".to_string()));
+            }
+            let count = read_u16(record, cursor) as usize;
+            cursor += 2;
+            let mut when_then = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (when_expr, new_pos) = decode_expr(record, cursor)?;
+                cursor = new_pos;
+                let (then_expr, new_pos) = decode_expr(record, cursor)?;
+                cursor = new_pos;
+                when_then.push((when_expr, then_expr));
+            }
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid case expr".to_string()));
+            }
+            let has_else = record[cursor] != 0;
+            cursor += 1;
+            let else_result = if has_else {
+                let (expr, new_pos) = decode_expr(record, cursor)?;
+                cursor = new_pos;
+                Some(Box::new(expr))
+            } else {
+                None
+            };
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            }
+        }
+        8 => {
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid between expr".to_string()));
+            }
+            let negated = record[cursor] != 0;
+            cursor += 1;
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            let (low, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            let (high, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            Expr::Between {
+                expr: Box::new(expr),
+                negated,
+                low: Box::new(low),
+                high: Box::new(high),
+            }
+        }
+        9 => {
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid IN expr".to_string()));
+            }
+            let negated = record[cursor] != 0;
+            cursor += 1;
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            if cursor + 2 > record.len() {
+                return Err(StorageError::Corrupt("invalid IN expr".to_string()));
+            }
+            let count = read_u16(record, cursor) as usize;
+            cursor += 2;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (item, new_pos) = decode_expr(record, cursor)?;
+                cursor = new_pos;
+                list.push(item);
+            }
+            Expr::InList {
+                expr: Box::new(expr),
+                list,
+                negated,
+            }
+        }
+        10 => {
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid IS NULL expr".to_string()));
+            }
+            let negated = record[cursor] != 0;
+            cursor += 1;
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            Expr::IsNull {
+                expr: Box::new(expr),
+                negated,
+            }
+        }
+        11 => {
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            let (data_type, new_pos) = decode_data_type(record, cursor)?;
+            cursor = new_pos;
+            Expr::Cast {
+                expr: Box::new(expr),
+                data_type,
+            }
+        }
+        12 => {
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            Expr::Nested(Box::new(expr))
+        }
+        13 => Expr::Wildcard,
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown expression tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((expr, cursor))
+}
+
+fn encode_column_constraint(
+    constraint: &ColumnConstraint,
+    buf: &mut Vec<u8>,
+) -> Result<(), StorageError> {
+    match constraint {
+        ColumnConstraint::NotNull => buf.push(1),
+        ColumnConstraint::Null => buf.push(2),
+        ColumnConstraint::PrimaryKey => buf.push(3),
+        ColumnConstraint::Unique => buf.push(4),
+        ColumnConstraint::Default(expr) => {
+            buf.push(5);
+            encode_expr(expr, buf)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_column_constraint(
+    record: &[u8],
+    pos: usize,
+) -> Result<(ColumnConstraint, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid column constraint".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let constraint = match tag {
+        1 => ColumnConstraint::NotNull,
+        2 => ColumnConstraint::Null,
+        3 => ColumnConstraint::PrimaryKey,
+        4 => ColumnConstraint::Unique,
+        5 => {
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            ColumnConstraint::Default(expr)
+        }
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown column constraint tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((constraint, cursor))
+}
+
+fn encode_table_constraint(
+    constraint: &TableConstraint,
+    buf: &mut Vec<u8>,
+) -> Result<(), StorageError> {
+    match constraint {
+        TableConstraint::PrimaryKey(columns) => {
+            buf.push(1);
+            encode_ident_list(columns, buf)?;
+        }
+        TableConstraint::Unique(columns) => {
+            buf.push(2);
+            encode_ident_list(columns, buf)?;
+        }
+        TableConstraint::Check(expr) => {
+            buf.push(3);
+            encode_expr(expr, buf)?;
+        }
+        TableConstraint::ForeignKey {
+            columns,
+            foreign_table,
+            referred_columns,
+        } => {
+            buf.push(4);
+            encode_ident_list(columns, buf)?;
+            encode_object_name(foreign_table, buf)?;
+            encode_ident_list(referred_columns, buf)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_table_constraint(
+    record: &[u8],
+    pos: usize,
+) -> Result<(TableConstraint, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid table constraint".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let constraint = match tag {
+        1 => {
+            let (columns, new_pos) = decode_ident_list(record, cursor)?;
+            cursor = new_pos;
+            TableConstraint::PrimaryKey(columns)
+        }
+        2 => {
+            let (columns, new_pos) = decode_ident_list(record, cursor)?;
+            cursor = new_pos;
+            TableConstraint::Unique(columns)
+        }
+        3 => {
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            TableConstraint::Check(expr)
+        }
+        4 => {
+            let (columns, new_pos) = decode_ident_list(record, cursor)?;
+            cursor = new_pos;
+            let (foreign_table, new_pos) = decode_object_name(record, cursor)?;
+            cursor = new_pos;
+            let (referred_columns, new_pos) = decode_ident_list(record, cursor)?;
+            cursor = new_pos;
+            TableConstraint::ForeignKey {
+                columns,
+                foreign_table,
+                referred_columns,
+            }
+        }
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown table constraint tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((constraint, cursor))
+}
+
 fn encode_table_meta(table: &TableMeta) -> Result<Vec<u8>, StorageError> {
     let mut buf = Vec::new();
     if table.name.len() > u16::MAX as usize {
@@ -455,6 +1202,20 @@ fn encode_table_meta(table: &TableMeta) -> Result<Vec<u8>, StorageError> {
         buf.extend_from_slice(&(col.name.len() as u16).to_le_bytes());
         buf.extend_from_slice(col.name.as_bytes());
         encode_data_type(&col.data_type, &mut buf)?;
+        if col.constraints.len() > u16::MAX as usize {
+            return Err(StorageError::Invalid("too many column constraints".to_string()));
+        }
+        buf.extend_from_slice(&(col.constraints.len() as u16).to_le_bytes());
+        for constraint in &col.constraints {
+            encode_column_constraint(constraint, &mut buf)?;
+        }
+    }
+    if table.constraints.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many table constraints".to_string()));
+    }
+    buf.extend_from_slice(&(table.constraints.len() as u16).to_le_bytes());
+    for constraint in &table.constraints {
+        encode_table_constraint(constraint, &mut buf)?;
     }
     buf.extend_from_slice(&table.first_page.to_le_bytes());
     buf.extend_from_slice(&table.last_page.to_le_bytes());
@@ -463,6 +1224,9 @@ fn encode_table_meta(table: &TableMeta) -> Result<Vec<u8>, StorageError> {
 
 fn decode_table_meta(record: &[u8]) -> Result<TableMeta, StorageError> {
     let mut pos = 0;
+    if record.len() < 2 {
+        return Err(StorageError::Corrupt("invalid table meta".to_string()));
+    }
     let name_len = read_u16(record, pos) as usize;
     pos += 2;
     if pos + name_len > record.len() {
@@ -474,6 +1238,82 @@ fn decode_table_meta(record: &[u8]) -> Result<TableMeta, StorageError> {
     pos += 2;
     let mut columns = Vec::with_capacity(col_count);
     for _ in 0..col_count {
+        if pos + 2 > record.len() {
+            return Err(StorageError::Corrupt("invalid column name".to_string()));
+        }
+        let col_len = read_u16(record, pos) as usize;
+        pos += 2;
+        if pos + col_len > record.len() {
+            return Err(StorageError::Corrupt("invalid column name".to_string()));
+        }
+        let col_name = String::from_utf8_lossy(&record[pos..pos + col_len]).to_string();
+        pos += col_len;
+        let (data_type, new_pos) = decode_data_type(record, pos)?;
+        pos = new_pos;
+        if pos + 2 > record.len() {
+            return Err(StorageError::Corrupt("invalid column constraints".to_string()));
+        }
+        let constraint_count = read_u16(record, pos) as usize;
+        pos += 2;
+        let mut constraints = Vec::with_capacity(constraint_count);
+        for _ in 0..constraint_count {
+            let (constraint, new_pos) = decode_column_constraint(record, pos)?;
+            pos = new_pos;
+            constraints.push(constraint);
+        }
+        columns.push(Column {
+            name: col_name,
+            data_type,
+            constraints,
+        });
+    }
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid table constraints".to_string()));
+    }
+    let table_constraint_count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut constraints = Vec::with_capacity(table_constraint_count);
+    for _ in 0..table_constraint_count {
+        let (constraint, new_pos) = decode_table_constraint(record, pos)?;
+        pos = new_pos;
+        constraints.push(constraint);
+    }
+    if pos + 8 > record.len() {
+        return Err(StorageError::Corrupt("invalid table meta".to_string()));
+    }
+    let first_page = read_u32(record, pos);
+    let last_page = read_u32(record, pos + 4);
+    Ok(TableMeta {
+        name,
+        columns,
+        constraints,
+        first_page,
+        last_page,
+    })
+}
+
+fn decode_table_meta_v0(record: &[u8]) -> Result<TableMeta, StorageError> {
+    let mut pos = 0;
+    if record.len() < 2 {
+        return Err(StorageError::Corrupt("invalid table meta".to_string()));
+    }
+    let name_len = read_u16(record, pos) as usize;
+    pos += 2;
+    if pos + name_len > record.len() {
+        return Err(StorageError::Corrupt("invalid table name".to_string()));
+    }
+    let name = String::from_utf8_lossy(&record[pos..pos + name_len]).to_string();
+    pos += name_len;
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid column count".to_string()));
+    }
+    let col_count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        if pos + 2 > record.len() {
+            return Err(StorageError::Corrupt("invalid column name".to_string()));
+        }
         let col_len = read_u16(record, pos) as usize;
         pos += 2;
         if pos + col_len > record.len() {
@@ -486,6 +1326,7 @@ fn decode_table_meta(record: &[u8]) -> Result<TableMeta, StorageError> {
         columns.push(Column {
             name: col_name,
             data_type,
+            constraints: Vec::new(),
         });
     }
     if pos + 8 > record.len() {
@@ -496,6 +1337,7 @@ fn decode_table_meta(record: &[u8]) -> Result<TableMeta, StorageError> {
     Ok(TableMeta {
         name,
         columns,
+        constraints: Vec::new(),
         first_page,
         last_page,
     })

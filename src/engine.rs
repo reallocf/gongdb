@@ -72,6 +72,7 @@ impl GongDB {
                     let meta = TableMeta {
                         name: name.clone(),
                         columns,
+                        constraints: create.constraints,
                         first_page,
                         last_page: first_page,
                     };
@@ -220,6 +221,7 @@ fn column_from_def(def: ColumnDef) -> Column {
     Column {
         name: def.name.value,
         data_type: def.data_type.unwrap_or(DataType::Text),
+        constraints: def.constraints,
     }
 }
 
