@@ -8,6 +8,8 @@ use std::fs;
 
 pub mod ast;
 pub mod parser;
+pub mod storage;
+pub mod engine;
 
 pub struct SQLiteDB {
     conn: Connection,
@@ -212,6 +214,19 @@ fn preprocess_test_file(test_file: &str) -> Result<String, Box<dyn std::error::E
 
 /// Helper function to run a single test file
 pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if test_file.ends_with("phase2_storage_engine.test") {
+        let mut tester = sqllogictest::Runner::new(|| async {
+            let db = engine::GongDB::new_in_memory()?;
+            Ok::<_, engine::GongDBError>(db)
+        });
+        tester.with_validator(auto_detect_validator);
+        let preprocessed = preprocess_test_file(test_file)?;
+        let records =
+            sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
+        tester.run_multi(records)?;
+        return Ok(());
+    }
+
     let mut tester = sqllogictest::Runner::new(|| async {
         let db = SQLiteDB::new()?;
         Ok::<_, rusqlite::Error>(db)
@@ -220,13 +235,14 @@ pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Er
     tester.with_validator(auto_detect_validator);
     // Add "sqlite" label so skipif/onlyif directives work correctly
     tester.add_label("sqlite");
-    
+
     // Preprocess the test file to strip comments from skipif/onlyif lines
     let preprocessed = preprocess_test_file(test_file)?;
-    
+
     // Parse and run the preprocessed content
     // Use the parser module directly since parse_with_name is not exported
-    let records = sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
+    let records =
+        sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
     tester.run_multi(records)?;
     Ok(())
 }
