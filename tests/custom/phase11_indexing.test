@@ -1,0 +1,142 @@
+# Phase 11: Indexing Tests
+# Tests for index structure, maintenance, and integrity
+
+# Test basic index creation
+statement ok
+CREATE TABLE index_test (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)
+
+statement ok
+CREATE INDEX idx_name ON index_test(name)
+
+statement ok
+CREATE INDEX idx_value ON index_test(value)
+
+# Test index usage in queries
+statement ok
+INSERT INTO index_test VALUES (1, 'alice', 100), (2, 'bob', 200), (3, 'charlie', 300)
+
+query II rowsort
+SELECT name, value FROM index_test WHERE name = 'bob'
+----
+bob 200
+
+query II rowsort
+SELECT name, value FROM index_test WHERE value = 200
+----
+bob 200
+
+# Test index with duplicate values
+statement ok
+INSERT INTO index_test VALUES (4, 'alice', 150), (5, 'bob', 250)
+
+query II rowsort
+SELECT name, value FROM index_test WHERE name = 'alice' ORDER BY value
+----
+alice 100
+alice 150
+
+# Test multi-column index
+statement ok
+CREATE TABLE multi_index (a INTEGER, b INTEGER, c INTEGER)
+
+statement ok
+CREATE INDEX idx_ab ON multi_index(a, b)
+
+statement ok
+INSERT INTO multi_index VALUES (1, 1, 1), (1, 2, 2), (2, 1, 3), (2, 2, 4)
+
+query III rowsort
+SELECT a, b, c FROM multi_index WHERE a = 1 AND b = 2
+----
+1 2 2
+
+# Test index maintenance on UPDATE
+statement ok
+UPDATE index_test SET name = 'david' WHERE id = 1
+
+query II rowsort
+SELECT name, value FROM index_test WHERE name = 'david'
+----
+david 100
+
+query II rowsort
+SELECT name, value FROM index_test WHERE name = 'alice'
+----
+alice 150
+
+# Test index maintenance on DELETE
+statement ok
+DELETE FROM index_test WHERE id = 2
+
+query I rowsort
+SELECT COUNT(*) FROM index_test WHERE name = 'bob'
+----
+1
+
+# Test index with NULL values
+statement ok
+CREATE TABLE null_index (id INTEGER, name TEXT)
+
+statement ok
+CREATE INDEX idx_null_name ON null_index(name)
+
+statement ok
+INSERT INTO null_index VALUES (1, 'a'), (2, NULL), (3, 'b'), (4, NULL)
+
+query II rowsort
+SELECT id, name FROM null_index WHERE name IS NULL ORDER BY id
+----
+2 NULL
+4 NULL
+
+# Test index on large dataset
+statement ok
+CREATE TABLE large_index (id INTEGER, value INTEGER)
+
+statement ok
+CREATE INDEX idx_large_value ON large_index(value)
+
+# Insert many rows to test index scalability
+statement ok
+INSERT INTO large_index SELECT 1, 1 UNION ALL SELECT 2, 2 UNION ALL SELECT 3, 3 UNION ALL SELECT 4, 4 UNION ALL SELECT 5, 5
+
+query I rowsort
+SELECT COUNT(*) FROM large_index WHERE value BETWEEN 2 AND 4
+----
+3
+
+# Test index with ORDER BY optimization
+query II rowsort
+SELECT id, value FROM large_index ORDER BY value
+----
+1 1
+2 2
+3 3
+4 4
+5 5
+
+# Test DROP INDEX
+statement ok
+DROP INDEX idx_name
+
+statement error
+SELECT * FROM index_test WHERE name = 'test' USE INDEX (idx_name)
+
+# Test index on expression (if supported)
+# Note: This may not be supported in all databases, but test if it is
+statement ok
+CREATE TABLE expr_index (id INTEGER, value INTEGER)
+
+# Test that index is used for range queries
+statement ok
+CREATE INDEX idx_range ON expr_index(value)
+
+statement ok
+INSERT INTO expr_index VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+query II rowsort
+SELECT id, value FROM expr_index WHERE value > 25 ORDER BY value
+----
+3 30
+4 40
+5 50

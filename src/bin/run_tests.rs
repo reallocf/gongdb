@@ -20,12 +20,18 @@ fn collect_test_files(dir: &std::path::Path, test_files: &mut Vec<String>) -> st
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Discover and run all SQLite test files
+    // Discover and run all test files (SQLite + custom)
     let mut test_files = Vec::new();
+    
+    // Collect SQLite test files
     collect_test_files(std::path::Path::new("tests/sqlite"), &mut test_files)?;
+    
+    // Collect custom test files
+    collect_test_files(std::path::Path::new("tests/custom"), &mut test_files)?;
+    
     test_files.sort();
     
-    println!("Found {} SQLite test files", test_files.len());
+    println!("Found {} test files (SQLite + custom)", test_files.len());
     
     let mut failed = Vec::new();
     for test_file in &test_files {

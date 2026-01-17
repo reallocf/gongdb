@@ -1,0 +1,237 @@
+# Phase 13: Transaction Management Tests
+# Tests for ACID properties, concurrency, and transaction isolation
+
+# Test basic transaction (BEGIN/COMMIT)
+statement ok
+CREATE TABLE trans_test (id INTEGER PRIMARY KEY, value INTEGER)
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO trans_test VALUES (1, 10)
+
+statement ok
+INSERT INTO trans_test VALUES (2, 20)
+
+statement ok
+COMMIT
+
+# Verify data is persisted after commit
+query II rowsort
+SELECT id, value FROM trans_test ORDER BY id
+----
+1 10
+2 20
+
+# Test ROLLBACK
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO trans_test VALUES (3, 30)
+
+# Verify data is visible within transaction
+query I rowsort
+SELECT COUNT(*) FROM trans_test
+----
+3
+
+statement ok
+ROLLBACK
+
+# Verify data is not persisted after rollback
+query I rowsort
+SELECT COUNT(*) FROM trans_test
+----
+2
+
+query II rowsort
+SELECT id, value FROM trans_test ORDER BY id
+----
+1 10
+2 20
+
+# Test atomicity - all or nothing
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO trans_test VALUES (4, 40)
+
+statement ok
+INSERT INTO trans_test VALUES (5, 50)
+
+# Simulate error condition - should rollback everything
+statement ok
+ROLLBACK
+
+query I rowsort
+SELECT COUNT(*) FROM trans_test
+----
+2
+
+# Test consistency - constraint violations
+statement ok
+CREATE TABLE constraint_test (id INTEGER PRIMARY KEY, value INTEGER UNIQUE)
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO constraint_test VALUES (1, 10)
+
+statement ok
+INSERT INTO constraint_test VALUES (2, 20)
+
+statement ok
+COMMIT
+
+# Try to violate constraint - should fail and rollback
+# Note: rusqlite checks UNIQUE constraints immediately, not deferred until COMMIT
+statement ok
+BEGIN TRANSACTION
+
+# INSERT fails due to UNIQUE constraint violation (rusqlite checks immediately)
+statement error
+INSERT INTO constraint_test VALUES (3, 10)
+
+# Transaction should be rolled back automatically on error
+statement ok
+ROLLBACK
+
+# Verify transaction was rolled back
+query I rowsort
+SELECT COUNT(*) FROM constraint_test
+----
+2
+
+# Test isolation - read uncommitted (if supported)
+# Note: This is a simplified test - real isolation testing requires concurrent connections
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO trans_test VALUES (6, 60)
+
+# In READ UNCOMMITTED, other transactions might see this
+# In READ COMMITTED or higher, they won't
+# For now, just verify our transaction sees it
+query I rowsort
+SELECT COUNT(*) FROM trans_test
+----
+3
+
+statement ok
+COMMIT
+
+# Test durability - data persists (simulated by verifying after operations)
+query II rowsort
+SELECT id, value FROM trans_test ORDER BY id
+----
+1 10
+2 20
+6 60
+
+# Test nested transactions
+# Note: SQLite doesn't support nested transactions - second BEGIN will fail
+# Instead, we'll test that a transaction can be committed after operations
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO trans_test VALUES (7, 70)
+
+statement ok
+INSERT INTO trans_test VALUES (8, 80)
+
+statement ok
+COMMIT
+
+# Verify both inserts persisted
+query I rowsort
+SELECT COUNT(*) FROM trans_test WHERE id >= 7
+----
+2
+
+# Test transaction with multiple statements
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+UPDATE trans_test SET value = value + 1 WHERE id = 1
+
+statement ok
+DELETE FROM trans_test WHERE id = 2
+
+statement ok
+INSERT INTO trans_test VALUES (9, 90)
+
+statement ok
+COMMIT
+
+# Verify all changes persisted atomically
+query II rowsort
+SELECT id, value FROM trans_test ORDER BY id
+----
+1 11
+6 60
+7 70
+8 80
+9 90
+
+# Test rollback of UPDATE
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+UPDATE trans_test SET value = 999 WHERE id = 1
+
+# Verify change is visible in transaction
+query I rowsort
+SELECT value FROM trans_test WHERE id = 1
+----
+999
+
+statement ok
+ROLLBACK
+
+# Verify change was rolled back
+query I rowsort
+SELECT value FROM trans_test WHERE id = 1
+----
+11
+
+# Test transaction with CREATE TABLE
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+CREATE TABLE trans_table (id INTEGER)
+
+statement ok
+INSERT INTO trans_table VALUES (1), (2), (3)
+
+statement ok
+COMMIT
+
+# Verify table and data persisted
+query I rowsort
+SELECT COUNT(*) FROM trans_table
+----
+3
+
+# Test rollback of DDL
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+CREATE TABLE rollback_table (id INTEGER)
+
+statement ok
+ROLLBACK
+
+# Table should not exist after rollback
+statement error
+SELECT * FROM rollback_table

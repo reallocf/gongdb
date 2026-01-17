@@ -1,0 +1,115 @@
+# Phase 2: Storage Engine Tests
+# Tests for page-based storage, persistence, and row serialization
+
+# Test basic table creation and data persistence
+statement ok
+CREATE TABLE storage_test (id INTEGER, name TEXT, value REAL)
+
+# Test inserting various data types
+statement ok
+INSERT INTO storage_test VALUES (1, 'test1', 3.14)
+
+statement ok
+INSERT INTO storage_test VALUES (2, 'test2', 2.71)
+
+statement ok
+INSERT INTO storage_test VALUES (NULL, 'null_id', 1.0)
+
+statement ok
+INSERT INTO storage_test VALUES (3, NULL, 2.0)
+
+statement ok
+INSERT INTO storage_test VALUES (4, 'test4', NULL)
+
+# Verify data was stored correctly
+query III rowsort
+SELECT id, name, value FROM storage_test ORDER BY id
+----
+1 test1 3.140
+2 test2 2.710
+3 NULL 2.000
+4 test4 NULL
+NULL null_id 1.000
+
+# Test variable-length TEXT storage
+statement ok
+INSERT INTO storage_test VALUES (5, 'short', 1.0)
+
+statement ok
+INSERT INTO storage_test VALUES (6, 'a' || 'very' || 'long' || 'string' || 'that' || 'tests' || 'variable' || 'length' || 'storage', 2.0)
+
+query II rowsort
+SELECT id, name FROM storage_test WHERE id >= 5 ORDER BY id
+----
+5 short
+6 averylongstringthattestsvariablelengthstorage
+
+# Test large INTEGER values
+statement ok
+INSERT INTO storage_test VALUES (2147483647, 'max_int32', 1.0)
+
+statement ok
+INSERT INTO storage_test VALUES (-2147483648, 'min_int32', 1.0)
+
+query II rowsort
+SELECT id, name FROM storage_test WHERE id = 2147483647 OR id = -2147483648 ORDER BY id
+----
+-2147483648 min_int32
+2147483647 max_int32
+
+# Test REAL precision
+# Note: rusqlite formats floats with 3 decimal places
+statement ok
+INSERT INTO storage_test VALUES (7, 'precision', 3.141592653589793)
+
+query II rowsort
+SELECT id, value FROM storage_test WHERE id = 7
+----
+7 3.142
+
+# Test multiple rows with same values (storage efficiency)
+statement ok
+CREATE TABLE duplicate_test (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO duplicate_test VALUES (1, 'same'), (2, 'same'), (3, 'same'), (4, 'same'), (5, 'same')
+
+query II rowsort
+SELECT a, b FROM duplicate_test ORDER BY a
+----
+1 same
+2 same
+3 same
+4 same
+5 same
+
+# Test empty table storage
+statement ok
+CREATE TABLE empty_test (id INTEGER)
+
+query I rowsort
+SELECT COUNT(*) FROM empty_test
+----
+0
+
+# Test table with many columns (tests row layout)
+statement ok
+CREATE TABLE wide_table (
+    c1 INTEGER, c2 INTEGER, c3 INTEGER, c4 INTEGER, c5 INTEGER,
+    c6 INTEGER, c7 INTEGER, c8 INTEGER, c9 INTEGER, c10 INTEGER
+)
+
+statement ok
+INSERT INTO wide_table VALUES (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+query I rowsort
+SELECT c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 + c10 FROM wide_table
+----
+55
+
+# Test DROP and verify storage cleanup
+statement ok
+DROP TABLE storage_test
+
+statement error
+SELECT * FROM storage_test

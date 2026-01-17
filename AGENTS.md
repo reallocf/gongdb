@@ -1,8 +1,19 @@
-# AGENTS.md - How to Compile and Run Tests
+# AGENTS.md
 
-This document provides instructions for AI agents on how to compile and run tests for the GongDB project.
+This document describes how AI agents should interact with gongdb.
 
-## Prerequisites
+## Task tracking
+
+Use 'bd' for task tracking
+
+## Scope
+
+- We are building sqlite from scratch in Rust called gonddb.
+- We have rusqlite (Rust sqlite bindings) as a reference to verify correctness, but we cannot use it internally within gongdb.
+- We should not copy sqlite's (or any other database's) code nor structure. Build from first principles.
+- We are using sqlite's slt tests to verify correctness and performance.
+
+## Test Prerequisites
 
 - Rust toolchain must be installed (via rustup)
 - Cargo must be available in the PATH (may need to source `~/.cargo/env`)
@@ -110,3 +121,29 @@ cargo test --test sqllogictest -- --ignored
 # Run via binary
 cargo run --bin run_tests
 ```
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds

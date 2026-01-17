@@ -1,0 +1,170 @@
+# Phase 3: Type System Tests
+# Tests for type coercion, affinity, and NULL handling
+
+# Test INTEGER type affinity
+statement ok
+CREATE TABLE type_test (id INTEGER, name TEXT, value REAL)
+
+# Test implicit type coercion in INSERT
+statement ok
+INSERT INTO type_test VALUES ('1', 'test1', '3.14')
+
+statement ok
+INSERT INTO type_test VALUES (2.5, 'test2', 2)
+
+statement ok
+INSERT INTO type_test VALUES (NULL, NULL, NULL)
+
+# Verify type coercion worked
+query III rowsort
+SELECT id, name, value FROM type_test ORDER BY id
+----
+1 test1 3.140
+2.500 test2 2.000
+NULL NULL NULL
+
+# Test type coercion in expressions
+# Note: When id is INTEGER (1), adding '1' results in 2 (INTEGER), formatted as "2"
+# When id is REAL (2.5), adding '1' results in 3.5 (REAL), formatted as "3.500"
+query I rowsort
+SELECT id + '1' FROM type_test WHERE id IS NOT NULL ORDER BY id
+----
+2
+3.500
+
+# Note: When id is REAL (2.5), '10' + id results in 12.5 (REAL), formatted as "12.500"
+query I rowsort
+SELECT '10' + id FROM type_test WHERE id IS NOT NULL ORDER BY id
+----
+11
+12.500
+
+# Test REAL type affinity
+statement ok
+CREATE TABLE real_test (value REAL)
+
+statement ok
+INSERT INTO real_test VALUES (1)
+
+statement ok
+INSERT INTO real_test VALUES ('2.5')
+
+statement ok
+INSERT INTO real_test VALUES (3.14159)
+
+query I rowsort
+SELECT value FROM real_test ORDER BY value
+----
+1.000
+2.500
+3.142
+
+# Test TEXT type affinity
+statement ok
+CREATE TABLE text_test (value TEXT)
+
+statement ok
+INSERT INTO text_test VALUES (123)
+
+statement ok
+INSERT INTO text_test VALUES (45.67)
+
+statement ok
+INSERT INTO text_test VALUES ('text')
+
+query I rowsort
+SELECT value FROM text_test ORDER BY value
+----
+123
+45.67
+text
+
+# Test NULL handling in comparisons
+statement ok
+CREATE TABLE null_test (a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO null_test VALUES (1, 1), (2, NULL), (NULL, 3), (NULL, NULL)
+
+# NULL comparisons should return NULL (treated as false in WHERE)
+query II rowsort
+SELECT a, b FROM null_test WHERE a = b ORDER BY a, b
+----
+1 1
+
+query II rowsort
+SELECT a, b FROM null_test WHERE a IS NULL OR b IS NULL ORDER BY a, b
+----
+2 NULL
+NULL 3
+NULL NULL
+
+# Test NULL in arithmetic
+query I rowsort
+SELECT a + b FROM null_test WHERE a IS NOT NULL AND b IS NOT NULL
+----
+2
+
+query I rowsort
+SELECT a + b FROM null_test
+----
+2
+NULL
+NULL
+NULL
+
+# Test type coercion in WHERE clauses
+statement ok
+CREATE TABLE where_coerce (id INTEGER, name TEXT)
+
+statement ok
+INSERT INTO where_coerce VALUES (1, '1'), (2, '2'), (10, '10')
+
+query II rowsort
+SELECT id, name FROM where_coerce WHERE id = '1' ORDER BY id
+----
+1 1
+
+query II rowsort
+SELECT id, name FROM where_coerce WHERE name = 1 ORDER BY id
+----
+1 1
+
+# Test type affinity in ORDER BY
+query I rowsort
+SELECT name FROM where_coerce ORDER BY name
+----
+1
+10
+2
+
+# Test mixed type operations
+# Note: rusqlite may return results in a different order due to ORDER BY processing
+query I rowsort
+SELECT id + CAST(name AS INTEGER) FROM where_coerce ORDER BY id
+----
+2
+20
+4
+
+# Test type preservation in aggregates
+statement ok
+CREATE TABLE agg_types (int_val INTEGER, real_val REAL, text_val TEXT)
+
+statement ok
+INSERT INTO agg_types VALUES (1, 1.5, 'a'), (2, 2.5, 'b'), (3, 3.5, 'c')
+
+query I rowsort
+SELECT SUM(int_val) FROM agg_types
+----
+6
+
+query I rowsort
+SELECT SUM(real_val) FROM agg_types
+----
+7.500
+
+query I rowsort
+SELECT COUNT(text_val) FROM agg_types
+----
+3
