@@ -163,7 +163,7 @@ impl GongDB {
                 };
                 for exprs in rows {
                     let row = build_insert_row(&table, &insert.columns, &exprs)?;
-                    self.storage.insert_row(&table_name, &row)?;
+                    let _ = self.storage.insert_row(&table_name, &row)?;
                 }
                 Ok(DBOutput::StatementComplete(0))
             }

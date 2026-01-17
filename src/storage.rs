@@ -2,7 +2,7 @@ use crate::ast::{
     BinaryOperator, ColumnConstraint, DataType, Expr, Ident, IndexedColumn, Literal, ObjectName,
     SortOrder, TableConstraint, UnaryOperator,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -24,6 +24,18 @@ pub enum Value {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowLocation {
+    page_id: u32,
+    slot: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IndexEntry {
+    key: Vec<Value>,
+    row: RowLocation,
 }
 
 #[derive(Debug, Clone)]
@@ -223,13 +235,47 @@ impl StorageEngine {
     }
 
     pub fn insert_row(&mut self, table_name: &str, row: &[Value]) -> Result<(), StorageError> {
-        let mut page_id = self
+        let _ = self.insert_row_with_location(table_name, row)?;
+        Ok(())
+    }
+
+    fn insert_row_with_location(
+        &mut self,
+        table_name: &str,
+        row: &[Value],
+    ) -> Result<RowLocation, StorageError> {
+        let table = self
             .tables
             .get(table_name)
             .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
-            .last_page;
-        let record = encode_row(row)?;
+            .clone();
+        let mut page_id = table.last_page;
+        let column_map = column_index_map(&table.columns);
+        let index_names: Vec<String> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == table_name)
+            .map(|index| index.name.clone())
+            .collect();
 
+        let mut index_keys = Vec::new();
+        for index_name in &index_names {
+            let index = self
+                .indexes
+                .get(index_name)
+                .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?
+                .clone();
+            let key = index_key_from_row(&index, &column_map, row)?;
+            if index.unique && !key_has_null(&key) && self.index_contains_key(&index, &key)? {
+                return Err(StorageError::Invalid(format!(
+                    "unique index violation: {}",
+                    index.name
+                )));
+            }
+            index_keys.push((index.name, key));
+        }
+
+        let record = encode_row(row)?;
         let mut page = self.read_page(page_id)?;
         if !has_space_for_record(&page, record.len()) {
             let new_page_id = self.allocate_data_page()?;
@@ -243,10 +289,17 @@ impl StorageEngine {
             }
         }
 
-        insert_record(&mut page, &record)?;
+        let slot = insert_record(&mut page, &record)?;
         self.write_page(page_id, &page)?;
+
+        let location = RowLocation { page_id, slot };
+        for (index_name, key) in index_keys {
+            let entry = IndexEntry { key, row: location };
+            self.insert_index_record(&index_name, &entry)?;
+        }
+
         self.write_catalog()?;
-        Ok(())
+        Ok(location)
     }
 
     pub fn create_index(&mut self, index: IndexMeta) -> Result<(), StorageError> {
@@ -256,7 +309,34 @@ impl StorageEngine {
                 index.name
             )));
         }
-        self.indexes.insert(index.name.clone(), index);
+        let table = self
+            .tables
+            .get(&index.table)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", index.table)))?
+            .clone();
+
+        let column_map = column_index_map(&table.columns);
+        let mut unique_keys = HashSet::new();
+
+        self.indexes.insert(index.name.clone(), index.clone());
+
+        let rows = self.scan_table_with_locations(&table.name)?;
+        for (location, row) in rows {
+            let key = index_key_from_row(&index, &column_map, &row)?;
+            if index.unique && !key_has_null(&key) {
+                let encoded_key = encode_index_key(&key)?;
+                if !unique_keys.insert(encoded_key) {
+                    self.indexes.remove(&index.name);
+                    return Err(StorageError::Invalid(format!(
+                        "unique index violation: {}",
+                        index.name
+                    )));
+                }
+            }
+            let entry = IndexEntry { key, row: location };
+            self.insert_index_record(&index.name, &entry)?;
+        }
+
         self.write_catalog()?;
         self.bump_schema_version()
     }
@@ -289,6 +369,87 @@ impl StorageEngine {
             page_id = next;
         }
         Ok(rows)
+    }
+
+    fn scan_table_with_locations(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<(RowLocation, Vec<Value>)>, StorageError> {
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?;
+        let mut rows = Vec::new();
+        let mut page_id = table.first_page;
+        loop {
+            let page = self.read_page(page_id)?;
+            let records = read_records_with_slots(&page);
+            for (slot, record) in records {
+                rows.push((RowLocation { page_id, slot }, decode_row(&record)?));
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(rows)
+    }
+
+    fn insert_index_record(
+        &mut self,
+        index_name: &str,
+        entry: &IndexEntry,
+    ) -> Result<(), StorageError> {
+        let mut index = self
+            .indexes
+            .remove(index_name)
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
+        self.insert_index_record_into_pages(&mut index, entry)?;
+        self.indexes.insert(index_name.to_string(), index);
+        Ok(())
+    }
+
+    fn insert_index_record_into_pages(
+        &mut self,
+        index: &mut IndexMeta,
+        entry: &IndexEntry,
+    ) -> Result<(), StorageError> {
+        let record = encode_index_entry(entry)?;
+        let mut page_id = index.last_page;
+        let mut page = self.read_page(page_id)?;
+        if !has_space_for_record(&page, record.len()) {
+            let new_page_id = self.allocate_data_page()?;
+            let new_page = init_data_page();
+            set_next_page_id(&mut page, new_page_id);
+            self.write_page(page_id, &page)?;
+            page_id = new_page_id;
+            page = new_page;
+            index.last_page = new_page_id;
+        }
+        let _ = insert_record(&mut page, &record)?;
+        self.write_page(page_id, &page)?;
+        Ok(())
+    }
+
+    fn index_contains_key(&self, index: &IndexMeta, key: &[Value]) -> Result<bool, StorageError> {
+        let mut page_id = index.first_page;
+        loop {
+            let page = self.read_page(page_id)?;
+            let records = read_records(&page);
+            for record in records {
+                let entry = decode_index_entry(&record)?;
+                if entry.key == key {
+                    return Ok(true);
+                }
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(false)
     }
 
     pub fn allocate_data_page(&mut self) -> Result<u32, StorageError> {
@@ -357,10 +518,10 @@ impl StorageEngine {
                 let mut encoded = Vec::new();
                 encoded.push(1);
                 encoded.extend_from_slice(&encode_table_meta(table)?);
-                insert_record(&mut page, &encoded)?;
+                let _ = insert_record(&mut page, &encoded)?;
             } else {
                 let encoded = encode_table_meta(table)?;
-                insert_record(&mut page, &encoded)?;
+                let _ = insert_record(&mut page, &encoded)?;
             }
         }
         if self.catalog_format_version >= 2 {
@@ -368,7 +529,7 @@ impl StorageEngine {
                 let mut encoded = Vec::new();
                 encoded.push(2);
                 encoded.extend_from_slice(&encode_index_meta(index)?);
-                insert_record(&mut page, &encoded)?;
+                let _ = insert_record(&mut page, &encoded)?;
             }
         }
         self.write_page(CATALOG_PAGE_ID, &page)
@@ -450,7 +611,7 @@ fn has_space_for_record(page: &[u8], record_len: usize) -> bool {
     free_start + record_len + 4 <= free_end
 }
 
-fn insert_record(page: &mut [u8], record: &[u8]) -> Result<(), StorageError> {
+fn insert_record(page: &mut [u8], record: &[u8]) -> Result<u16, StorageError> {
     if !has_space_for_record(page, record.len()) {
         return Err(StorageError::Invalid("page full".to_string()));
     }
@@ -468,7 +629,7 @@ fn insert_record(page: &mut [u8], record: &[u8]) -> Result<(), StorageError> {
     write_u16(page, 1, slot_count + 1);
     write_u16(page, 3, new_free_start as u16);
     write_u16(page, 5, slot_offset as u16);
-    Ok(())
+    Ok(slot_count)
 }
 
 fn read_records(page: &[u8]) -> Vec<Vec<u8>> {
@@ -480,6 +641,20 @@ fn read_records(page: &[u8]) -> Vec<Vec<u8>> {
         let record_len = read_u16(page, slot_offset + 2) as usize;
         if record_offset + record_len <= PAGE_SIZE {
             records.push(page[record_offset..record_offset + record_len].to_vec());
+        }
+    }
+    records
+}
+
+fn read_records_with_slots(page: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let slot_count = read_u16(page, 1) as usize;
+    let mut records = Vec::new();
+    for idx in 0..slot_count {
+        let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+        let record_offset = read_u16(page, slot_offset) as usize;
+        let record_len = read_u16(page, slot_offset + 2) as usize;
+        if record_offset + record_len <= PAGE_SIZE {
+            records.push((idx as u16, page[record_offset..record_offset + record_len].to_vec()));
         }
     }
     records
@@ -511,6 +686,50 @@ fn decode_row(record: &[u8]) -> Result<Vec<Value>, StorageError> {
         values.push(value);
     }
     Ok(values)
+}
+
+fn encode_index_key(values: &[Value]) -> Result<Vec<u8>, StorageError> {
+    let mut buf = Vec::new();
+    if values.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("index key too wide".to_string()));
+    }
+    buf.extend_from_slice(&(values.len() as u16).to_le_bytes());
+    for value in values {
+        encode_value(value, &mut buf)?;
+    }
+    Ok(buf)
+}
+
+fn encode_index_entry(entry: &IndexEntry) -> Result<Vec<u8>, StorageError> {
+    let mut buf = encode_index_key(&entry.key)?;
+    buf.extend_from_slice(&entry.row.page_id.to_le_bytes());
+    buf.extend_from_slice(&entry.row.slot.to_le_bytes());
+    Ok(buf)
+}
+
+fn decode_index_entry(record: &[u8]) -> Result<IndexEntry, StorageError> {
+    if record.len() < 2 + 4 + 2 {
+        return Err(StorageError::Corrupt("invalid index entry".to_string()));
+    }
+    let mut pos = 0;
+    let count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut key = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (value, new_pos) = decode_value(record, pos)?;
+        pos = new_pos;
+        key.push(value);
+    }
+    if pos + 6 > record.len() {
+        return Err(StorageError::Corrupt("invalid index entry location".to_string()));
+    }
+    let page_id = read_u32(record, pos);
+    pos += 4;
+    let slot = read_u16(record, pos);
+    Ok(IndexEntry {
+        key,
+        row: RowLocation { page_id, slot },
+    })
 }
 
 fn encode_value(value: &Value, buf: &mut Vec<u8>) -> Result<(), StorageError> {
@@ -611,6 +830,33 @@ fn decode_value(record: &[u8], pos: usize) -> Result<(Value, usize), StorageErro
         }
     };
     Ok((value, cursor))
+}
+
+fn column_index_map(columns: &[Column]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (idx, column) in columns.iter().enumerate() {
+        map.insert(column.name.to_lowercase(), idx);
+    }
+    map
+}
+
+fn index_key_from_row(
+    index: &IndexMeta,
+    column_map: &HashMap<String, usize>,
+    row: &[Value],
+) -> Result<Vec<Value>, StorageError> {
+    let mut key = Vec::with_capacity(index.columns.len());
+    for column in &index.columns {
+        let idx = column_map.get(&column.name.value.to_lowercase()).ok_or_else(|| {
+            StorageError::Invalid(format!("unknown column in index {}", column.name.value))
+        })?;
+        key.push(row[*idx].clone());
+    }
+    Ok(key)
+}
+
+fn key_has_null(values: &[Value]) -> bool {
+    values.iter().any(|value| matches!(value, Value::Null))
 }
 
 fn encode_ident(ident: &Ident, buf: &mut Vec<u8>) -> Result<(), StorageError> {
