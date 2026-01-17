@@ -7,6 +7,7 @@ use md5::{Digest, Md5};
 use std::fs;
 
 pub mod ast;
+pub mod parser;
 
 pub struct SQLiteDB {
     conn: Connection,
