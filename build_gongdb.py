@@ -308,6 +308,7 @@ Please work on this task now. Remember: this is your only chance to work on it i
         codex_cmd = [
             'codex', 'exec',
             '--full-auto',
+            '--model', 'gpt-5.2-codex',
             '--output-last-message', codex_output_path
         ]
         
