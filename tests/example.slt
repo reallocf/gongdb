@@ -1,0 +1,27 @@
+# Example SQL Logic Test file
+# This file demonstrates the sqllogictest format
+
+# Test a simple query
+query I
+SELECT 1
+----
+1
+
+# Test a statement that should succeed
+statement ok
+CREATE TABLE test (id INTEGER, name TEXT);
+
+# Test inserting data
+statement ok
+INSERT INTO test VALUES (1, 'Alice'), (2, 'Bob');
+
+# Test a query with multiple results
+query II rowsort
+SELECT id, name FROM test ORDER BY id
+----
+1 Alice
+2 Bob
+
+# Test a query that should fail
+statement error
+SELECT * FROM nonexistent_table;
