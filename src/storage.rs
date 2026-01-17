@@ -23,6 +23,7 @@ pub enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
+    Blob(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +440,14 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) -> Result<(), StorageError> {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
+        Value::Blob(bytes) => {
+            buf.push(4);
+            if bytes.len() > u32::MAX as usize {
+                return Err(StorageError::Invalid("blob too large".to_string()));
+            }
+            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
     }
     Ok(())
 }
@@ -485,6 +494,21 @@ fn decode_value(record: &[u8], pos: usize) -> Result<(Value, usize), StorageErro
             let text = String::from_utf8_lossy(&record[cursor..end]).to_string();
             cursor = end;
             Value::Text(text)
+        }
+        4 => {
+            let end = cursor + 4;
+            if end > record.len() {
+                return Err(StorageError::Corrupt("invalid blob".to_string()));
+            }
+            let len = read_u32(record, cursor) as usize;
+            cursor = end;
+            let end = cursor + len;
+            if end > record.len() {
+                return Err(StorageError::Corrupt("invalid blob length".to_string()));
+            }
+            let data = record[cursor..end].to_vec();
+            cursor = end;
+            Value::Blob(data)
         }
         _ => {
             return Err(StorageError::Corrupt(format!(
