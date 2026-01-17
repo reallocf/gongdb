@@ -35,15 +35,16 @@ class Logger:
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         log_message = f"[{timestamp}] {message}"
         
-        # Write to file
+        # Write to file (flush immediately for real-time logging)
         with open(self.log_file, 'a') as f:
             f.write(log_message + '\n')
+            f.flush()  # Ensure immediate write to file
         
-        # Write to stdout/stderr
+        # Write to stdout/stderr (flush immediately for real-time display)
         if error:
-            print(log_message, file=sys.stderr)
+            print(log_message, file=sys.stderr, flush=True)
         else:
-            print(log_message)
+            print(log_message, flush=True)
     
     def log(self, message: str):
         """Log a message"""
@@ -301,8 +302,14 @@ def add_task_note(task_id: str, note: str) -> bool:
     return False
 
 
-def commit_changes(task_id: str, task_title: str) -> Optional[str]:
-    """Commit changes to git. Returns commit hash if successful, None otherwise."""
+def commit_changes(task_id: str, task_title: str, task_completed: bool = False) -> Optional[str]:
+    """Commit changes to git. Returns commit hash if successful, None otherwise.
+    
+    Args:
+        task_id: The task/bead ID
+        task_title: The task title
+        task_completed: Whether the task was completed (default: False)
+    """
     logger.log("Checking for changes to commit...")
     
     # Check if there are changes
@@ -322,7 +329,9 @@ def commit_changes(task_id: str, task_title: str) -> Optional[str]:
         logger.error(f"Failed to stage changes: {stderr}")
         return None
     
-    commit_message = f"Work on bead: {task_id} - {task_title}"
+    # Include completion status in commit message
+    status = "COMPLETED" if task_completed else "IN PROGRESS"
+    commit_message = f"Work on bead: {task_id} - {task_title} [{status}]"
     logger.log(f"Committing changes: {commit_message}")
     
     exit_code, stdout, stderr = run_command(['git', 'commit', '-m', commit_message])
@@ -420,15 +429,30 @@ Please work on this task now. Remember: this is your only chance to work on it i
             bufsize=1  # Line buffered
         )
         
-        # Send prompt and capture output
-        stdout, _ = process.communicate(input=prompt)
-        codex_exit_code = process.returncode
+        # Send prompt to stdin and close it
+        try:
+            process.stdin.write(prompt)
+            process.stdin.flush()
+        finally:
+            process.stdin.close()
         
-        # Log codex output
-        if stdout:
-            for line in stdout.split('\n'):
-                if line.strip():
+        # Stream output in real-time
+        logger.log("--- Codex Output Start (streaming) ---")
+        stdout_lines = []
+        
+        # Read output line by line as it comes in
+        try:
+            for line in process.stdout:
+                line = line.rstrip('\n\r')
+                if line:  # Only log non-empty lines
+                    # Log immediately to both file and stdout
                     logger.log(line)
+                    stdout_lines.append(line)
+        except Exception as e:
+            logger.error(f"Error reading codex output: {e}")
+        
+        # Wait for process to complete
+        codex_exit_code = process.wait()
         
         if codex_exit_code != 0:
             logger.error(f"Codex session exited with code: {codex_exit_code}")
@@ -570,14 +594,17 @@ def main():
         codex_duration = int(codex_end_time - codex_start_time)
         log_codex_session_complete(codex_duration, codex_exit_code)
         
-        # Commit changes
+        # Check if task was completed (before committing)
+        time.sleep(1)  # Give bd a moment to sync
+        task_completed = is_task_completed(task_id)
+        
+        # Commit changes (include completion status in message)
         logger.log("Committing changes...")
-        commit_hash = commit_changes(task_id, task_title)
+        commit_hash = commit_changes(task_id, task_title, task_completed)
         # commit_changes already logs appropriate messages for success/failure/no-changes
         
-        # Check if task was completed
-        time.sleep(1)  # Give bd a moment to sync
-        if is_task_completed(task_id):
+        # Handle task completion
+        if task_completed:
             log_task_completed(task_id)
             continue
         else:
