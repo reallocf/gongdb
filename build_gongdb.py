@@ -124,17 +124,114 @@ def get_total_open_tasks() -> int:
         return 0
 
 
-def get_top_task() -> Optional[str]:
-    """Get the top open task"""
-    exit_code, stdout, stderr = run_command(['bd', 'list', '--json', '--limit', '1'])
+def get_task_dependencies(task_id: str) -> list:
+    """Get list of dependency IDs for a task"""
+    exit_code, stdout, stderr = run_command(['bd', 'dep', 'list', task_id, '--json'])
     
     if exit_code != 0 or not stdout.strip():
-        return None
+        return []
     
     try:
         data = json.loads(stdout)
-        if data and len(data) > 0:
-            return data[0].get('id')
+        # Dependencies are listed, extract their IDs
+        if isinstance(data, list):
+            return [dep.get('id', '') for dep in data if dep.get('id')]
+        elif isinstance(data, dict) and 'dependencies' in data:
+            return [dep.get('id', '') for dep in data['dependencies'] if dep.get('id')]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        pass
+    
+    return []
+
+
+def is_task_ready(task_id: str) -> bool:
+    """Check if a task is ready (all dependencies completed)"""
+    dependencies = get_task_dependencies(task_id)
+    
+    if not dependencies:
+        return True  # No dependencies, task is ready
+    
+    # Check if all dependencies are completed
+    for dep_id in dependencies:
+        if not is_task_completed(dep_id):
+            return False
+    
+    return True
+
+
+def extract_phase_number(title: str) -> int:
+    """Extract phase number from task title. Returns 999 if not a phase task."""
+    try:
+        if 'Phase' in title:
+            parts = title.split(':')[0].split()
+            return int(parts[-1])
+    except (ValueError, IndexError):
+        pass
+    return 999
+
+
+def get_all_tasks() -> list:
+    """Get all tasks from beads, including those that might not appear in default list.
+    Reads from both bd list and issues.jsonl to ensure we get all tasks."""
+    tasks = []
+    
+    # First, try bd list
+    exit_code, stdout, stderr = run_command(['bd', 'list', '--json'])
+    if exit_code == 0 and stdout.strip():
+        try:
+            tasks = json.loads(stdout)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    
+    # Also read from issues.jsonl to catch any tasks that bd list might miss
+    try:
+        issues_file = '.beads/issues.jsonl'
+        import os
+        if os.path.exists(issues_file):
+            with open(issues_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            task = json.loads(line)
+                            # Only add if not already in tasks list
+                            if not any(t.get('id') == task.get('id') for t in tasks):
+                                tasks.append(task)
+                        except json.JSONDecodeError:
+                            pass
+    except Exception:
+        pass
+    
+    return tasks
+
+
+def get_top_task() -> Optional[str]:
+    """Get the top open task that has all dependencies completed, prioritizing by phase number.
+    Phase 1 tasks come first, Phase 15 comes after Phase 14."""
+    data = get_all_tasks()
+    
+    if not data:
+        return None
+    
+    try:
+        # Filter for open tasks (status not 'done' or 'closed')
+        open_tasks = [task for task in data if task.get('status', '') not in ('done', 'closed')]
+        
+        # Filter for tasks that are ready (all dependencies completed)
+        ready_tasks = [task for task in open_tasks if is_task_ready(task.get('id', ''))]
+        
+        if not ready_tasks:
+            return None
+        
+        # Sort by phase number (lower phase numbers first)
+        # This ensures Phase 1 comes first, and Phase 15 comes after Phase 14
+        ready_tasks.sort(key=lambda t: (
+            extract_phase_number(t.get('title', '')),  # Primary sort: phase number
+            t.get('id', '')  # Secondary sort: task ID for consistency
+        ))
+        
+        # Return the first ready task (lowest phase number)
+        return ready_tasks[0].get('id')
     except (json.JSONDecodeError, KeyError, IndexError):
         pass
     
