@@ -14,11 +14,30 @@ The `build_gongdb.py` script automates the process of working through beads (tas
 
 - `codex` CLI installed and configured
 - `bd` (beads) CLI installed
-- `python3` (Python 3.6+) available
+- `uv` (Python package manager) installed - [Install uv](https://github.com/astral-sh/uv)
+- `python3` (Python 3.8+) available
 - Git repository initialized
 - Working directory should be the project root
 
 ## Usage
+
+### Using uv (Recommended)
+
+```bash
+# First time setup - sync the environment
+uv sync
+
+# Run the script
+uv run build_gongdb.py
+```
+
+Or directly:
+
+```bash
+uv run python3 build_gongdb.py
+```
+
+### Using Python directly
 
 ```bash
 ./build_gongdb.py
