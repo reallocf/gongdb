@@ -103,6 +103,7 @@ pub struct StorageEngine {
     catalog_format_version: u32,
     tables: HashMap<String, TableMeta>,
     indexes: HashMap<String, IndexMeta>,
+    free_pages: Vec<u32>,
 }
 
 impl StorageEngine {
@@ -117,6 +118,7 @@ impl StorageEngine {
             catalog_format_version: CATALOG_FORMAT_VERSION,
             tables: HashMap::new(),
             indexes: HashMap::new(),
+            free_pages: Vec::new(),
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -183,6 +185,7 @@ impl StorageEngine {
             catalog_format_version,
             tables,
             indexes,
+            free_pages: Vec::new(),
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -202,10 +205,33 @@ impl StorageEngine {
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<(), StorageError> {
-        if self.tables.remove(name).is_none() {
-            return Err(StorageError::NotFound(format!("table not found: {}", name)));
+        let table = self
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", name)))?;
+        if let Some(dependent) = self.find_foreign_key_dependency(name) {
+            return Err(StorageError::Invalid(format!(
+                "table {} is referenced by {}",
+                name, dependent
+            )));
         }
-        self.indexes.retain(|_, index| index.table != name);
+        let dependent_indexes: Vec<IndexMeta> = self
+            .indexes
+            .values()
+            .filter(|index| index.table.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect();
+
+        self.free_page_chain(table.first_page)?;
+        for index in &dependent_indexes {
+            self.free_page_chain(index.first_page)?;
+        }
+
+        self.tables.remove(name);
+        for index in &dependent_indexes {
+            self.indexes.remove(&index.name);
+        }
         self.write_catalog()?;
         self.bump_schema_version()
     }
@@ -342,9 +368,13 @@ impl StorageEngine {
     }
 
     pub fn drop_index(&mut self, name: &str) -> Result<(), StorageError> {
-        if self.indexes.remove(name).is_none() {
-            return Err(StorageError::NotFound(format!("index not found: {}", name)));
-        }
+        let index = self
+            .indexes
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", name)))?;
+        self.free_page_chain(index.first_page)?;
+        self.indexes.remove(name);
         self.write_catalog()?;
         self.bump_schema_version()
     }
@@ -453,12 +483,82 @@ impl StorageEngine {
     }
 
     pub fn allocate_data_page(&mut self) -> Result<u32, StorageError> {
+        if let Some(page_id) = self.free_pages.pop() {
+            let page = init_data_page();
+            self.write_page(page_id, &page)?;
+            return Ok(page_id);
+        }
         let page_id = self.next_page_id;
         self.next_page_id += 1;
         let page = init_data_page();
         self.write_page(page_id, &page)?;
         self.write_header()?;
         Ok(page_id)
+    }
+
+    fn find_foreign_key_dependency(&self, target: &str) -> Option<String> {
+        for table in self.tables.values() {
+            if table.name.eq_ignore_ascii_case(target) {
+                continue;
+            }
+            for constraint in &table.constraints {
+                if let TableConstraint::ForeignKey { foreign_table, .. } = constraint {
+                    let foreign_name = object_name_string(foreign_table);
+                    if foreign_name.eq_ignore_ascii_case(target) {
+                        return Some(table.name.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn free_page_chain(&mut self, start_page_id: u32) -> Result<(), StorageError> {
+        let pages = self.collect_page_chain(start_page_id)?;
+        for page_id in pages {
+            self.free_page(page_id)?;
+        }
+        Ok(())
+    }
+
+    fn free_page(&mut self, page_id: u32) -> Result<(), StorageError> {
+        if page_id == HEADER_PAGE_ID || page_id == CATALOG_PAGE_ID {
+            return Err(StorageError::Invalid(format!(
+                "cannot free reserved page {}",
+                page_id
+            )));
+        }
+        let page = init_data_page();
+        self.write_page(page_id, &page)?;
+        if !self.free_pages.contains(&page_id) {
+            self.free_pages.push(page_id);
+        }
+        Ok(())
+    }
+
+    fn collect_page_chain(&self, start_page_id: u32) -> Result<Vec<u32>, StorageError> {
+        if start_page_id == 0 {
+            return Err(StorageError::Corrupt("invalid page chain start".to_string()));
+        }
+        let mut pages = Vec::new();
+        let mut seen = HashSet::new();
+        let mut page_id = start_page_id;
+        loop {
+            if !seen.insert(page_id) {
+                return Err(StorageError::Corrupt(format!(
+                    "page chain loop at {}",
+                    page_id
+                )));
+            }
+            pages.push(page_id);
+            let page = self.read_page(page_id)?;
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(pages)
     }
 
     fn read_page(&self, page_id: u32) -> Result<Vec<u8>, StorageError> {
@@ -585,6 +685,14 @@ fn load_catalog_from_file(
         return Err(StorageError::Corrupt("invalid next page id".to_string()));
     }
     Ok((tables, indexes))
+}
+
+fn object_name_string(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|part| part.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn init_data_page() -> Vec<u8> {
