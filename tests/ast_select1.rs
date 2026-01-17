@@ -1,4 +1,5 @@
 use gongdb::ast::*;
+use gongdb::parser::parse_statement;
 use std::collections::HashSet;
 use std::fs;
 
@@ -298,4 +299,16 @@ fn ast_represents_select1_statement_types() {
     assert!(matches!(samples[0], Statement::CreateTable(_)));
     assert!(matches!(samples[1], Statement::Insert(_)));
     assert!(matches!(samples[2], Statement::Select(_)));
+}
+
+#[test]
+fn parser_accepts_select1_sql_blocks() {
+    let sql_blocks =
+        extract_sql_blocks("tests/sqlite/select1.test").expect("read select1.test");
+
+    for sql in sql_blocks {
+        parse_statement(&sql).unwrap_or_else(|err| {
+            panic!("failed to parse select1 SQL:\n{}\nerror: {}", sql, err.message)
+        });
+    }
 }
