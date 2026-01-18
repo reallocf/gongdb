@@ -526,8 +526,29 @@ impl GongDB {
         }
 
         let output_columns = projection_columns(&select.projection, &columns, &column_scopes)?;
+        let projection_has_aggregate = projection_has_aggregate(&select.projection);
+        let having_has_aggregate = select
+            .having
+            .as_ref()
+            .is_some_and(|expr| expr_contains_aggregate(expr));
 
-        if is_count_star(select) && select.having.is_none() {
+        if select
+            .group_by
+            .iter()
+            .any(|expr| expr_contains_aggregate(expr))
+        {
+            return Err(GongDBError::new("GROUP BY cannot contain aggregate expressions"));
+        }
+
+        if select.group_by.is_empty()
+            && select.having.is_some()
+            && !projection_has_aggregate
+            && !having_has_aggregate
+        {
+            return Err(GongDBError::new("HAVING requires aggregate expressions"));
+        }
+
+        if select.group_by.is_empty() && is_count_star(select) && select.having.is_none() {
             let count = filtered.len() as i64;
             return Ok(QueryResult {
                 columns: output_columns,
@@ -535,33 +556,168 @@ impl GongDB {
             });
         }
 
-        let projection_aggregates = aggregate_projections(&select.projection)?;
-        let having_has_aggregate = select
-            .having
-            .as_ref()
-            .is_some_and(|expr| expr_contains_aggregate(expr));
+        if !select.group_by.is_empty() {
+            struct Group {
+                key: Vec<Value>,
+                rows: Vec<Vec<Value>>,
+            }
 
-        if select.having.is_some() && projection_aggregates.is_none() && !having_has_aggregate {
-            return Err(GongDBError::new("HAVING requires aggregate expressions"));
-        }
+            let mut groups: Vec<Group> = Vec::new();
+            for row in filtered {
+                let scope = EvalScope {
+                    columns: &columns,
+                    column_scopes: &column_scopes,
+                    row: &row,
+                    table_scope: &table_scope,
+                };
+                let mut key = Vec::with_capacity(select.group_by.len());
+                for expr in &select.group_by {
+                    key.push(eval_expr(self, expr, &scope, outer)?);
+                }
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group_keys_equal(&group.key, &key))
+                {
+                    group.rows.push(row);
+                } else {
+                    groups.push(Group {
+                        key,
+                        rows: vec![row],
+                    });
+                }
+            }
 
-        if projection_aggregates.is_some() || having_has_aggregate {
-            let aggregate_values = if let Some(aggregates) = projection_aggregates.as_ref() {
-                compute_aggregates(
-                    self,
-                    aggregates,
-                    &columns,
-                    &column_scopes,
-                    &table_scope,
-                    &filtered,
-                    outer,
-                )?
-            } else {
+            let order_plans = if select.order_by.is_empty() {
                 Vec::new()
+            } else {
+                resolve_order_by_plans(&select.order_by, &output_columns)?
             };
 
+            let projected = if order_plans.is_empty() {
+                let mut rows = Vec::with_capacity(groups.len());
+                for group in &groups {
+                    if let Some(having) = &select.having {
+                        if !evaluate_group_having(
+                            self,
+                            having,
+                            &columns,
+                            &column_scopes,
+                            &table_scope,
+                            &group.rows,
+                            outer,
+                        )? {
+                            continue;
+                        }
+                    }
+                    rows.push(evaluate_group_projection(
+                        self,
+                        &select.projection,
+                        &columns,
+                        &column_scopes,
+                        &table_scope,
+                        &group.rows,
+                        outer,
+                    )?);
+                }
+                if select.distinct {
+                    let mut unique: Vec<Vec<Value>> = Vec::new();
+                    'row: for row in rows {
+                        for existing in &unique {
+                            if rows_equal(existing, &row) {
+                                continue 'row;
+                            }
+                        }
+                        unique.push(row);
+                    }
+                    unique
+                } else {
+                    rows
+                }
+            } else {
+                let order_table_scope = TableScope {
+                    table_name: None,
+                    table_alias: None,
+                };
+                let order_column_scopes =
+                    vec![order_table_scope.clone(); output_columns.len()];
+                let mut rows = Vec::with_capacity(groups.len());
+                for group in &groups {
+                    if let Some(having) = &select.having {
+                        if !evaluate_group_having(
+                            self,
+                            having,
+                            &columns,
+                            &column_scopes,
+                            &table_scope,
+                            &group.rows,
+                            outer,
+                        )? {
+                            continue;
+                        }
+                    }
+                    let projected_row = evaluate_group_projection(
+                        self,
+                        &select.projection,
+                        &columns,
+                        &column_scopes,
+                        &table_scope,
+                        &group.rows,
+                        outer,
+                    )?;
+                    let scope = EvalScope {
+                        columns: &columns,
+                        column_scopes: &column_scopes,
+                        row: group.rows.first().unwrap(),
+                        table_scope: &table_scope,
+                    };
+                    let order_values = compute_group_order_values(
+                        self,
+                        &order_plans,
+                        &projected_row,
+                        &output_columns,
+                        &order_column_scopes,
+                        &order_table_scope,
+                        &scope,
+                        &group.rows,
+                        outer,
+                    )?;
+                    rows.push(SortedRow {
+                        order_values,
+                        projected: projected_row,
+                    });
+                }
+                let mut sorted_rows = if select.distinct {
+                    let mut unique: Vec<SortedRow> = Vec::new();
+                    'row: for row in rows {
+                        for existing in &unique {
+                            if rows_equal(&existing.projected, &row.projected) {
+                                continue 'row;
+                            }
+                        }
+                        unique.push(row);
+                    }
+                    unique
+                } else {
+                    rows
+                };
+                sorted_rows.sort_by(|a, b| {
+                    compare_order_keys(&a.order_values, &b.order_values, &order_plans)
+                });
+                sorted_rows
+                    .into_iter()
+                    .map(|row| row.projected)
+                    .collect()
+            };
+
+            return Ok(QueryResult {
+                columns: output_columns,
+                rows: projected,
+            });
+        }
+
+        if projection_has_aggregate || having_has_aggregate {
             if let Some(having) = &select.having {
-                let passes = eval_having_clause(
+                if !evaluate_group_having(
                     self,
                     having,
                     &columns,
@@ -569,8 +725,7 @@ impl GongDB {
                     &table_scope,
                     &filtered,
                     outer,
-                )?;
-                if !passes {
+                )? {
                     return Ok(QueryResult {
                         columns: output_columns,
                         rows: Vec::new(),
@@ -578,30 +733,19 @@ impl GongDB {
                 }
             }
 
-            let rows = if projection_aggregates.is_some() {
-                vec![aggregate_values]
-            } else {
-                let empty_scope = EvalScope {
-                    columns: &[],
-                    column_scopes: &[],
-                    row: &[],
-                    table_scope: &TableScope {
-                        table_name: None,
-                        table_alias: None,
-                    },
-                };
-                vec![project_row(
-                    self,
-                    &select.projection,
-                    &[],
-                    &empty_scope,
-                    outer,
-                )?]
-            };
+            let projected = evaluate_group_projection(
+                self,
+                &select.projection,
+                &columns,
+                &column_scopes,
+                &table_scope,
+                &filtered,
+                outer,
+            )?;
 
             return Ok(QueryResult {
                 columns: output_columns,
-                rows,
+                rows: vec![projected],
             });
         }
 
@@ -2377,6 +2521,51 @@ fn compute_order_values(
     Ok(values)
 }
 
+fn compute_group_order_values(
+    db: &GongDB,
+    plans: &[OrderByPlan],
+    projected_row: &[Value],
+    output_columns: &[Column],
+    order_column_scopes: &[TableScope],
+    order_table_scope: &TableScope,
+    scope: &EvalScope<'_>,
+    group_rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<Vec<Value>, GongDBError> {
+    let order_scope = EvalScope {
+        columns: output_columns,
+        column_scopes: order_column_scopes,
+        row: projected_row,
+        table_scope: order_table_scope,
+    };
+    let mut values = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let value = match &plan.source {
+            OrderByValueSource::Expr(expr) => {
+                let expr = if expr_contains_aggregate(expr) {
+                    replace_aggregate_calls(
+                        db,
+                        expr,
+                        scope.columns,
+                        scope.column_scopes,
+                        scope.table_scope,
+                        group_rows,
+                        outer,
+                    )?
+                } else {
+                    expr.clone()
+                };
+                eval_expr(db, &expr, &order_scope, Some(scope))?
+            }
+            OrderByValueSource::ProjectionIndex(idx) => {
+                projected_row.get(*idx).cloned().unwrap_or(Value::Null)
+            }
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
 fn compare_order_keys(
     left: &[Value],
     right: &[Value],
@@ -2520,6 +2709,30 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
+    projection.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => expr_contains_aggregate(expr),
+        _ => false,
+    })
+}
+
+fn group_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => values_equal(left, right),
+    }
+}
+
+fn group_keys_equal(left: &[Value], right: &[Value]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .all(|(l, r)| group_values_equal(l, r))
+}
+
 #[derive(Clone)]
 struct AggregateExpr {
     kind: AggregateKind,
@@ -2539,6 +2752,7 @@ enum AggregateKind {
     GroupConcat,
 }
 
+#[allow(dead_code)]
 fn eval_having_clause(
     db: &GongDB,
     expr: &Expr,
@@ -2969,6 +3183,96 @@ fn value_to_literal(value: &Value) -> Literal {
     }
 }
 
+fn evaluate_group_projection(
+    db: &GongDB,
+    projection: &[SelectItem],
+    columns: &[Column],
+    column_scopes: &[TableScope],
+    table_scope: &TableScope,
+    group_rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<Vec<Value>, GongDBError> {
+    let null_row = vec![Value::Null; columns.len()];
+    let row = group_rows.first().unwrap_or(&null_row);
+    let scope = EvalScope {
+        columns,
+        column_scopes,
+        row,
+        table_scope,
+    };
+    let mut output = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard => {
+                output.extend(row.iter().cloned());
+            }
+            SelectItem::Expr { expr, .. } => {
+                let rewritten = if expr_contains_aggregate(expr) {
+                    replace_aggregate_calls(
+                        db,
+                        expr,
+                        columns,
+                        column_scopes,
+                        table_scope,
+                        group_rows,
+                        outer,
+                    )?
+                } else {
+                    expr.clone()
+                };
+                let value = eval_expr(db, &rewritten, &scope, outer)?;
+                output.push(value);
+            }
+            SelectItem::QualifiedWildcard(name) => {
+                let qualifier = object_name(name);
+                let indices = qualified_wildcard_indices(&qualifier, column_scopes);
+                if indices.is_empty() {
+                    return Err(GongDBError::new(format!("unknown table: {}", qualifier)));
+                }
+                for idx in indices {
+                    output.push(row[idx].clone());
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn evaluate_group_having(
+    db: &GongDB,
+    having: &Expr,
+    columns: &[Column],
+    column_scopes: &[TableScope],
+    table_scope: &TableScope,
+    group_rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<bool, GongDBError> {
+    let null_row = vec![Value::Null; columns.len()];
+    let row = group_rows.first().unwrap_or(&null_row);
+    let scope = EvalScope {
+        columns,
+        column_scopes,
+        row,
+        table_scope,
+    };
+    let rewritten = if expr_contains_aggregate(having) {
+        replace_aggregate_calls(
+            db,
+            having,
+            columns,
+            column_scopes,
+            table_scope,
+            group_rows,
+            outer,
+        )?
+    } else {
+        having.clone()
+    };
+    let value = eval_expr(db, &rewritten, &scope, outer)?;
+    Ok(value_to_bool(&value))
+}
+
+#[allow(dead_code)]
 fn aggregate_projections(
     projection: &[SelectItem],
 ) -> Result<Option<Vec<AggregateExpr>>, GongDBError> {
