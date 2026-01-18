@@ -3,7 +3,7 @@ use crate::ast::{
     InsertSource, Select, SelectItem, Statement, TableConstraint,
 };
 use crate::parser;
-use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value};
+use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
 use std::collections::{HashMap, HashSet};
@@ -65,6 +65,12 @@ impl GongDB {
                         )));
                     }
                     return Ok(DBOutput::StatementComplete(0));
+                }
+                if self.storage.get_view(&name).is_some() {
+                    return Err(GongDBError::new(format!(
+                        "view already exists: {}",
+                        name
+                    )));
                 }
 
                 let plan = build_create_table_plan(create)?;
@@ -162,8 +168,60 @@ impl GongDB {
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
+            Statement::CreateView(create) => {
+                let name = object_name(&create.name);
+                if self.storage.get_table(&name).is_some() {
+                    return Err(GongDBError::new(format!(
+                        "table already exists: {}",
+                        name
+                    )));
+                }
+                if self.storage.get_view(&name).is_some() {
+                    if !create.if_not_exists {
+                        return Err(GongDBError::new(format!(
+                            "view already exists: {}",
+                            name
+                        )));
+                    }
+                    return Ok(DBOutput::StatementComplete(0));
+                }
+                let output_columns = self.evaluate_select_values(&create.query)?.columns;
+                if !create.columns.is_empty() && create.columns.len() != output_columns.len() {
+                    return Err(GongDBError::new(format!(
+                        "view column count mismatch: {}",
+                        name
+                    )));
+                }
+                ensure_unique_idents(&create.columns)?;
+                let view = ViewMeta {
+                    name: name.clone(),
+                    columns: create.columns,
+                    query: create.query,
+                };
+                self.storage.create_view(view)?;
+                Ok(DBOutput::StatementComplete(0))
+            }
+            Statement::DropView(drop) => {
+                let name = object_name(&drop.name);
+                if self.storage.get_view(&name).is_none() && !drop.if_exists {
+                    return Err(GongDBError::new(format!(
+                        "view not found: {}",
+                        name
+                    )));
+                }
+                if self.storage.get_view(&name).is_some() {
+                    self.storage.drop_view(&name)?;
+                }
+                Ok(DBOutput::StatementComplete(0))
+            }
             Statement::Insert(insert) => {
                 let table_name = object_name(&insert.table);
+                if self.storage.get_view(&table_name).is_some() {
+                    return Err(GongDBError::new(format!(
+                        "cannot modify view {}",
+                        table_name
+                    )));
+                }
                 let table = self
                     .storage
                     .get_table(&table_name)
@@ -191,11 +249,32 @@ impl GongDB {
     }
 
     fn run_select(&self, select: &Select) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
-        let (table_name, columns) = single_table(&self.storage, select)?;
-        let rows = self.storage.scan_table(&table_name)?;
+        let result = self.evaluate_select_values(select)?;
+        let output_rows = result
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().map(|v| value_to_string(&v)).collect())
+            .collect();
+        Ok(DBOutput::Rows {
+            types: vec![DefaultColumnType::Text; result.columns.len()],
+            rows: output_rows,
+        })
+    }
 
+    fn evaluate_select_values(&self, select: &Select) -> Result<QueryResult, GongDBError> {
+        let mut view_stack = Vec::new();
+        self.evaluate_select_values_with_views(select, &mut view_stack)
+    }
+
+    fn evaluate_select_values_with_views(
+        &self,
+        select: &Select,
+        view_stack: &mut Vec<String>,
+    ) -> Result<QueryResult, GongDBError> {
+        let source = self.resolve_source(select, view_stack)?;
+        let columns = source.columns;
         let mut filtered = Vec::new();
-        for row in rows {
+        for row in source.rows {
             if let Some(predicate) = &select.selection {
                 let value = eval_expr(predicate, &columns, &row)?;
                 if !value_to_bool(&value) {
@@ -205,21 +284,21 @@ impl GongDB {
             filtered.push(row);
         }
 
+        let output_columns = projection_columns(&select.projection, &columns)?;
+
         if is_count_star(select) {
             let count = filtered.len() as i64;
-            let output_rows = vec![vec![value_to_string(&Value::Integer(count))]];
-            return Ok(DBOutput::Rows {
-                types: vec![DefaultColumnType::Text],
-                rows: output_rows,
+            return Ok(QueryResult {
+                columns: output_columns,
+                rows: vec![vec![Value::Integer(count)]],
             });
         }
 
         if let Some(aggregates) = aggregate_projections(&select.projection)? {
             let values = compute_aggregates(&aggregates, &columns, &filtered)?;
-            let output_row = values.into_iter().map(|v| value_to_string(&v)).collect();
-            return Ok(DBOutput::Rows {
-                types: vec![DefaultColumnType::Text; select.projection.len()],
-                rows: vec![output_row],
+            return Ok(QueryResult {
+                columns: output_columns,
+                rows: vec![values],
             });
         }
 
@@ -235,12 +314,12 @@ impl GongDB {
                 match item {
                     SelectItem::Wildcard => {
                         for value in &row {
-                            output.push(value_to_string(value));
+                            output.push(value.clone());
                         }
                     }
                     SelectItem::Expr { expr, .. } => {
                         let value = eval_expr(expr, &columns, &row)?;
-                        output.push(value_to_string(&value));
+                        output.push(value);
                     }
                     _ => {
                         return Err(GongDBError::new(
@@ -252,11 +331,68 @@ impl GongDB {
             projected.push(output);
         }
 
-        let column_count = projected.first().map(|row| row.len()).unwrap_or(0);
-        Ok(DBOutput::Rows {
-            types: vec![DefaultColumnType::Text; column_count],
+        Ok(QueryResult {
+            columns: output_columns,
             rows: projected,
         })
+    }
+
+    fn resolve_source(
+        &self,
+        select: &Select,
+        view_stack: &mut Vec<String>,
+    ) -> Result<QuerySource, GongDBError> {
+        if select.from.len() != 1 {
+            return Err(GongDBError::new(
+                "only single-table queries are supported in phase 2",
+            ));
+        }
+        match &select.from[0] {
+            crate::ast::TableRef::Named { name, .. } => {
+                let table_name = object_name(name);
+                if let Some(table) = self.storage.get_table(&table_name) {
+                    let rows = self.storage.scan_table(&table_name)?;
+                    return Ok(QuerySource {
+                        columns: table.columns.clone(),
+                        rows,
+                    });
+                }
+                if let Some(view) = self.storage.get_view(&table_name) {
+                    if view_stack
+                        .iter()
+                        .any(|entry| entry.eq_ignore_ascii_case(&table_name))
+                    {
+                        return Err(GongDBError::new(format!(
+                            "circular view reference: {}",
+                            table_name
+                        )));
+                    }
+                    view_stack.push(table_name.clone());
+                    let mut result = self.evaluate_select_values_with_views(&view.query, view_stack)?;
+                    view_stack.pop();
+                    if !view.columns.is_empty() {
+                        if view.columns.len() != result.columns.len() {
+                            return Err(GongDBError::new(format!(
+                                "view column count mismatch: {}",
+                                table_name
+                            )));
+                        }
+                        result.columns = columns_from_idents(&view.columns);
+                    }
+                    return Ok(QuerySource {
+                        columns: result.columns,
+                        rows: result.rows,
+                    });
+                }
+                Err(GongDBError::new(format!(
+                    "table not found: {}",
+                    table_name
+                )))
+            }
+            _ => Err(GongDBError::new(
+                "only simple table references are supported in phase 2",
+            )),
+        }
     }
 }
 
@@ -272,27 +408,14 @@ impl sqllogictest::AsyncDB for GongDB {
     async fn shutdown(&mut self) {}
 }
 
-fn single_table(
-    storage: &StorageEngine,
-    select: &Select,
-) -> Result<(String, Vec<Column>), GongDBError> {
-    if select.from.len() != 1 {
-        return Err(GongDBError::new(
-            "only single-table queries are supported in phase 2",
-        ));
-    }
-    match &select.from[0] {
-        crate::ast::TableRef::Named { name, .. } => {
-            let table_name = object_name(name);
-            let table = storage
-                .get_table(&table_name)
-                .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?;
-            Ok((table_name, table.columns.clone()))
-        }
-        _ => Err(GongDBError::new(
-            "only simple table references are supported in phase 2",
-        )),
-    }
+struct QuerySource {
+    columns: Vec<Column>,
+    rows: Vec<Vec<Value>>,
+}
+
+struct QueryResult {
+    columns: Vec<Column>,
+    rows: Vec<Vec<Value>>,
 }
 
 fn column_from_def(def: ColumnDef) -> Column {
@@ -491,6 +614,70 @@ fn object_name(name: &crate::ast::ObjectName) -> String {
         .map(|part| part.value.clone())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn projection_columns(
+    projection: &[SelectItem],
+    source_columns: &[Column],
+) -> Result<Vec<Column>, GongDBError> {
+    let mut columns = Vec::new();
+    for (idx, item) in projection.iter().enumerate() {
+        match item {
+            SelectItem::Wildcard => {
+                columns.extend(source_columns.iter().cloned());
+            }
+            SelectItem::Expr { expr, alias } => {
+                let name = if let Some(alias) = alias {
+                    alias.value.clone()
+                } else {
+                    match expr {
+                        Expr::Identifier(ident) => ident.value.clone(),
+                        Expr::CompoundIdentifier(idents) => idents
+                            .last()
+                            .map(|ident| ident.value.clone())
+                            .unwrap_or_else(|| format!("expr{}", idx + 1)),
+                        _ => format!("expr{}", idx + 1),
+                    }
+                };
+                columns.push(Column {
+                    name,
+                    data_type: DataType::Text,
+                    constraints: Vec::new(),
+                });
+            }
+            SelectItem::QualifiedWildcard(_) => {
+                return Err(GongDBError::new(
+                    "qualified wildcard not supported in phase 2",
+                ))
+            }
+        }
+    }
+    Ok(columns)
+}
+
+fn columns_from_idents(idents: &[Ident]) -> Vec<Column> {
+    idents
+        .iter()
+        .map(|ident| Column {
+            name: ident.value.clone(),
+            data_type: DataType::Text,
+            constraints: Vec::new(),
+        })
+        .collect()
+}
+
+fn ensure_unique_idents(idents: &[Ident]) -> Result<(), GongDBError> {
+    let mut seen = HashSet::new();
+    for ident in idents {
+        let key = ident.value.to_lowercase();
+        if !seen.insert(key) {
+            return Err(GongDBError::new(format!(
+                "duplicate column name: {}",
+                ident.value
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn build_insert_row(

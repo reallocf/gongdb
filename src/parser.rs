@@ -382,6 +382,7 @@ impl Parser {
     fn parse_create(&mut self) -> Result<Statement, ParserError> {
         self.expect_keyword("CREATE")?;
         let unique = self.eat_keyword("UNIQUE");
+        let _temp = self.eat_keyword("TEMP") || self.eat_keyword("TEMPORARY");
         if self.eat_keyword("TABLE") {
             let if_not_exists = self.eat_keyword("IF");
             if if_not_exists {

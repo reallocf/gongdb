@@ -1,6 +1,6 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, DataType, Expr, Ident, IndexedColumn, Literal, ObjectName,
-    SortOrder, TableConstraint, UnaryOperator,
+    OrderByExpr, Select, SelectItem, SortOrder, TableConstraint, TableRef, UnaryOperator,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -10,7 +10,7 @@ const PAGE_SIZE: usize = 4096;
 const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
-const CATALOG_FORMAT_VERSION: u32 = 2;
+const CATALOG_FORMAT_VERSION: u32 = 3;
 const HEADER_PAGE_SIZE_OFFSET: usize = 8;
 const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
 const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
@@ -64,6 +64,13 @@ pub struct IndexMeta {
     pub last_page: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ViewMeta {
+    pub name: String,
+    pub columns: Vec<Ident>,
+    pub query: Select,
+}
+
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),
@@ -103,6 +110,7 @@ pub struct StorageEngine {
     catalog_format_version: u32,
     tables: HashMap<String, TableMeta>,
     indexes: HashMap<String, IndexMeta>,
+    views: HashMap<String, ViewMeta>,
     free_pages: Vec<u32>,
 }
 
@@ -118,6 +126,7 @@ impl StorageEngine {
             catalog_format_version: CATALOG_FORMAT_VERSION,
             tables: HashMap::new(),
             indexes: HashMap::new(),
+            views: HashMap::new(),
             free_pages: Vec::new(),
         };
         engine.write_header()?;
@@ -144,12 +153,12 @@ impl StorageEngine {
         let mut header = vec![0; PAGE_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header)?;
-        let (next_page_id, schema_version, catalog_format_version, tables, indexes) =
+        let (next_page_id, schema_version, catalog_format_version, tables, indexes, views) =
             if header.starts_with(&FILE_MAGIC) {
                 let next_page_id = read_u32(&header, HEADER_NEXT_PAGE_ID_OFFSET);
                 let schema_version = read_u32(&header, HEADER_SCHEMA_VERSION_OFFSET);
                 let loaded_format_version = read_u32(&header, HEADER_CATALOG_FORMAT_OFFSET);
-                let (tables, indexes) =
+                let (tables, indexes, views) =
                     load_catalog_from_file(&mut file, next_page_id, loaded_format_version)?;
                 let mut catalog_format_version = if loaded_format_version == 0 {
                     1
@@ -165,16 +174,19 @@ impl StorageEngine {
                     catalog_format_version,
                     tables,
                     indexes,
+                    views,
                 )
         } else {
             let tables = HashMap::new();
             let indexes = HashMap::new();
+            let views = HashMap::new();
             (
                 CATALOG_PAGE_ID + 1,
                 0,
                 CATALOG_FORMAT_VERSION,
                 tables,
                 indexes,
+                views,
             )
         };
 
@@ -185,6 +197,7 @@ impl StorageEngine {
             catalog_format_version,
             tables,
             indexes,
+            views,
             free_pages: Vec::new(),
         };
         engine.write_header()?;
@@ -238,6 +251,33 @@ impl StorageEngine {
 
     pub fn get_table(&self, name: &str) -> Option<&TableMeta> {
         self.tables.get(name)
+    }
+
+    pub fn create_view(&mut self, view: ViewMeta) -> Result<(), StorageError> {
+        if self.views.contains_key(&view.name) {
+            return Err(StorageError::Invalid(format!(
+                "view already exists: {}",
+                view.name
+            )));
+        }
+        self.views.insert(view.name.clone(), view);
+        self.write_catalog()?;
+        self.bump_schema_version()
+    }
+
+    pub fn drop_view(&mut self, name: &str) -> Result<(), StorageError> {
+        if self.views.remove(name).is_none() {
+            return Err(StorageError::NotFound(format!(
+                "view not found: {}",
+                name
+            )));
+        }
+        self.write_catalog()?;
+        self.bump_schema_version()
+    }
+
+    pub fn get_view(&self, name: &str) -> Option<&ViewMeta> {
+        self.views.get(name)
     }
 
     pub fn get_index(&self, name: &str) -> Option<&IndexMeta> {
@@ -632,6 +672,14 @@ impl StorageEngine {
                 let _ = insert_record(&mut page, &encoded)?;
             }
         }
+        if self.catalog_format_version >= 3 {
+            for view in self.views.values() {
+                let mut encoded = Vec::new();
+                encoded.push(3);
+                encoded.extend_from_slice(&encode_view_meta(view)?);
+                let _ = insert_record(&mut page, &encoded)?;
+            }
+        }
         self.write_page(CATALOG_PAGE_ID, &page)
     }
 
@@ -645,12 +693,20 @@ fn load_catalog_from_file(
     file: &mut File,
     next_page_id: u32,
     format_version: u32,
-) -> Result<(HashMap<String, TableMeta>, HashMap<String, IndexMeta>), StorageError> {
+) -> Result<
+    (
+        HashMap<String, TableMeta>,
+        HashMap<String, IndexMeta>,
+        HashMap<String, ViewMeta>,
+    ),
+    StorageError,
+> {
     let mut page = vec![0; PAGE_SIZE];
     file.seek(SeekFrom::Start(CATALOG_PAGE_ID as u64 * PAGE_SIZE as u64))?;
     file.read_exact(&mut page)?;
     let mut tables = HashMap::new();
     let mut indexes = HashMap::new();
+    let mut views = HashMap::new();
     for record in read_records(&page) {
         if format_version >= 2 {
             if record.is_empty() {
@@ -664,6 +720,15 @@ fn load_catalog_from_file(
                 2 => {
                     let index = decode_index_meta(&record[1..])?;
                     indexes.insert(index.name.clone(), index);
+                }
+                3 => {
+                    if format_version < 3 {
+                        return Err(StorageError::Corrupt(
+                            "unexpected view record in catalog".to_string(),
+                        ));
+                    }
+                    let view = decode_view_meta(&record[1..])?;
+                    views.insert(view.name.clone(), view);
                 }
                 tag => {
                     return Err(StorageError::Corrupt(format!(
@@ -684,7 +749,7 @@ fn load_catalog_from_file(
     if next_page_id == 0 {
         return Err(StorageError::Corrupt("invalid next page id".to_string()));
     }
-    Ok((tables, indexes))
+    Ok((tables, indexes, views))
 }
 
 fn object_name_string(name: &ObjectName) -> String {
@@ -1921,6 +1986,352 @@ fn decode_index_meta(record: &[u8]) -> Result<IndexMeta, StorageError> {
         first_page,
         last_page,
     })
+}
+
+fn encode_select(select: &Select, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    buf.push(if select.distinct { 1 } else { 0 });
+    if select.projection.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many select items".to_string()));
+    }
+    buf.extend_from_slice(&(select.projection.len() as u16).to_le_bytes());
+    for item in &select.projection {
+        encode_select_item(item, buf)?;
+    }
+    if select.from.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many from items".to_string()));
+    }
+    buf.extend_from_slice(&(select.from.len() as u16).to_le_bytes());
+    for table_ref in &select.from {
+        encode_table_ref(table_ref, buf)?;
+    }
+    encode_optional_expr(&select.selection, buf)?;
+    if select.group_by.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many group by items".to_string()));
+    }
+    buf.extend_from_slice(&(select.group_by.len() as u16).to_le_bytes());
+    for expr in &select.group_by {
+        encode_expr(expr, buf)?;
+    }
+    encode_optional_expr(&select.having, buf)?;
+    if select.order_by.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many order by items".to_string()));
+    }
+    buf.extend_from_slice(&(select.order_by.len() as u16).to_le_bytes());
+    for order in &select.order_by {
+        encode_order_by_expr(order, buf)?;
+    }
+    encode_optional_expr(&select.limit, buf)?;
+    encode_optional_expr(&select.offset, buf)?;
+    Ok(())
+}
+
+fn decode_select(record: &[u8], pos: usize) -> Result<(Select, usize), StorageError> {
+    let mut cursor = pos;
+    if cursor >= record.len() {
+        return Err(StorageError::Corrupt("invalid select".to_string()));
+    }
+    let distinct = record[cursor] != 0;
+    cursor += 1;
+    if cursor + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid select projection".to_string()));
+    }
+    let proj_len = read_u16(record, cursor) as usize;
+    cursor += 2;
+    let mut projection = Vec::with_capacity(proj_len);
+    for _ in 0..proj_len {
+        let (item, new_pos) = decode_select_item(record, cursor)?;
+        cursor = new_pos;
+        projection.push(item);
+    }
+    if cursor + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid select from".to_string()));
+    }
+    let from_len = read_u16(record, cursor) as usize;
+    cursor += 2;
+    let mut from = Vec::with_capacity(from_len);
+    for _ in 0..from_len {
+        let (table_ref, new_pos) = decode_table_ref(record, cursor)?;
+        cursor = new_pos;
+        from.push(table_ref);
+    }
+    let (selection, new_pos) = decode_optional_expr(record, cursor)?;
+    cursor = new_pos;
+    if cursor + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid select group by".to_string()));
+    }
+    let group_len = read_u16(record, cursor) as usize;
+    cursor += 2;
+    let mut group_by = Vec::with_capacity(group_len);
+    for _ in 0..group_len {
+        let (expr, new_pos) = decode_expr(record, cursor)?;
+        cursor = new_pos;
+        group_by.push(expr);
+    }
+    let (having, new_pos) = decode_optional_expr(record, cursor)?;
+    cursor = new_pos;
+    if cursor + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid select order by".to_string()));
+    }
+    let order_len = read_u16(record, cursor) as usize;
+    cursor += 2;
+    let mut order_by = Vec::with_capacity(order_len);
+    for _ in 0..order_len {
+        let (order, new_pos) = decode_order_by_expr(record, cursor)?;
+        cursor = new_pos;
+        order_by.push(order);
+    }
+    let (limit, new_pos) = decode_optional_expr(record, cursor)?;
+    cursor = new_pos;
+    let (offset, new_pos) = decode_optional_expr(record, cursor)?;
+    cursor = new_pos;
+    Ok((
+        Select {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        },
+        cursor,
+    ))
+}
+
+fn encode_select_item(item: &SelectItem, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match item {
+        SelectItem::Expr { expr, alias } => {
+            buf.push(1);
+            encode_expr(expr, buf)?;
+            encode_optional_ident(alias, buf)?;
+        }
+        SelectItem::Wildcard => {
+            buf.push(2);
+        }
+        SelectItem::QualifiedWildcard(name) => {
+            buf.push(3);
+            encode_object_name(name, buf)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_select_item(record: &[u8], pos: usize) -> Result<(SelectItem, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid select item".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let item = match tag {
+        1 => {
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            let (alias, new_pos) = decode_optional_ident(record, cursor)?;
+            cursor = new_pos;
+            SelectItem::Expr { expr, alias }
+        }
+        2 => SelectItem::Wildcard,
+        3 => {
+            let (name, new_pos) = decode_object_name(record, cursor)?;
+            cursor = new_pos;
+            SelectItem::QualifiedWildcard(name)
+        }
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown select item tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((item, cursor))
+}
+
+fn encode_table_ref(table_ref: &TableRef, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match table_ref {
+        TableRef::Named { name, alias } => {
+            buf.push(1);
+            encode_object_name(name, buf)?;
+            encode_optional_ident(alias, buf)?;
+        }
+        _ => {
+            return Err(StorageError::Invalid(
+                "unsupported table reference in view".to_string(),
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn decode_table_ref(record: &[u8], pos: usize) -> Result<(TableRef, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid table ref".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let table_ref = match tag {
+        1 => {
+            let (name, new_pos) = decode_object_name(record, cursor)?;
+            cursor = new_pos;
+            let (alias, new_pos) = decode_optional_ident(record, cursor)?;
+            cursor = new_pos;
+            TableRef::Named { name, alias }
+        }
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown table ref tag {}",
+                tag
+            )))
+        }
+    };
+    Ok((table_ref, cursor))
+}
+
+fn encode_order_by_expr(order: &OrderByExpr, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    encode_expr(&order.expr, buf)?;
+    let tag = match order.asc {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    buf.push(tag);
+    Ok(())
+}
+
+fn decode_order_by_expr(record: &[u8], pos: usize) -> Result<(OrderByExpr, usize), StorageError> {
+    let (expr, mut cursor) = decode_expr(record, pos)?;
+    if cursor >= record.len() {
+        return Err(StorageError::Corrupt("invalid order by expr".to_string()));
+    }
+    let asc = match record[cursor] {
+        0 => None,
+        1 => Some(true),
+        2 => Some(false),
+        tag => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown order by tag {}",
+                tag
+            )))
+        }
+    };
+    cursor += 1;
+    Ok((OrderByExpr { expr, asc }, cursor))
+}
+
+fn encode_optional_expr(expr: &Option<Expr>, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match expr {
+        Some(expr) => {
+            buf.push(1);
+            encode_expr(expr, buf)?;
+        }
+        None => buf.push(0),
+    }
+    Ok(())
+}
+
+fn decode_optional_expr(record: &[u8], pos: usize) -> Result<(Option<Expr>, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid optional expr".to_string()));
+    }
+    match record[pos] {
+        0 => Ok((None, pos + 1)),
+        1 => {
+            let (expr, new_pos) = decode_expr(record, pos + 1)?;
+            Ok((Some(expr), new_pos))
+        }
+        tag => Err(StorageError::Corrupt(format!(
+            "unknown optional expr tag {}",
+            tag
+        ))),
+    }
+}
+
+fn encode_optional_ident(ident: &Option<Ident>, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match ident {
+        Some(ident) => {
+            buf.push(1);
+            encode_ident(ident, buf)?;
+        }
+        None => buf.push(0),
+    }
+    Ok(())
+}
+
+fn decode_optional_ident(record: &[u8], pos: usize) -> Result<(Option<Ident>, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid optional ident".to_string()));
+    }
+    match record[pos] {
+        0 => Ok((None, pos + 1)),
+        1 => {
+            let (ident, new_pos) = decode_ident(record, pos + 1)?;
+            Ok((Some(ident), new_pos))
+        }
+        tag => Err(StorageError::Corrupt(format!(
+            "unknown optional ident tag {}",
+            tag
+        ))),
+    }
+}
+
+fn encode_view_meta(view: &ViewMeta) -> Result<Vec<u8>, StorageError> {
+    let mut buf = Vec::new();
+    if view.name.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("view name too long".to_string()));
+    }
+    buf.extend_from_slice(&(view.name.len() as u16).to_le_bytes());
+    buf.extend_from_slice(view.name.as_bytes());
+    if view.columns.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many view columns".to_string()));
+    }
+    buf.extend_from_slice(&(view.columns.len() as u16).to_le_bytes());
+    for column in &view.columns {
+        encode_ident(column, &mut buf)?;
+    }
+    let mut select_buf = Vec::new();
+    encode_select(&view.query, &mut select_buf)?;
+    if select_buf.len() > u32::MAX as usize {
+        return Err(StorageError::Invalid("view query too large".to_string()));
+    }
+    buf.extend_from_slice(&(select_buf.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&select_buf);
+    Ok(buf)
+}
+
+fn decode_view_meta(record: &[u8]) -> Result<ViewMeta, StorageError> {
+    let mut pos = 0;
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid view meta".to_string()));
+    }
+    let name_len = read_u16(record, pos) as usize;
+    pos += 2;
+    if pos + name_len > record.len() {
+        return Err(StorageError::Corrupt("invalid view name".to_string()));
+    }
+    let name = String::from_utf8_lossy(&record[pos..pos + name_len]).to_string();
+    pos += name_len;
+    if pos + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid view columns".to_string()));
+    }
+    let col_count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut columns = Vec::with_capacity(col_count);
+    for _ in 0..col_count {
+        let (ident, new_pos) = decode_ident(record, pos)?;
+        pos = new_pos;
+        columns.push(ident);
+    }
+    if pos + 4 > record.len() {
+        return Err(StorageError::Corrupt("invalid view query length".to_string()));
+    }
+    let query_len = read_u32(record, pos) as usize;
+    pos += 4;
+    if pos + query_len > record.len() {
+        return Err(StorageError::Corrupt("invalid view query".to_string()));
+    }
+    let (query, _) = decode_select(&record[pos..pos + query_len], 0)?;
+    Ok(ViewMeta { name, columns, query })
 }
 
 fn encode_data_type(data_type: &DataType, buf: &mut Vec<u8>) -> Result<(), StorageError> {
