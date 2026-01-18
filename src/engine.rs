@@ -734,7 +734,7 @@ fn eval_literal(expr: &Expr) -> Result<Value, GongDBError> {
                     Value::Null => Ok(Value::Null),
                     _ => Err(GongDBError::new("invalid unary minus")),
                 },
-                crate::ast::UnaryOperator::Not => Ok(Value::Integer((!value_to_bool(&value)) as i64)),
+                crate::ast::UnaryOperator::Not => Ok(apply_logical_not(value)),
             }
         }
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Concat => {
@@ -771,7 +771,7 @@ fn eval_expr(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value, Go
                     Value::Null => Ok(Value::Null),
                     _ => Err(GongDBError::new("invalid unary minus")),
                 },
-                crate::ast::UnaryOperator::Not => Ok(Value::Integer((!value_to_bool(&value)) as i64)),
+                crate::ast::UnaryOperator::Not => Ok(apply_logical_not(value)),
             }
         }
         Expr::IsNull { expr, negated } => {
@@ -837,8 +837,8 @@ fn apply_binary_op(
         | BinaryOperator::GtEq => Ok(compare_values(op, &left, &right)),
         BinaryOperator::Is => Ok(Value::Integer(values_equal(&left, &right) as i64)),
         BinaryOperator::IsNot => Ok(Value::Integer((!values_equal(&left, &right)) as i64)),
-        BinaryOperator::And => Ok(Value::Integer((value_to_bool(&left) && value_to_bool(&right)) as i64)),
-        BinaryOperator::Or => Ok(Value::Integer((value_to_bool(&left) || value_to_bool(&right)) as i64)),
+        BinaryOperator::And => Ok(apply_logical_and(&left, &right)),
+        BinaryOperator::Or => Ok(apply_logical_or(&left, &right)),
         _ => Err(GongDBError::new("unsupported operator in phase 2")),
     }
 }
@@ -860,8 +860,18 @@ fn apply_numeric_op(
         BinaryOperator::Plus => left_num + right_num,
         BinaryOperator::Minus => left_num - right_num,
         BinaryOperator::Multiply => left_num * right_num,
-        BinaryOperator::Divide => left_num / right_num,
-        BinaryOperator::Modulo => left_num % right_num,
+        BinaryOperator::Divide => {
+            if right_num == 0.0 {
+                return Ok(Value::Null);
+            }
+            left_num / right_num
+        }
+        BinaryOperator::Modulo => {
+            if right_num == 0.0 {
+                return Ok(Value::Null);
+            }
+            left_num % right_num
+        }
         _ => return Err(GongDBError::new("invalid numeric op")),
     };
     if is_real {
@@ -934,6 +944,36 @@ fn value_to_bool(value: &Value) -> bool {
             None => false,
         },
         Value::Blob(_) => false,
+    }
+}
+
+fn value_to_truth_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Null => None,
+        _ => Some(value_to_bool(value)),
+    }
+}
+
+fn apply_logical_not(value: Value) -> Value {
+    match value_to_truth_value(&value) {
+        None => Value::Null,
+        Some(result) => Value::Integer((!result) as i64),
+    }
+}
+
+fn apply_logical_and(left: &Value, right: &Value) -> Value {
+    match (value_to_truth_value(left), value_to_truth_value(right)) {
+        (Some(false), _) | (_, Some(false)) => Value::Integer(0),
+        (Some(true), Some(true)) => Value::Integer(1),
+        _ => Value::Null,
+    }
+}
+
+fn apply_logical_or(left: &Value, right: &Value) -> Value {
+    match (value_to_truth_value(left), value_to_truth_value(right)) {
+        (Some(true), _) | (_, Some(true)) => Value::Integer(1),
+        (Some(false), Some(false)) => Value::Integer(0),
+        _ => Value::Null,
     }
 }
 
