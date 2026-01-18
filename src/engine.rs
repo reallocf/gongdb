@@ -915,6 +915,14 @@ fn split_qualified_identifier(idents: &[Ident]) -> Result<(&str, &str), GongDBEr
     Ok((qualifier.as_str(), column.as_str()))
 }
 
+fn is_aggregate_function_call(name: &str, args: &[Expr]) -> bool {
+    match name {
+        "sum" | "avg" | "count" | "total" | "group_concat" => true,
+        "min" | "max" => args.len() == 1,
+        _ => false,
+    }
+}
+
 fn eval_expr<'a, 'b>(
     db: &GongDB,
     expr: &Expr,
@@ -955,6 +963,69 @@ fn eval_expr<'a, 'b>(
                 "unknown column {}",
                 column
             )))
+        }
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
+            let func_name = name.value.to_ascii_lowercase();
+            if is_aggregate_function_call(func_name.as_str(), args) {
+                return Err(GongDBError::new(
+                    "aggregate function is not allowed in this context",
+                ));
+            }
+            if *distinct {
+                return Err(GongDBError::new(
+                    "DISTINCT is only valid for aggregate functions",
+                ));
+            }
+            match func_name.as_str() {
+                "abs" => {
+                    if args.len() != 1 {
+                        return Err(GongDBError::new("ABS expects one argument"));
+                    }
+                    let value = eval_expr(db, &args[0], scope, outer)?;
+                    match value {
+                        Value::Null => Ok(Value::Null),
+                        _ => match numeric_value_or_zero(&value) {
+                            Some(NumericValue::Integer(v)) => Ok(Value::Integer(v.abs())),
+                            Some(NumericValue::Real(v)) => Ok(Value::Real(v.abs())),
+                            None => Ok(Value::Null),
+                        },
+                    }
+                }
+                "min" | "max" => {
+                    if args.len() < 2 {
+                        return Err(GongDBError::new(
+                            "MIN and MAX require at least two arguments in scalar context",
+                        ));
+                    }
+                    let mut current: Option<Value> = None;
+                    for arg in args {
+                        let value = eval_expr(db, arg, scope, outer)?;
+                        if matches!(value, Value::Null) {
+                            continue;
+                        }
+                        match &current {
+                            None => current = Some(value),
+                            Some(existing) => {
+                                let ord = compare_order_values(&value, existing);
+                                let replace = match func_name.as_str() {
+                                    "min" => ord == std::cmp::Ordering::Less,
+                                    "max" => ord == std::cmp::Ordering::Greater,
+                                    _ => false,
+                                };
+                                if replace {
+                                    current = Some(value);
+                                }
+                            }
+                        }
+                    }
+                    Ok(current.unwrap_or(Value::Null))
+                }
+                _ => Err(GongDBError::new("unsupported function")),
+            }
         }
         Expr::BinaryOp { left, op, right } => {
             let left_val = eval_expr(db, left, scope, outer)?;
@@ -1478,6 +1549,13 @@ fn numeric_value(value: &Value) -> Option<NumericValue> {
     }
 }
 
+fn numeric_value_or_zero(value: &Value) -> Option<NumericValue> {
+    match value {
+        Value::Null => None,
+        _ => Some(numeric_value(value).unwrap_or(NumericValue::Integer(0))),
+    }
+}
+
 fn numeric_to_f64(value: NumericValue) -> (f64, bool) {
     match value {
         NumericValue::Integer(v) => (v as f64, false),
@@ -1570,7 +1648,14 @@ fn is_count_star(select: &Select) -> bool {
     }
     match &select.projection[0] {
         SelectItem::Expr { expr, .. } => match expr {
-            Expr::Function { name, args, .. } => {
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            } => {
+                if *distinct {
+                    return false;
+                }
                 name.value.eq_ignore_ascii_case("count")
                     && (args.is_empty() || args.iter().all(|arg| matches!(arg, Expr::Wildcard)))
             }
@@ -1584,12 +1669,19 @@ fn is_count_star(select: &Select) -> bool {
 struct AggregateExpr {
     kind: AggregateKind,
     expr: Option<Expr>,
+    distinct: bool,
+    separator: Option<Expr>,
 }
 
 #[derive(Clone)]
 enum AggregateKind {
     Sum,
     Count,
+    Avg,
+    Min,
+    Max,
+    Total,
+    GroupConcat,
 }
 
 fn aggregate_projections(
@@ -1600,7 +1692,11 @@ fn aggregate_projections(
     for item in projection {
         match item {
             SelectItem::Expr { expr, .. } => match expr {
-                Expr::Function { name, args, .. } => {
+                Expr::Function {
+                    name,
+                    args,
+                    distinct,
+                } => {
                     let func_name = name.value.to_ascii_lowercase();
                     match func_name.as_str() {
                         "sum" => {
@@ -1611,6 +1707,8 @@ fn aggregate_projections(
                             aggregates.push(AggregateExpr {
                                 kind: AggregateKind::Sum,
                                 expr: Some(args[0].clone()),
+                                distinct: *distinct,
+                                separator: None,
                             });
                         }
                         "count" => {
@@ -1618,20 +1716,139 @@ fn aggregate_projections(
                             if args.is_empty()
                                 || args.iter().all(|arg| matches!(arg, Expr::Wildcard))
                             {
+                                if *distinct {
+                                    return Err(GongDBError::new(
+                                        "COUNT DISTINCT does not support *",
+                                    ));
+                                }
                                 aggregates.push(AggregateExpr {
                                     kind: AggregateKind::Count,
                                     expr: None,
+                                    distinct: false,
+                                    separator: None,
                                 });
                             } else if args.len() == 1 {
+                                if matches!(args[0], Expr::Wildcard) {
+                                    if *distinct {
+                                        return Err(GongDBError::new(
+                                            "COUNT DISTINCT does not support *",
+                                        ));
+                                    }
+                                    aggregates.push(AggregateExpr {
+                                        kind: AggregateKind::Count,
+                                        expr: None,
+                                        distinct: false,
+                                        separator: None,
+                                    });
+                                } else {
                                 aggregates.push(AggregateExpr {
                                     kind: AggregateKind::Count,
                                     expr: Some(args[0].clone()),
+                                    distinct: *distinct,
+                                    separator: None,
                                 });
+                                }
                             } else {
                                 return Err(GongDBError::new("COUNT expects at most one argument"));
                             }
                         }
-                        _ => return Err(GongDBError::new("unsupported aggregate function")),
+                        "avg" => {
+                            saw_aggregate = true;
+                            if args.len() != 1 {
+                                return Err(GongDBError::new("AVG expects one argument"));
+                            }
+                            aggregates.push(AggregateExpr {
+                                kind: AggregateKind::Avg,
+                                expr: Some(args[0].clone()),
+                                distinct: *distinct,
+                                separator: None,
+                            });
+                        }
+                        "min" => {
+                            if args.len() == 1 {
+                                saw_aggregate = true;
+                                aggregates.push(AggregateExpr {
+                                    kind: AggregateKind::Min,
+                                    expr: Some(args[0].clone()),
+                                    distinct: *distinct,
+                                    separator: None,
+                                });
+                            } else if *distinct {
+                                return Err(GongDBError::new(
+                                    "DISTINCT is only valid for single-argument aggregates",
+                                ));
+                            } else if saw_aggregate {
+                                return Err(GongDBError::new(
+                                    "cannot mix aggregate and non-aggregate expressions",
+                                ));
+                            } else {
+                                return Ok(None);
+                            }
+                        }
+                        "max" => {
+                            if args.len() == 1 {
+                                saw_aggregate = true;
+                                aggregates.push(AggregateExpr {
+                                    kind: AggregateKind::Max,
+                                    expr: Some(args[0].clone()),
+                                    distinct: *distinct,
+                                    separator: None,
+                                });
+                            } else if *distinct {
+                                return Err(GongDBError::new(
+                                    "DISTINCT is only valid for single-argument aggregates",
+                                ));
+                            } else if saw_aggregate {
+                                return Err(GongDBError::new(
+                                    "cannot mix aggregate and non-aggregate expressions",
+                                ));
+                            } else {
+                                return Ok(None);
+                            }
+                        }
+                        "total" => {
+                            saw_aggregate = true;
+                            if args.len() != 1 {
+                                return Err(GongDBError::new("TOTAL expects one argument"));
+                            }
+                            aggregates.push(AggregateExpr {
+                                kind: AggregateKind::Total,
+                                expr: Some(args[0].clone()),
+                                distinct: *distinct,
+                                separator: None,
+                            });
+                        }
+                        "group_concat" => {
+                            saw_aggregate = true;
+                            if args.is_empty() || args.len() > 2 {
+                                return Err(GongDBError::new(
+                                    "GROUP_CONCAT expects one or two arguments",
+                                ));
+                            }
+                            if *distinct && args.len() != 1 {
+                                return Err(GongDBError::new(
+                                    "DISTINCT is only valid for single-argument aggregates",
+                                ));
+                            }
+                            aggregates.push(AggregateExpr {
+                                kind: AggregateKind::GroupConcat,
+                                expr: Some(args[0].clone()),
+                                distinct: *distinct,
+                                separator: if args.len() == 2 {
+                                    Some(args[1].clone())
+                                } else {
+                                    None
+                                },
+                            });
+                        }
+                        _ => {
+                            if saw_aggregate {
+                                return Err(GongDBError::new(
+                                    "cannot mix aggregate and non-aggregate expressions",
+                                ));
+                            }
+                            return Ok(None);
+                        }
                     }
                 }
                 _ => {
@@ -1674,6 +1891,7 @@ fn compute_aggregates(
             AggregateKind::Count => {
                 let count = if let Some(expr) = &agg.expr {
                     let mut tally = 0i64;
+                    let mut seen = Vec::new();
                     for row in rows {
                         let scope = EvalScope {
                             columns,
@@ -1682,7 +1900,15 @@ fn compute_aggregates(
                         };
                         let value = eval_expr(db, expr, &scope, outer)?;
                         if !matches!(value, Value::Null) {
+                            if agg.distinct {
+                                if seen.iter().any(|v| values_equal(v, &value)) {
+                                    continue;
+                                }
+                                seen.push(value);
+                                tally += 1;
+                            } else {
                             tally += 1;
+                            }
                         }
                     }
                     tally
@@ -1699,6 +1925,7 @@ fn compute_aggregates(
                 let mut sum_real = 0.0;
                 let mut any_real = false;
                 let mut has_value = false;
+                let mut seen = Vec::new();
                 for row in rows {
                     let scope = EvalScope {
                         columns,
@@ -1709,7 +1936,13 @@ fn compute_aggregates(
                     if matches!(value, Value::Null) {
                         continue;
                     }
-                    if let Some(num) = numeric_value(&value) {
+                    if agg.distinct {
+                        if seen.iter().any(|v| values_equal(v, &value)) {
+                            continue;
+                        }
+                        seen.push(value.clone());
+                    }
+                    if let Some(num) = numeric_value_or_zero(&value) {
                         has_value = true;
                         match num {
                             NumericValue::Integer(v) => {
@@ -1735,6 +1968,205 @@ fn compute_aggregates(
                     results.push(Value::Real(sum_real));
                 } else {
                     results.push(Value::Integer(sum_int));
+                }
+            }
+            AggregateKind::Avg => {
+                let Some(expr) = &agg.expr else {
+                    return Err(GongDBError::new("AVG requires an expression"));
+                };
+                let mut sum = 0.0;
+                let mut count = 0i64;
+                let mut seen = Vec::new();
+                for row in rows {
+                    let scope = EvalScope {
+                        columns,
+                        row,
+                        table_scope,
+                    };
+                    let value = eval_expr(db, expr, &scope, outer)?;
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    if agg.distinct {
+                        if seen.iter().any(|v| values_equal(v, &value)) {
+                            continue;
+                        }
+                        seen.push(value.clone());
+                    }
+                    if let Some(num) = numeric_value_or_zero(&value) {
+                        sum += numeric_to_f64(num).0;
+                        count += 1;
+                    }
+                }
+                if count == 0 {
+                    results.push(Value::Null);
+                } else {
+                    results.push(Value::Real(sum / count as f64));
+                }
+            }
+            AggregateKind::Min => {
+                let Some(expr) = &agg.expr else {
+                    return Err(GongDBError::new("MIN requires an expression"));
+                };
+                let mut current: Option<NumericValue> = None;
+                let mut seen = Vec::new();
+                for row in rows {
+                    let scope = EvalScope {
+                        columns,
+                        row,
+                        table_scope,
+                    };
+                    let value = eval_expr(db, expr, &scope, outer)?;
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    if agg.distinct {
+                        if seen.iter().any(|v| values_equal(v, &value)) {
+                            continue;
+                        }
+                        seen.push(value.clone());
+                    }
+                    let Some(num) = numeric_value_or_zero(&value) else {
+                        continue;
+                    };
+                    match current {
+                        None => current = Some(num),
+                        Some(existing) => {
+                            let left = numeric_to_f64(num).0;
+                            let right = numeric_to_f64(existing).0;
+                            if left < right {
+                                current = Some(num);
+                            }
+                        }
+                    }
+                }
+                results.push(match current {
+                    Some(NumericValue::Integer(v)) => Value::Integer(v),
+                    Some(NumericValue::Real(v)) => Value::Real(v),
+                    None => Value::Null,
+                });
+            }
+            AggregateKind::Max => {
+                let Some(expr) = &agg.expr else {
+                    return Err(GongDBError::new("MAX requires an expression"));
+                };
+                let mut current: Option<NumericValue> = None;
+                let mut seen = Vec::new();
+                for row in rows {
+                    let scope = EvalScope {
+                        columns,
+                        row,
+                        table_scope,
+                    };
+                    let value = eval_expr(db, expr, &scope, outer)?;
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    if agg.distinct {
+                        if seen.iter().any(|v| values_equal(v, &value)) {
+                            continue;
+                        }
+                        seen.push(value.clone());
+                    }
+                    let Some(num) = numeric_value_or_zero(&value) else {
+                        continue;
+                    };
+                    match current {
+                        None => current = Some(num),
+                        Some(existing) => {
+                            let left = numeric_to_f64(num).0;
+                            let right = numeric_to_f64(existing).0;
+                            if left > right {
+                                current = Some(num);
+                            }
+                        }
+                    }
+                }
+                results.push(match current {
+                    Some(NumericValue::Integer(v)) => Value::Integer(v),
+                    Some(NumericValue::Real(v)) => Value::Real(v),
+                    None => Value::Null,
+                });
+            }
+            AggregateKind::Total => {
+                let Some(expr) = &agg.expr else {
+                    return Err(GongDBError::new("TOTAL requires an expression"));
+                };
+                let mut sum = 0.0;
+                let mut seen = Vec::new();
+                let mut saw_value = false;
+                for row in rows {
+                    let scope = EvalScope {
+                        columns,
+                        row,
+                        table_scope,
+                    };
+                    let value = eval_expr(db, expr, &scope, outer)?;
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    if agg.distinct {
+                        if seen.iter().any(|v| values_equal(v, &value)) {
+                            continue;
+                        }
+                        seen.push(value.clone());
+                    }
+                    if let Some(num) = numeric_value_or_zero(&value) {
+                        sum += numeric_to_f64(num).0;
+                        saw_value = true;
+                    }
+                }
+                if saw_value {
+                    results.push(Value::Real(sum));
+                } else {
+                    results.push(Value::Real(0.0));
+                }
+            }
+            AggregateKind::GroupConcat => {
+                let Some(expr) = &agg.expr else {
+                    return Err(GongDBError::new("GROUP_CONCAT requires an expression"));
+                };
+                let mut result = String::new();
+                let mut first = true;
+                let mut seen = Vec::new();
+                for row in rows {
+                    let scope = EvalScope {
+                        columns,
+                        row,
+                        table_scope,
+                    };
+                    let value = eval_expr(db, expr, &scope, outer)?;
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    if agg.distinct {
+                        if seen.iter().any(|v| values_equal(v, &value)) {
+                            continue;
+                        }
+                        seen.push(value.clone());
+                    }
+                    let separator = if let Some(separator_expr) = &agg.separator {
+                        let sep_value = eval_expr(db, separator_expr, &scope, outer)?;
+                        if matches!(sep_value, Value::Null) {
+                            String::new()
+                        } else {
+                            value_to_text(&sep_value)
+                        }
+                    } else {
+                        ",".to_string()
+                    };
+                    if first {
+                        result.push_str(&value_to_text(&value));
+                        first = false;
+                    } else {
+                        result.push_str(&separator);
+                        result.push_str(&value_to_text(&value));
+                    }
+                }
+                if first {
+                    results.push(Value::Null);
+                } else {
+                    results.push(Value::Text(result));
                 }
             }
         }

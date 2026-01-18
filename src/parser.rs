@@ -1089,6 +1089,9 @@ impl Parser {
         }
         if self.eat_symbol('(') {
             let distinct = self.eat_keyword("DISTINCT");
+            if !distinct {
+                self.eat_keyword("ALL");
+            }
             let mut args = Vec::new();
             if !self.eat_symbol(')') {
                 loop {
