@@ -6,6 +6,7 @@ use crate::ast::{
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +23,8 @@ const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
 const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
 const HEADER_SCHEMA_VERSION_OFFSET: usize = 20;
 const HEADER_CATALOG_FORMAT_OFFSET: usize = 24;
+const JOURNAL_MAGIC: [u8; 8] = *b"GONGJNL1";
+const JOURNAL_HEADER_SIZE: usize = 16;
 
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 static LOCK_MANAGER: OnceLock<Mutex<LockManager>> = OnceLock::new();
@@ -143,6 +146,14 @@ pub struct StorageSnapshot {
 }
 
 #[derive(Debug)]
+struct Journal {
+    path: String,
+    file: File,
+    logged_pages: HashSet<u32>,
+    base_len: u64,
+}
+
+#[derive(Debug)]
 struct LockState {
     readers: HashMap<u64, usize>,
     writer: Option<u64>,
@@ -179,6 +190,7 @@ impl LockManager {
 pub struct StorageEngine {
     mode: StorageMode,
     db_id: String,
+    disk_path: Option<String>,
     next_page_id: u32,
     schema_version: u32,
     catalog_format_version: u32,
@@ -186,6 +198,8 @@ pub struct StorageEngine {
     indexes: HashMap<String, IndexMeta>,
     views: HashMap<String, ViewMeta>,
     free_pages: Vec<u32>,
+    txn_active: bool,
+    journal: Option<Journal>,
 }
 
 pub struct TableScan<'a> {
@@ -257,6 +271,7 @@ impl StorageEngine {
         let mut engine = StorageEngine {
             mode: StorageMode::InMemory { pages },
             db_id: format!("memory-{}", id),
+            disk_path: None,
             next_page_id: CATALOG_PAGE_ID + 1,
             schema_version: 0,
             catalog_format_version: CATALOG_FORMAT_VERSION,
@@ -264,6 +279,8 @@ impl StorageEngine {
             indexes: HashMap::new(),
             views: HashMap::new(),
             free_pages: Vec::new(),
+            txn_active: false,
+            journal: None,
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -277,6 +294,8 @@ impl StorageEngine {
             .write(true)
             .create(true)
             .open(path)?;
+
+        recover_journal_if_needed(path, &mut file)?;
 
         if !exists || file.metadata()?.len() < PAGE_SIZE as u64 {
             file.set_len((PAGE_SIZE * 2) as u64)?;
@@ -329,6 +348,7 @@ impl StorageEngine {
         let mut engine = StorageEngine {
             mode: StorageMode::OnDisk { file },
             db_id: format!("disk-{}", path),
+            disk_path: Some(path.to_string()),
             next_page_id,
             schema_version,
             catalog_format_version,
@@ -336,6 +356,8 @@ impl StorageEngine {
             indexes,
             views,
             free_pages: Vec::new(),
+            txn_active: false,
+            journal: None,
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -387,6 +409,28 @@ impl StorageEngine {
         self.views = snapshot.views;
         self.free_pages = snapshot.free_pages;
         Ok(())
+    }
+
+    pub fn begin_transaction(&mut self) {
+        self.txn_active = true;
+    }
+
+    pub fn commit_transaction(&mut self) -> Result<(), StorageError> {
+        self.txn_active = false;
+        if let Some(journal) = self.journal.take() {
+            if let StorageMode::OnDisk { file } = &mut self.mode {
+                file.sync_all()?;
+            }
+            let _ = std::fs::remove_file(&journal.path);
+        }
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&mut self) {
+        self.txn_active = false;
+        if let Some(journal) = self.journal.take() {
+            let _ = std::fs::remove_file(&journal.path);
+        }
     }
 
     pub fn acquire_read_lock(&self, txn_id: u64) -> Result<(), StorageError> {
@@ -1271,7 +1315,68 @@ impl StorageEngine {
         }
     }
 
+    fn ensure_journal(&mut self) -> Result<(), StorageError> {
+        if !self.txn_active {
+            return Ok(());
+        }
+        if self.journal.is_some() {
+            return Ok(());
+        }
+        let path = match &self.disk_path {
+            Some(path) => format!("{}.journal", path),
+            None => return Ok(()),
+        };
+        let base_len = match &self.mode {
+            StorageMode::OnDisk { file } => file.metadata()?.len(),
+            StorageMode::InMemory { .. } => return Ok(()),
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        file.write_all(&JOURNAL_MAGIC)?;
+        file.write_all(&base_len.to_le_bytes())?;
+        file.sync_all()?;
+        self.journal = Some(Journal {
+            path,
+            file,
+            logged_pages: HashSet::new(),
+            base_len,
+        });
+        Ok(())
+    }
+
+    fn log_page_before_write(&mut self, page_id: u32) -> Result<(), StorageError> {
+        if !self.txn_active {
+            return Ok(());
+        }
+        self.ensure_journal()?;
+        let journal = match self.journal.as_mut() {
+            Some(journal) => journal,
+            None => return Ok(()),
+        };
+        if !journal.logged_pages.insert(page_id) {
+            return Ok(());
+        }
+        let offset = page_id as u64 * PAGE_SIZE as u64;
+        if offset >= journal.base_len {
+            return Ok(());
+        }
+        let mut buf = vec![0; PAGE_SIZE];
+        if let StorageMode::OnDisk { file } = &mut self.mode {
+            let mut clone = file.try_clone()?;
+            clone.seek(SeekFrom::Start(offset))?;
+            clone.read_exact(&mut buf)?;
+        }
+        journal.file.write_all(&page_id.to_le_bytes())?;
+        journal.file.write_all(&buf)?;
+        journal.file.sync_all()?;
+        Ok(())
+    }
+
     fn write_page(&mut self, page_id: u32, data: &[u8]) -> Result<(), StorageError> {
+        self.log_page_before_write(page_id)?;
         match &mut self.mode {
             StorageMode::InMemory { pages } => {
                 let idx = page_id as usize;
@@ -1404,6 +1509,57 @@ fn load_catalog_from_file(
         return Err(StorageError::Corrupt("invalid next page id".to_string()));
     }
     Ok((tables, indexes, views))
+}
+
+fn recover_journal_if_needed(path: &str, file: &mut File) -> Result<(), StorageError> {
+    let journal_path = format!("{}.journal", path);
+    if !Path::new(&journal_path).exists() {
+        return Ok(());
+    }
+    let db_id = format!("disk-{}", path);
+    if let Some(manager) = LOCK_MANAGER.get() {
+        if let Ok(guard) = manager.lock() {
+            if let Some(state) = guard.locks.get(&db_id) {
+                if state.writer.is_some() || !state.readers.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let mut journal = OpenOptions::new().read(true).open(&journal_path)?;
+    let mut header = vec![0; JOURNAL_HEADER_SIZE];
+    journal.read_exact(&mut header)?;
+    if header[..8] != JOURNAL_MAGIC {
+        return Err(StorageError::Corrupt("invalid journal header".to_string()));
+    }
+    let base_len = u64::from_le_bytes(
+        header[8..16]
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("invalid journal length".to_string()))?,
+    );
+    let mut entry = vec![0; 4 + PAGE_SIZE];
+    loop {
+        match journal.read_exact(&mut entry) {
+            Ok(()) => {
+                let page_id = u32::from_le_bytes(
+                    entry[..4]
+                        .try_into()
+                        .map_err(|_| StorageError::Corrupt("invalid journal entry".to_string()))?,
+                );
+                let offset = page_id as u64 * PAGE_SIZE as u64;
+                if offset < base_len {
+                    file.seek(SeekFrom::Start(offset))?;
+                    file.write_all(&entry[4..])?;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(StorageError::Io(err)),
+        }
+    }
+    file.set_len(base_len)?;
+    file.sync_all()?;
+    let _ = std::fs::remove_file(&journal_path);
+    Ok(())
 }
 
 fn object_name_string(name: &ObjectName) -> String {

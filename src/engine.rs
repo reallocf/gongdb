@@ -124,6 +124,7 @@ impl GongDB {
             self.storage.acquire_read_lock(txn_id)?;
         }
         let snapshot = self.storage.snapshot()?;
+        self.storage.begin_transaction();
         self.transaction = Some(TransactionState {
             id: txn_id,
             isolation,
@@ -136,6 +137,7 @@ impl GongDB {
 
     fn commit_transaction(&mut self) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
         if let Some(txn) = self.transaction.take() {
+            self.storage.commit_transaction()?;
             self.storage.release_locks(txn.id);
         }
         Ok(DBOutput::StatementComplete(0))
@@ -151,6 +153,7 @@ impl GongDB {
     fn rollback_internal(&mut self) -> Result<(), GongDBError> {
         if let Some(txn) = self.transaction.take() {
             self.storage.restore(txn.snapshot)?;
+            self.storage.rollback_transaction();
             self.storage.release_locks(txn.id);
             self.stats_cache.borrow_mut().clear();
         }
