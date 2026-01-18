@@ -13,6 +13,19 @@ pub enum Statement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct With {
+    pub recursive: bool,
+    pub ctes: Vec<Cte>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: Ident,
+    pub columns: Vec<Ident>,
+    pub query: Box<Select>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateTable {
     pub if_not_exists: bool,
     pub name: ObjectName,
@@ -97,6 +110,7 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    pub with: Option<With>,
     pub distinct: bool,
     pub projection: Vec<SelectItem>,
     pub from: Vec<TableRef>,

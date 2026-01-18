@@ -102,9 +102,11 @@ fn build_select1_sample_ast() -> Vec<Statement> {
             Expr::Literal(Literal::Integer(101)),
             Expr::Literal(Literal::Integer(104)),
         ]]),
+        on_conflict: InsertConflict::Abort,
     });
 
     let avg_c = Select {
+        with: None,
         distinct: false,
         projection: vec![SelectItem::Expr {
             expr: Expr::Function {
@@ -127,6 +129,7 @@ fn build_select1_sample_ast() -> Vec<Statement> {
     };
 
     let count_subquery = Select {
+        with: None,
         distinct: false,
         projection: vec![SelectItem::Expr {
             expr: Expr::Function {
@@ -201,6 +204,7 @@ fn build_select1_sample_ast() -> Vec<Statement> {
     };
 
     let exists_expr = Expr::Exists(Box::new(Select {
+        with: None,
         distinct: false,
         projection: vec![SelectItem::Expr {
             expr: Expr::Literal(Literal::Integer(1)),
@@ -229,6 +233,7 @@ fn build_select1_sample_ast() -> Vec<Statement> {
     }));
 
     let select = Statement::Select(Select {
+        with: None,
         distinct: false,
         projection: vec![
             SelectItem::Expr {

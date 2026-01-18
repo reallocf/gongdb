@@ -1,7 +1,7 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
     InsertConflict, InsertSource, JoinConstraint, JoinOperator, Literal, NullsOrder, Select,
-    SelectItem, Statement, TableConstraint, TableRef,
+    SelectItem, Statement, TableConstraint, TableRef, With,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
@@ -368,6 +368,7 @@ impl GongDB {
                         column_scopes: &column_scopes,
                         row: &row,
                         table_scope: &table_scope,
+                        cte_context: None,
                     };
                     if let Some(predicate) = &update.selection {
                         let value = eval_expr(self, predicate, &scope, None)?;
@@ -419,6 +420,7 @@ impl GongDB {
                         column_scopes: &column_scopes,
                         row: &row,
                         table_scope: &table_scope,
+                        cte_context: None,
                     };
                     if let Some(predicate) = &delete.selection {
                         let value = eval_expr(self, predicate, &scope, None)?;
@@ -453,7 +455,7 @@ impl GongDB {
 
     fn evaluate_select_values(&self, select: &Select) -> Result<QueryResult, GongDBError> {
         let mut view_stack = Vec::new();
-        self.evaluate_select_values_with_views(select, &mut view_stack, None)
+        self.evaluate_select_values_with_views(select, &mut view_stack, None, None)
     }
 
     fn evaluate_select_values_with_views(
@@ -461,7 +463,19 @@ impl GongDB {
         select: &Select,
         view_stack: &mut Vec<String>,
         outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
     ) -> Result<QueryResult, GongDBError> {
+        let owned_cte_context = if let Some(with_clause) = &select.with {
+            Some(self.build_cte_context(
+                with_clause,
+                cte_context,
+                view_stack,
+                outer,
+            )?)
+        } else {
+            None
+        };
+        let cte_context = owned_cte_context.as_ref().or(cte_context);
         let mut selection_applied = false;
         let source = if select.from.len() == 1 {
             if let crate::ast::TableRef::Named { name, alias } = &select.from[0] {
@@ -473,6 +487,7 @@ impl GongDB {
                         table_alias.as_deref(),
                         select.selection.as_ref(),
                         outer,
+                        cte_context,
                     )?;
                     selection_applied = select.selection.is_some();
                     let table = self
@@ -490,13 +505,31 @@ impl GongDB {
                         table_scope,
                     }
                 } else {
-                    self.resolve_source(select, view_stack, select.selection.as_ref(), outer)?
+                    self.resolve_source(
+                        select,
+                        view_stack,
+                        select.selection.as_ref(),
+                        outer,
+                        cte_context,
+                    )?
                 }
             } else {
-                self.resolve_source(select, view_stack, select.selection.as_ref(), outer)?
+                self.resolve_source(
+                    select,
+                    view_stack,
+                    select.selection.as_ref(),
+                    outer,
+                    cte_context,
+                )?
             }
         } else {
-            self.resolve_source(select, view_stack, select.selection.as_ref(), outer)?
+            self.resolve_source(
+                select,
+                view_stack,
+                select.selection.as_ref(),
+                outer,
+                cte_context,
+            )?
         };
         let QuerySource {
             columns,
@@ -511,6 +544,7 @@ impl GongDB {
                 column_scopes: &column_scopes,
                 row: &row,
                 table_scope: &table_scope,
+                cte_context,
             };
             if let Some(predicate) = &select.selection {
                 if selection_applied {
@@ -569,6 +603,7 @@ impl GongDB {
                     column_scopes: &column_scopes,
                     row: &row,
                     table_scope: &table_scope,
+                    cte_context,
                 };
                 let mut key = Vec::with_capacity(select.group_by.len());
                 for expr in &select.group_by {
@@ -605,6 +640,7 @@ impl GongDB {
                             &table_scope,
                             &group.rows,
                             outer,
+                            cte_context,
                         )? {
                             continue;
                         }
@@ -617,6 +653,7 @@ impl GongDB {
                         &table_scope,
                         &group.rows,
                         outer,
+                        cte_context,
                     )?);
                 }
                 if select.distinct {
@@ -651,6 +688,7 @@ impl GongDB {
                             &table_scope,
                             &group.rows,
                             outer,
+                            cte_context,
                         )? {
                             continue;
                         }
@@ -663,12 +701,14 @@ impl GongDB {
                         &table_scope,
                         &group.rows,
                         outer,
+                        cte_context,
                     )?;
                     let scope = EvalScope {
                         columns: &columns,
                         column_scopes: &column_scopes,
                         row: group.rows.first().unwrap(),
                         table_scope: &table_scope,
+                        cte_context,
                     };
                     let order_values = compute_group_order_values(
                         self,
@@ -725,6 +765,7 @@ impl GongDB {
                     &table_scope,
                     &filtered,
                     outer,
+                    cte_context,
                 )? {
                     return Ok(QueryResult {
                         columns: output_columns,
@@ -741,6 +782,7 @@ impl GongDB {
                 &table_scope,
                 &filtered,
                 outer,
+                cte_context,
             )?;
 
             return Ok(QueryResult {
@@ -763,6 +805,7 @@ impl GongDB {
                     column_scopes: &column_scopes,
                     row: &row,
                     table_scope: &table_scope,
+                    cte_context,
                 };
                 rows.push(project_row(
                     self,
@@ -800,6 +843,7 @@ impl GongDB {
                     column_scopes: &column_scopes,
                     row: &row,
                     table_scope: &table_scope,
+                    cte_context,
                 };
                 let projected_row = project_row(
                     self,
@@ -855,9 +899,42 @@ impl GongDB {
         &self,
         select: &Select,
         outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
     ) -> Result<QueryResult, GongDBError> {
         let mut view_stack = Vec::new();
-        self.evaluate_select_values_with_views(select, &mut view_stack, outer)
+        self.evaluate_select_values_with_views(select, &mut view_stack, outer, cte_context)
+    }
+
+    fn build_cte_context(
+        &self,
+        with_clause: &With,
+        parent: Option<&CteContext>,
+        view_stack: &mut Vec<String>,
+        outer: Option<&EvalScope<'_>>,
+    ) -> Result<CteContext, GongDBError> {
+        if with_clause.recursive {
+            return Err(GongDBError::new("recursive CTEs are not supported"));
+        }
+        let mut context = parent.cloned().unwrap_or_else(CteContext::new);
+        for cte in &with_clause.ctes {
+            let mut result = self.evaluate_select_values_with_views(
+                &cte.query,
+                view_stack,
+                outer,
+                Some(&context),
+            )?;
+            if !cte.columns.is_empty() {
+                if cte.columns.len() != result.columns.len() {
+                    return Err(GongDBError::new(format!(
+                        "CTE column count mismatch: {}",
+                        cte.name.value
+                    )));
+                }
+                result.columns = columns_from_idents(&cte.columns);
+            }
+            context.insert(&cte.name.value, result);
+        }
+        Ok(context)
     }
 
     fn resolve_source(
@@ -866,6 +943,7 @@ impl GongDB {
         view_stack: &mut Vec<String>,
         selection: Option<&Expr>,
         outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
     ) -> Result<QuerySource, GongDBError> {
         if select.from.is_empty() {
             return Ok(QuerySource {
@@ -880,7 +958,7 @@ impl GongDB {
         }
 
         if select.from.len() == 1 {
-            return self.resolve_table_ref(&select.from[0], view_stack);
+            return self.resolve_table_ref(&select.from[0], view_stack, cte_context);
         }
 
         let mut sources = Vec::new();
@@ -889,7 +967,7 @@ impl GongDB {
             if !matches!(table_ref, TableRef::Named { .. }) {
                 named_only = false;
             }
-            sources.push(self.resolve_table_ref(table_ref, view_stack)?);
+            sources.push(self.resolve_table_ref(table_ref, view_stack, cte_context)?);
         }
 
         if sources.len() == 1 {
@@ -906,7 +984,7 @@ impl GongDB {
                 let scope = source.table_scope.clone();
                 table_infos.push(TableInfo { source, scope });
             }
-            return self.resolve_join_plan(table_infos, predicates, outer);
+            return self.resolve_join_plan(table_infos, predicates, outer, cte_context);
         }
 
         let mut rows = vec![Vec::new()];
@@ -943,6 +1021,7 @@ impl GongDB {
         table_alias: Option<&str>,
         selection: Option<&Expr>,
         outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
     ) -> Result<Vec<Vec<Value>>, GongDBError> {
         let table = self
             .storage
@@ -963,6 +1042,7 @@ impl GongDB {
                     column_scopes: &column_scopes,
                     row: &row,
                     table_scope: &table_scope,
+                    cte_context,
                 };
                 let value = eval_expr(self, predicate, &scope, outer)?;
                 if !value_to_bool(&value) {
@@ -978,11 +1058,27 @@ impl GongDB {
         &self,
         table_ref: &crate::ast::TableRef,
         view_stack: &mut Vec<String>,
+        cte_context: Option<&CteContext>,
     ) -> Result<QuerySource, GongDBError> {
         match table_ref {
             crate::ast::TableRef::Named { name, alias } => {
                 let table_name = object_name(name);
                 let table_alias = alias.as_ref().map(|ident| ident.value.clone());
+                if let Some(ctes) = cte_context {
+                    if let Some(result) = ctes.get(&table_name) {
+                        let table_scope = TableScope {
+                            table_name: Some(table_name),
+                            table_alias,
+                        };
+                        let column_count = result.columns.len();
+                        return Ok(QuerySource {
+                            columns: result.columns.clone(),
+                            column_scopes: vec![table_scope.clone(); column_count],
+                            rows: result.rows.clone(),
+                            table_scope,
+                        });
+                    }
+                }
                 if let Some(table) = self.storage.get_table(&table_name) {
                     let rows = self.storage.scan_table(&table_name)?;
                     let table_scope = TableScope {
@@ -1008,7 +1104,7 @@ impl GongDB {
                     }
                     view_stack.push(table_name.clone());
                     let mut result =
-                        self.evaluate_select_values_with_views(&view.query, view_stack, None)?;
+                        self.evaluate_select_values_with_views(&view.query, view_stack, None, None)?;
                     view_stack.pop();
                     if !view.columns.is_empty() {
                         if view.columns.len() != result.columns.len() {
@@ -1037,7 +1133,8 @@ impl GongDB {
                 )))
             }
             crate::ast::TableRef::Subquery { subquery, alias } => {
-                let result = self.evaluate_select_values_with_views(subquery, view_stack, None)?;
+                let result =
+                    self.evaluate_select_values_with_views(subquery, view_stack, None, cte_context)?;
                 let table_scope = TableScope {
                     table_name: None,
                     table_alias: alias.as_ref().map(|ident| ident.value.clone()),
@@ -1056,14 +1153,15 @@ impl GongDB {
                 operator,
                 constraint,
             } => {
-                let left_source = self.resolve_table_ref(left, view_stack)?;
-                let right_source = self.resolve_table_ref(right, view_stack)?;
+                let left_source = self.resolve_table_ref(left, view_stack, cte_context)?;
+                let right_source = self.resolve_table_ref(right, view_stack, cte_context)?;
                 self.join_sources_with_constraint(
                     left_source,
                     right_source,
                     constraint.as_ref(),
                     operator.clone(),
                     None,
+                    cte_context,
                 )
             }
         }
@@ -1074,6 +1172,7 @@ impl GongDB {
         tables: Vec<TableInfo>,
         predicates: Vec<Expr>,
         outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
     ) -> Result<QuerySource, GongDBError> {
         let mut remaining: Vec<PredicateInfo> = predicates
             .into_iter()
@@ -1096,6 +1195,7 @@ impl GongDB {
             sources[current_index].take().unwrap(),
             extract_predicates_for_tables(&mut remaining, &joined),
             outer,
+            cte_context,
         )?;
 
         while joined.len() < table_count {
@@ -1141,6 +1241,7 @@ impl GongDB {
                 sources[idx].take().unwrap(),
                 extract_local_predicates(&mut remaining, idx),
                 outer,
+                cte_context,
             )?;
 
             let new_joined = extend_joined(&joined, idx);
@@ -1151,6 +1252,7 @@ impl GongDB {
                 right,
                 &join_predicates,
                 outer,
+                cte_context,
             )?;
             joined.insert(idx);
         }
@@ -1165,6 +1267,7 @@ impl GongDB {
         constraint: Option<&JoinConstraint>,
         operator: JoinOperator,
         outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
     ) -> Result<QuerySource, GongDBError> {
         let QuerySource {
             columns: left_columns,
@@ -1215,6 +1318,7 @@ impl GongDB {
                         column_scopes: &column_scopes,
                         row: &combined,
                         table_scope: &table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(self, expr, &scope, outer)?;
                     if !value_to_bool(&value) {
@@ -1514,6 +1618,7 @@ fn apply_predicates_to_source(
     source: QuerySource,
     predicates: Vec<Expr>,
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<QuerySource, GongDBError> {
     if predicates.is_empty() {
         return Ok(source);
@@ -1526,6 +1631,7 @@ fn apply_predicates_to_source(
             column_scopes: &source.column_scopes,
             row: &row,
             table_scope: &table_scope,
+            cte_context,
         };
         let mut keep = true;
         for predicate in &predicates {
@@ -1551,6 +1657,7 @@ fn join_sources_with_predicates(
     right: QuerySource,
     predicates: &[Expr],
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<QuerySource, GongDBError> {
     let mut columns = left.columns;
     columns.extend(right.columns);
@@ -1571,6 +1678,7 @@ fn join_sources_with_predicates(
                     column_scopes: &column_scopes,
                     row: &combined,
                     table_scope: &table_scope,
+                    cte_context,
                 };
                 let mut keep = true;
                 for predicate in predicates {
@@ -1667,9 +1775,31 @@ struct PredicateInfo {
     tables: Option<Vec<usize>>,
 }
 
+#[derive(Clone)]
 struct QueryResult {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
+}
+
+#[derive(Clone, Default)]
+struct CteContext {
+    entries: HashMap<String, QueryResult>,
+}
+
+impl CteContext {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&QueryResult> {
+        self.entries.get(&name.to_ascii_lowercase())
+    }
+
+    fn insert(&mut self, name: &str, result: QueryResult) {
+        self.entries.insert(name.to_ascii_lowercase(), result);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1696,6 +1826,7 @@ struct EvalScope<'a> {
     column_scopes: &'a [TableScope],
     row: &'a [Value],
     table_scope: &'a TableScope,
+    cte_context: Option<&'a CteContext>,
 }
 
 fn column_from_def(def: ColumnDef) -> Column {
@@ -2183,6 +2314,7 @@ fn eval_insert_expr(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
         column_scopes: &column_scopes,
         row: &[],
         table_scope: &table_scope,
+        cte_context: None,
     };
     eval_expr(db, expr, &scope, None)
 }
@@ -2233,6 +2365,7 @@ fn validate_insert_row(
             column_scopes: &column_scopes,
             row,
             table_scope: &table_scope,
+            cte_context: None,
         };
         for constraint in &table.constraints {
             if let TableConstraint::Check(expr) = constraint {
@@ -2554,7 +2687,8 @@ fn eval_expr<'a, 'b>(
             }
         }
         Expr::Exists(subquery) => {
-            let result = db.evaluate_select_values_with_outer(subquery, Some(scope))?;
+            let result =
+                db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
             Ok(Value::Integer((!result.rows.is_empty()) as i64))
         }
         Expr::Nested(expr) => eval_expr(db, expr, scope, outer),
@@ -2596,7 +2730,8 @@ fn eval_in_subquery<'a>(
     subquery: &Select,
     scope: &EvalScope<'a>,
 ) -> Result<Value, GongDBError> {
-    let result = db.evaluate_select_values_with_outer(subquery, Some(scope))?;
+    let result =
+        db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
     if result.columns.len() != 1 {
         return Err(GongDBError::new(
             "subquery returned more than one column",
@@ -3135,6 +3270,7 @@ fn compute_order_values(
         column_scopes: order_column_scopes,
         row: projected_row,
         table_scope: order_table_scope,
+        cte_context: scope.cte_context,
     };
     let mut values = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -3165,6 +3301,7 @@ fn compute_group_order_values(
         column_scopes: order_column_scopes,
         row: projected_row,
         table_scope: order_table_scope,
+        cte_context: scope.cte_context,
     };
     let mut values = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -3179,6 +3316,7 @@ fn compute_group_order_values(
                         scope.table_scope,
                         group_rows,
                         outer,
+                        scope.cte_context,
                     )?
                 } else {
                     expr.clone()
@@ -3390,7 +3528,17 @@ fn eval_having_clause(
     rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
 ) -> Result<bool, GongDBError> {
-    let rewritten = replace_aggregate_calls(db, expr, columns, column_scopes, table_scope, rows, outer)?;
+    let cte_context = outer.and_then(|scope| scope.cte_context);
+    let rewritten = replace_aggregate_calls(
+        db,
+        expr,
+        columns,
+        column_scopes,
+        table_scope,
+        rows,
+        outer,
+        cte_context,
+    )?;
     let empty_scope = EvalScope {
         columns: &[],
         column_scopes: &[],
@@ -3399,6 +3547,7 @@ fn eval_having_clause(
             table_name: None,
             table_alias: None,
         },
+        cte_context,
     };
     let value = eval_expr(db, &rewritten, &empty_scope, outer)?;
     Ok(value_to_bool(&value))
@@ -3412,6 +3561,7 @@ fn replace_aggregate_calls(
     table_scope: &TableScope,
     rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<Expr, GongDBError> {
     match expr {
         Expr::Function {
@@ -3421,7 +3571,16 @@ fn replace_aggregate_calls(
         } => {
             let maybe_aggregate = aggregate_expr_from_function(name, args, *distinct)?;
             if let Some(aggregate) = maybe_aggregate {
-                let value = compute_single_aggregate(db, &aggregate, columns, column_scopes, table_scope, rows, outer)?;
+                let value = compute_single_aggregate(
+                    db,
+                    &aggregate,
+                    columns,
+                    column_scopes,
+                    table_scope,
+                    rows,
+                    outer,
+                    cte_context,
+                )?;
                 Ok(Expr::Literal(value_to_literal(&value)))
             } else {
                 let mut new_args = Vec::with_capacity(args.len());
@@ -3434,6 +3593,7 @@ fn replace_aggregate_calls(
                         table_scope,
                         rows,
                         outer,
+                        cte_context,
                     )?);
                 }
                 Ok(Expr::Function {
@@ -3452,6 +3612,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
             op: op.clone(),
             right: Box::new(replace_aggregate_calls(
@@ -3462,6 +3623,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
         }),
         Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
@@ -3474,6 +3636,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
         }),
         Expr::Case {
@@ -3490,6 +3653,7 @@ fn replace_aggregate_calls(
                     table_scope,
                     rows,
                     outer,
+                    cte_context,
                 )?))
             } else {
                 None
@@ -3505,6 +3669,7 @@ fn replace_aggregate_calls(
                         table_scope,
                         rows,
                         outer,
+                        cte_context,
                     )?,
                     replace_aggregate_calls(
                         db,
@@ -3514,6 +3679,7 @@ fn replace_aggregate_calls(
                         table_scope,
                         rows,
                         outer,
+                        cte_context,
                     )?,
                 ));
             }
@@ -3526,6 +3692,7 @@ fn replace_aggregate_calls(
                     table_scope,
                     rows,
                     outer,
+                    cte_context,
                 )?))
             } else {
                 None
@@ -3550,6 +3717,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
             negated: *negated,
             low: Box::new(replace_aggregate_calls(
@@ -3560,6 +3728,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
             high: Box::new(replace_aggregate_calls(
                 db,
@@ -3569,6 +3738,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
         }),
         Expr::InList { expr, list, negated } => {
@@ -3582,6 +3752,7 @@ fn replace_aggregate_calls(
                     table_scope,
                     rows,
                     outer,
+                    cte_context,
                 )?);
             }
             Ok(Expr::InList {
@@ -3593,6 +3764,7 @@ fn replace_aggregate_calls(
                     table_scope,
                     rows,
                     outer,
+                    cte_context,
                 )?),
                 list: new_list,
                 negated: *negated,
@@ -3607,6 +3779,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
             subquery: subquery.clone(),
             negated: *negated,
@@ -3620,6 +3793,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
             negated: *negated,
         }),
@@ -3632,6 +3806,7 @@ fn replace_aggregate_calls(
                 table_scope,
                 rows,
                 outer,
+                cte_context,
             )?),
             data_type: data_type.clone(),
         }),
@@ -3643,6 +3818,7 @@ fn replace_aggregate_calls(
             table_scope,
             rows,
             outer,
+            cte_context,
         )?))),
         _ => Ok(expr.clone()),
     }
@@ -3788,6 +3964,7 @@ fn compute_single_aggregate(
     table_scope: &TableScope,
     rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<Value, GongDBError> {
     let mut values = compute_aggregates(
         db,
@@ -3797,6 +3974,7 @@ fn compute_single_aggregate(
         table_scope,
         rows,
         outer,
+        cte_context,
     )?;
     Ok(values.pop().unwrap_or(Value::Null))
 }
@@ -3819,6 +3997,7 @@ fn evaluate_group_projection(
     table_scope: &TableScope,
     group_rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<Vec<Value>, GongDBError> {
     let null_row = vec![Value::Null; columns.len()];
     let row = group_rows.first().unwrap_or(&null_row);
@@ -3827,6 +4006,7 @@ fn evaluate_group_projection(
         column_scopes,
         row,
         table_scope,
+        cte_context,
     };
     let mut output = Vec::new();
     for item in projection {
@@ -3844,6 +4024,7 @@ fn evaluate_group_projection(
                         table_scope,
                         group_rows,
                         outer,
+                        cte_context,
                     )?
                 } else {
                     expr.clone()
@@ -3874,6 +4055,7 @@ fn evaluate_group_having(
     table_scope: &TableScope,
     group_rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<bool, GongDBError> {
     let null_row = vec![Value::Null; columns.len()];
     let row = group_rows.first().unwrap_or(&null_row);
@@ -3882,6 +4064,7 @@ fn evaluate_group_having(
         column_scopes,
         row,
         table_scope,
+        cte_context,
     };
     let rewritten = if expr_contains_aggregate(having) {
         replace_aggregate_calls(
@@ -3892,6 +4075,7 @@ fn evaluate_group_having(
             table_scope,
             group_rows,
             outer,
+            cte_context,
         )?
     } else {
         having.clone()
@@ -4102,6 +4286,7 @@ fn compute_aggregates(
     table_scope: &TableScope,
     rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
+    cte_context: Option<&CteContext>,
 ) -> Result<Vec<Value>, GongDBError> {
     let mut results = Vec::with_capacity(aggregates.len());
     for agg in aggregates {
@@ -4116,6 +4301,7 @@ fn compute_aggregates(
                             column_scopes,
                             row,
                             table_scope,
+                            cte_context,
                         };
                         let value = eval_expr(db, expr, &scope, outer)?;
                         if !matches!(value, Value::Null) {
@@ -4126,7 +4312,7 @@ fn compute_aggregates(
                                 seen.push(value);
                                 tally += 1;
                             } else {
-                            tally += 1;
+                                tally += 1;
                             }
                         }
                     }
@@ -4151,6 +4337,7 @@ fn compute_aggregates(
                         column_scopes,
                         row,
                         table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -4203,6 +4390,7 @@ fn compute_aggregates(
                         column_scopes,
                         row,
                         table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -4237,6 +4425,7 @@ fn compute_aggregates(
                         column_scopes,
                         row,
                         table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -4280,6 +4469,7 @@ fn compute_aggregates(
                         column_scopes,
                         row,
                         table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -4324,6 +4514,7 @@ fn compute_aggregates(
                         column_scopes,
                         row,
                         table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -4359,6 +4550,7 @@ fn compute_aggregates(
                         column_scopes,
                         row,
                         table_scope,
+                        cte_context,
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {

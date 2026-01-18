@@ -1,7 +1,7 @@
 use crate::ast::{
-    BinaryOperator, ColumnConstraint, DataType, Expr, Ident, IndexedColumn, Literal, ObjectName,
-    NullsOrder, OrderByExpr, Select, SelectItem, SortOrder, TableConstraint, TableRef,
-    UnaryOperator,
+    BinaryOperator, ColumnConstraint, Cte, DataType, Expr, Ident, IndexedColumn, Literal,
+    NullsOrder, ObjectName, OrderByExpr, Select, SelectItem, SortOrder, TableConstraint, TableRef,
+    UnaryOperator, With,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -11,7 +11,7 @@ const PAGE_SIZE: usize = 4096;
 const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
-const CATALOG_FORMAT_VERSION: u32 = 3;
+const CATALOG_FORMAT_VERSION: u32 = 4;
 const HEADER_PAGE_SIZE_OFFSET: usize = 8;
 const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
 const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
@@ -2089,6 +2089,7 @@ fn decode_index_meta(record: &[u8]) -> Result<IndexMeta, StorageError> {
 }
 
 fn encode_select(select: &Select, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    encode_with_clause(&select.with, buf)?;
     buf.push(if select.distinct { 1 } else { 0 });
     if select.projection.len() > u16::MAX as usize {
         return Err(StorageError::Invalid("too many select items".to_string()));
@@ -2130,6 +2131,8 @@ fn decode_select(record: &[u8], pos: usize) -> Result<(Select, usize), StorageEr
     if cursor >= record.len() {
         return Err(StorageError::Corrupt("invalid select".to_string()));
     }
+    let (with, new_pos) = decode_with_clause(record, cursor)?;
+    cursor = new_pos;
     let distinct = record[cursor] != 0;
     cursor += 1;
     if cursor + 2 > record.len() {
@@ -2186,6 +2189,7 @@ fn decode_select(record: &[u8], pos: usize) -> Result<(Select, usize), StorageEr
     cursor = new_pos;
     Ok((
         Select {
+            with,
             distinct,
             projection,
             from,
@@ -2198,6 +2202,68 @@ fn decode_select(record: &[u8], pos: usize) -> Result<(Select, usize), StorageEr
         },
         cursor,
     ))
+}
+
+fn encode_with_clause(with: &Option<With>, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    match with {
+        None => {
+            buf.push(0);
+            Ok(())
+        }
+        Some(with_clause) => {
+            buf.push(1);
+            buf.push(if with_clause.recursive { 1 } else { 0 });
+            if with_clause.ctes.len() > u16::MAX as usize {
+                return Err(StorageError::Invalid("too many CTEs".to_string()));
+            }
+            buf.extend_from_slice(&(with_clause.ctes.len() as u16).to_le_bytes());
+            for cte in &with_clause.ctes {
+                encode_ident(&cte.name, buf)?;
+                encode_ident_list(&cte.columns, buf)?;
+                encode_select(&cte.query, buf)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn decode_with_clause(
+    record: &[u8],
+    pos: usize,
+) -> Result<(Option<With>, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid with clause".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    if tag == 0 {
+        return Ok((None, cursor));
+    }
+    if cursor >= record.len() {
+        return Err(StorageError::Corrupt("invalid with clause".to_string()));
+    }
+    let recursive = record[cursor] != 0;
+    cursor += 1;
+    if cursor + 2 > record.len() {
+        return Err(StorageError::Corrupt("invalid with clause".to_string()));
+    }
+    let cte_len = read_u16(record, cursor) as usize;
+    cursor += 2;
+    let mut ctes = Vec::with_capacity(cte_len);
+    for _ in 0..cte_len {
+        let (name, new_pos) = decode_ident(record, cursor)?;
+        cursor = new_pos;
+        let (columns, new_pos) = decode_ident_list(record, cursor)?;
+        cursor = new_pos;
+        let (query, new_pos) = decode_select(record, cursor)?;
+        cursor = new_pos;
+        ctes.push(Cte {
+            name,
+            columns,
+            query: Box::new(query),
+        });
+    }
+    Ok((Some(With { recursive, ctes }), cursor))
 }
 
 fn encode_select_item(item: &SelectItem, buf: &mut Vec<u8>) -> Result<(), StorageError> {

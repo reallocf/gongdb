@@ -271,6 +271,8 @@ fn is_keyword(word: &str) -> bool {
             | "ASC"
             | "DESC"
             | "IF"
+            | "WITH"
+            | "RECURSIVE"
             | "WITHOUT"
             | "ROWID"
             | "UNION"
@@ -370,6 +372,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         match self.current() {
             TokenKind::Keyword(k) if k == "SELECT" => Ok(Statement::Select(self.parse_select()?)),
+            TokenKind::Keyword(k) if k == "WITH" => Ok(Statement::Select(self.parse_select()?)),
             TokenKind::Keyword(k) if k == "INSERT" => Ok(Statement::Insert(self.parse_insert()?)),
             TokenKind::Keyword(k) if k == "REPLACE" => Ok(Statement::Insert(self.parse_replace()?)),
             TokenKind::Keyword(k) if k == "UPDATE" => Ok(Statement::Update(self.parse_update()?)),
@@ -611,6 +614,11 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select, ParserError> {
+        let with = if self.eat_keyword("WITH") {
+            Some(self.parse_with_clause()?)
+        } else {
+            None
+        };
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
         let projection = self.parse_select_list()?;
@@ -657,6 +665,7 @@ impl Parser {
             }
         }
         Ok(Select {
+            with,
             distinct,
             projection,
             from,
@@ -667,6 +676,32 @@ impl Parser {
             limit,
             offset,
         })
+    }
+
+    fn parse_with_clause(&mut self) -> Result<With, ParserError> {
+        let recursive = self.eat_keyword("RECURSIVE");
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.parse_ident()?;
+            let columns = if self.eat_symbol('(') {
+                self.parse_ident_list(')')?
+            } else {
+                Vec::new()
+            };
+            self.expect_keyword("AS")?;
+            self.expect_symbol('(')?;
+            let query = self.parse_select()?;
+            self.expect_symbol(')')?;
+            ctes.push(Cte {
+                name,
+                columns,
+                query: Box::new(query),
+            });
+            if !self.eat_symbol(',') {
+                break;
+            }
+        }
+        Ok(With { recursive, ctes })
     }
 
     fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParserError> {
@@ -758,7 +793,7 @@ impl Parser {
 
     fn parse_table_factor(&mut self) -> Result<TableRef, ParserError> {
         if self.eat_symbol('(') {
-            if self.current_is_keyword("SELECT") {
+            if self.is_select_start() {
                 let subquery = self.parse_select()?;
                 self.expect_symbol(')')?;
                 let alias = self.parse_optional_alias()?;
@@ -1184,7 +1219,7 @@ impl Parser {
 
     fn parse_paren_expr_or_subquery(&mut self) -> Result<Expr, ParserError> {
         self.expect_symbol('(')?;
-        if self.current_is_keyword("SELECT") {
+        if self.is_select_start() {
             let select = self.parse_select()?;
             self.expect_symbol(')')?;
             return Ok(Expr::Subquery(Box::new(select)));
@@ -1196,7 +1231,7 @@ impl Parser {
 
     fn parse_in_expr(&mut self, left: Expr, negated: bool) -> Result<Expr, ParserError> {
         if self.eat_symbol('(') {
-            if self.current_is_keyword("SELECT") {
+            if self.is_select_start() {
                 let select = self.parse_select()?;
                 self.expect_symbol(')')?;
                 Ok(Expr::InSubquery {
@@ -1224,6 +1259,7 @@ impl Parser {
         } else {
             let name = self.parse_object_name()?;
             let select = Select {
+                with: None,
                 distinct: false,
                 projection: vec![SelectItem::Wildcard],
                 from: vec![TableRef::Named { name, alias: None }],
@@ -1524,6 +1560,10 @@ impl Parser {
 
     fn current_is_keyword(&self, keyword: &str) -> bool {
         matches!(self.current(), TokenKind::Keyword(k) if k == keyword)
+    }
+
+    fn is_select_start(&self) -> bool {
+        self.current_is_keyword("SELECT") || self.current_is_keyword("WITH")
     }
 }
 
