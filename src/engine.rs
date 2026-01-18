@@ -1058,19 +1058,13 @@ impl GongDB {
             } => {
                 let left_source = self.resolve_table_ref(left, view_stack)?;
                 let right_source = self.resolve_table_ref(right, view_stack)?;
-                match operator {
-                    JoinOperator::Inner | JoinOperator::Cross => {
-                        self.join_sources_with_constraint(
-                            left_source,
-                            right_source,
-                            constraint.as_ref(),
-                            None,
-                        )
-                    }
-                    _ => Err(GongDBError::new(
-                        "only INNER JOIN is supported in phase 9",
-                    )),
-                }
+                self.join_sources_with_constraint(
+                    left_source,
+                    right_source,
+                    constraint.as_ref(),
+                    operator.clone(),
+                    None,
+                )
             }
         }
     }
@@ -1169,17 +1163,34 @@ impl GongDB {
         left: QuerySource,
         right: QuerySource,
         constraint: Option<&JoinConstraint>,
+        operator: JoinOperator,
         outer: Option<&EvalScope<'_>>,
     ) -> Result<QuerySource, GongDBError> {
-        let mut columns = left.columns;
-        columns.extend(right.columns);
-        let mut column_scopes = left.column_scopes;
-        column_scopes.extend(right.column_scopes);
+        let QuerySource {
+            columns: left_columns,
+            column_scopes: left_scopes,
+            rows: left_rows,
+            ..
+        } = left;
+        let QuerySource {
+            columns: right_columns,
+            column_scopes: right_scopes,
+            rows: right_rows,
+            ..
+        } = right;
+        let left_len = left_columns.len();
+        let right_len = right_columns.len();
+        let mut columns = left_columns;
+        columns.extend(right_columns);
+        let mut column_scopes = left_scopes;
+        column_scopes.extend(right_scopes);
         let table_scope = TableScope {
             table_name: None,
             table_alias: None,
         };
         let mut rows = Vec::new();
+        let null_left = vec![Value::Null; left_len];
+        let null_right = vec![Value::Null; right_len];
 
         let using_pairs = if let Some(JoinConstraint::Using(cols)) = constraint {
             Some(resolve_using_pairs(cols, &columns, &column_scopes)?)
@@ -1187,14 +1198,18 @@ impl GongDB {
             None
         };
 
-        for left_row in left.rows {
-            for right_row in &right.rows {
+        let on_expr = constraint.and_then(|c| match c {
+            JoinConstraint::On(expr) => Some(expr),
+            _ => None,
+        });
+        let mut right_matched = vec![false; right_rows.len()];
+
+        for left_row in left_rows {
+            let mut matched = false;
+            for (right_idx, right_row) in right_rows.iter().enumerate() {
                 let mut combined = left_row.clone();
                 combined.extend(right_row.clone());
-                if let Some(expr) = constraint.and_then(|c| match c {
-                    JoinConstraint::On(expr) => Some(expr),
-                    _ => None,
-                }) {
+                if let Some(expr) = on_expr {
                     let scope = EvalScope {
                         columns: &columns,
                         column_scopes: &column_scopes,
@@ -1211,6 +1226,24 @@ impl GongDB {
                         continue;
                     }
                 }
+                matched = true;
+                right_matched[right_idx] = true;
+                rows.push(combined);
+            }
+            if !matched && matches!(operator, JoinOperator::Left | JoinOperator::Full) {
+                let mut combined = left_row;
+                combined.extend(null_right.clone());
+                rows.push(combined);
+            }
+        }
+
+        if matches!(operator, JoinOperator::Right | JoinOperator::Full) {
+            for (right_idx, right_row) in right_rows.into_iter().enumerate() {
+                if right_matched[right_idx] {
+                    continue;
+                }
+                let mut combined = null_left.clone();
+                combined.extend(right_row);
                 rows.push(combined);
             }
         }
