@@ -1,7 +1,7 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
-    InsertConflict, InsertSource, Literal, NullsOrder, Select, SelectItem, Statement,
-    TableConstraint,
+    InsertConflict, InsertSource, JoinConstraint, JoinOperator, Literal, NullsOrder, Select,
+    SelectItem, Statement, TableConstraint, TableRef,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
@@ -490,13 +490,13 @@ impl GongDB {
                         table_scope,
                     }
                 } else {
-                    self.resolve_source(select, view_stack)?
+                    self.resolve_source(select, view_stack, select.selection.as_ref(), outer)?
                 }
             } else {
-                self.resolve_source(select, view_stack)?
+                self.resolve_source(select, view_stack, select.selection.as_ref(), outer)?
             }
         } else {
-            self.resolve_source(select, view_stack)?
+            self.resolve_source(select, view_stack, select.selection.as_ref(), outer)?
         };
         let QuerySource {
             columns,
@@ -864,6 +864,8 @@ impl GongDB {
         &self,
         select: &Select,
         view_stack: &mut Vec<String>,
+        selection: Option<&Expr>,
+        outer: Option<&EvalScope<'_>>,
     ) -> Result<QuerySource, GongDBError> {
         if select.from.is_empty() {
             return Ok(QuerySource {
@@ -877,13 +879,34 @@ impl GongDB {
             });
         }
 
+        if select.from.len() == 1 {
+            return self.resolve_table_ref(&select.from[0], view_stack);
+        }
+
         let mut sources = Vec::new();
+        let mut named_only = true;
         for table_ref in &select.from {
+            if !matches!(table_ref, TableRef::Named { .. }) {
+                named_only = false;
+            }
             sources.push(self.resolve_table_ref(table_ref, view_stack)?);
         }
 
         if sources.len() == 1 {
             return Ok(sources.remove(0));
+        }
+
+        let predicates = selection
+            .map(split_conjuncts)
+            .unwrap_or_default();
+
+        if named_only && !predicates.is_empty() {
+            let mut table_infos = Vec::new();
+            for source in sources {
+                let scope = source.table_scope.clone();
+                table_infos.push(TableInfo { source, scope });
+            }
+            return self.resolve_join_plan(table_infos, predicates, outer);
         }
 
         let mut rows = vec![Vec::new()];
@@ -1013,11 +1036,535 @@ impl GongDB {
                     table_name
                 )))
             }
-            _ => Err(GongDBError::new(
-                "only simple table references are supported in phase 2",
-            )),
+            crate::ast::TableRef::Subquery { subquery, alias } => {
+                let result = self.evaluate_select_values_with_views(subquery, view_stack, None)?;
+                let table_scope = TableScope {
+                    table_name: None,
+                    table_alias: alias.as_ref().map(|ident| ident.value.clone()),
+                };
+                let column_count = result.columns.len();
+                Ok(QuerySource {
+                    columns: result.columns,
+                    column_scopes: vec![table_scope.clone(); column_count],
+                    rows: result.rows,
+                    table_scope,
+                })
+            }
+            crate::ast::TableRef::Join {
+                left,
+                right,
+                operator,
+                constraint,
+            } => {
+                let left_source = self.resolve_table_ref(left, view_stack)?;
+                let right_source = self.resolve_table_ref(right, view_stack)?;
+                match operator {
+                    JoinOperator::Inner | JoinOperator::Cross => {
+                        self.join_sources_with_constraint(
+                            left_source,
+                            right_source,
+                            constraint.as_ref(),
+                            None,
+                        )
+                    }
+                    _ => Err(GongDBError::new(
+                        "only INNER JOIN is supported in phase 9",
+                    )),
+                }
+            }
         }
     }
+
+    fn resolve_join_plan(
+        &self,
+        tables: Vec<TableInfo>,
+        predicates: Vec<Expr>,
+        outer: Option<&EvalScope<'_>>,
+    ) -> Result<QuerySource, GongDBError> {
+        let mut remaining: Vec<PredicateInfo> = predicates
+            .into_iter()
+            .map(|expr| PredicateInfo {
+                tables: predicate_table_refs(&expr, &tables),
+                expr,
+            })
+            .collect();
+        let table_count = tables.len();
+        let row_counts: Vec<usize> = tables.iter().map(|info| info.source.rows.len()).collect();
+        let mut sources: Vec<Option<QuerySource>> =
+            tables.into_iter().map(|info| Some(info.source)).collect();
+
+        let mut joined = HashSet::new();
+        let current_index = 0usize;
+        joined.insert(current_index);
+
+        let mut current = apply_predicates_to_source(
+            self,
+            sources[current_index].take().unwrap(),
+            extract_predicates_for_tables(&mut remaining, &joined),
+            outer,
+        )?;
+
+        while joined.len() < table_count {
+            let mut best_idx = None;
+            let mut best_applicable = 0usize;
+            let mut best_rows = usize::MAX;
+            for (idx, row_count) in row_counts.iter().enumerate() {
+                if joined.contains(&idx) {
+                    continue;
+                }
+                let mut applicable = 0usize;
+                for pred in &remaining {
+                    if let Some(tables) = &pred.tables {
+                        if tables_contains(tables, idx)
+                            && tables_subset(tables, &joined, idx)
+                        {
+                            applicable += 1;
+                        }
+                    }
+                }
+                if applicable > 0 {
+                    if applicable > best_applicable
+                        || (applicable == best_applicable && *row_count < best_rows)
+                    {
+                        best_idx = Some(idx);
+                        best_applicable = applicable;
+                        best_rows = *row_count;
+                    }
+                } else if best_idx.is_none() && *row_count < best_rows {
+                    best_idx = Some(idx);
+                    best_rows = *row_count;
+                }
+            }
+
+            let idx = best_idx.unwrap_or_else(|| {
+                (0..table_count)
+                    .find(|i| !joined.contains(i))
+                    .unwrap()
+            });
+
+            let right = apply_predicates_to_source(
+                self,
+                sources[idx].take().unwrap(),
+                extract_local_predicates(&mut remaining, idx),
+                outer,
+            )?;
+
+            let new_joined = extend_joined(&joined, idx);
+            let join_predicates = extract_predicates_for_tables(&mut remaining, &new_joined);
+            current = join_sources_with_predicates(
+                self,
+                current,
+                right,
+                &join_predicates,
+                outer,
+            )?;
+            joined.insert(idx);
+        }
+
+        Ok(current)
+    }
+
+    fn join_sources_with_constraint(
+        &self,
+        left: QuerySource,
+        right: QuerySource,
+        constraint: Option<&JoinConstraint>,
+        outer: Option<&EvalScope<'_>>,
+    ) -> Result<QuerySource, GongDBError> {
+        let mut columns = left.columns;
+        columns.extend(right.columns);
+        let mut column_scopes = left.column_scopes;
+        column_scopes.extend(right.column_scopes);
+        let table_scope = TableScope {
+            table_name: None,
+            table_alias: None,
+        };
+        let mut rows = Vec::new();
+
+        let using_pairs = if let Some(JoinConstraint::Using(cols)) = constraint {
+            Some(resolve_using_pairs(cols, &columns, &column_scopes)?)
+        } else {
+            None
+        };
+
+        for left_row in left.rows {
+            for right_row in &right.rows {
+                let mut combined = left_row.clone();
+                combined.extend(right_row.clone());
+                if let Some(expr) = constraint.and_then(|c| match c {
+                    JoinConstraint::On(expr) => Some(expr),
+                    _ => None,
+                }) {
+                    let scope = EvalScope {
+                        columns: &columns,
+                        column_scopes: &column_scopes,
+                        row: &combined,
+                        table_scope: &table_scope,
+                    };
+                    let value = eval_expr(self, expr, &scope, outer)?;
+                    if !value_to_bool(&value) {
+                        continue;
+                    }
+                }
+                if let Some(pairs) = &using_pairs {
+                    if !using_pairs_match(&combined, pairs)? {
+                        continue;
+                    }
+                }
+                rows.push(combined);
+            }
+        }
+
+        Ok(QuerySource {
+            columns,
+            column_scopes,
+            rows,
+            table_scope,
+        })
+    }
+}
+
+fn split_conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+            let mut items = split_conjuncts(left);
+            items.extend(split_conjuncts(right));
+            items
+        }
+        _ => vec![expr.clone()],
+    }
+}
+
+fn predicate_table_refs(expr: &Expr, tables: &[TableInfo]) -> Option<Vec<usize>> {
+    if expr_contains_subquery(expr) {
+        return None;
+    }
+    let mut refs = HashSet::new();
+    if !collect_predicate_tables(expr, tables, &mut refs) {
+        return None;
+    }
+    let mut refs: Vec<usize> = refs.into_iter().collect();
+    refs.sort_unstable();
+    Some(refs)
+}
+
+fn collect_predicate_tables(expr: &Expr, tables: &[TableInfo], refs: &mut HashSet<usize>) -> bool {
+    match expr {
+        Expr::Identifier(ident) => {
+            let mut matches = Vec::new();
+            for (idx, info) in tables.iter().enumerate() {
+                if resolve_column_index(&ident.value, &info.source.columns).is_some() {
+                    matches.push(idx);
+                }
+            }
+            if matches.len() != 1 {
+                return false;
+            }
+            refs.insert(matches[0]);
+            true
+        }
+        Expr::CompoundIdentifier(idents) => {
+            let (qualifier, column) = match split_qualified_identifier(idents) {
+                Ok(result) => result,
+                Err(_) => return false,
+            };
+            let mut matches = Vec::new();
+            for (idx, info) in tables.iter().enumerate() {
+                if info.scope.matches_qualifier(qualifier)
+                    && resolve_column_index(column, &info.source.columns).is_some()
+                {
+                    matches.push(idx);
+                }
+            }
+            if matches.len() != 1 {
+                return false;
+            }
+            refs.insert(matches[0]);
+            true
+        }
+        Expr::Literal(_) | Expr::Wildcard => true,
+        Expr::BinaryOp { left, right, .. } => {
+            collect_predicate_tables(left, tables, refs)
+                && collect_predicate_tables(right, tables, refs)
+        }
+        Expr::UnaryOp { expr, .. } => collect_predicate_tables(expr, tables, refs),
+        Expr::Function { args, .. } => args
+            .iter()
+            .all(|arg| collect_predicate_tables(arg, tables, refs)),
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            if let Some(expr) = operand {
+                if !collect_predicate_tables(expr, tables, refs) {
+                    return false;
+                }
+            }
+            for (when_expr, then_expr) in when_then {
+                if !collect_predicate_tables(when_expr, tables, refs)
+                    || !collect_predicate_tables(then_expr, tables, refs)
+                {
+                    return false;
+                }
+            }
+            if let Some(expr) = else_result {
+                if !collect_predicate_tables(expr, tables, refs) {
+                    return false;
+                }
+            }
+            true
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            ..
+        } => {
+            collect_predicate_tables(expr, tables, refs)
+                && collect_predicate_tables(low, tables, refs)
+                && collect_predicate_tables(high, tables, refs)
+        }
+        Expr::InList { expr, list, .. } => {
+            if !collect_predicate_tables(expr, tables, refs) {
+                return false;
+            }
+            list.iter()
+                .all(|item| collect_predicate_tables(item, tables, refs))
+        }
+        Expr::IsNull { expr, .. } => collect_predicate_tables(expr, tables, refs),
+        Expr::Cast { expr, .. } => collect_predicate_tables(expr, tables, refs),
+        Expr::Nested(expr) => collect_predicate_tables(expr, tables, refs),
+        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::Subquery(_) => false,
+    }
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::Subquery(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_subquery(expr),
+        Expr::Function { args, .. } => args.iter().any(expr_contains_subquery),
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_contains_subquery(expr))
+                || when_then.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_subquery(when_expr) || expr_contains_subquery(then_expr)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_subquery(expr))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            ..
+        } => {
+            expr_contains_subquery(expr)
+                || expr_contains_subquery(low)
+                || expr_contains_subquery(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_contains_subquery(expr) || list.iter().any(expr_contains_subquery)
+        }
+        Expr::IsNull { expr, .. } => expr_contains_subquery(expr),
+        Expr::Cast { expr, .. } => expr_contains_subquery(expr),
+        Expr::Nested(expr) => expr_contains_subquery(expr),
+        Expr::Literal(_) | Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Wildcard => {
+            false
+        }
+    }
+}
+
+fn extract_local_predicates(
+    predicates: &mut Vec<PredicateInfo>,
+    table_idx: usize,
+) -> Vec<Expr> {
+    let mut applied = Vec::new();
+    let mut remaining = Vec::new();
+    for pred in predicates.drain(..) {
+        if let Some(tables) = &pred.tables {
+            if tables.len() == 1 && tables[0] == table_idx {
+                applied.push(pred.expr);
+                continue;
+            }
+        }
+        remaining.push(pred);
+    }
+    *predicates = remaining;
+    applied
+}
+
+fn extract_predicates_for_tables(
+    predicates: &mut Vec<PredicateInfo>,
+    joined: &HashSet<usize>,
+) -> Vec<Expr> {
+    let mut applied = Vec::new();
+    let mut remaining = Vec::new();
+    for pred in predicates.drain(..) {
+        if let Some(tables) = &pred.tables {
+            if tables.iter().all(|idx| joined.contains(idx)) {
+                applied.push(pred.expr);
+                continue;
+            }
+        }
+        remaining.push(pred);
+    }
+    *predicates = remaining;
+    applied
+}
+
+fn tables_contains(tables: &[usize], idx: usize) -> bool {
+    tables.iter().any(|table_idx| *table_idx == idx)
+}
+
+fn tables_subset(tables: &[usize], joined: &HashSet<usize>, candidate: usize) -> bool {
+    tables
+        .iter()
+        .all(|table_idx| *table_idx == candidate || joined.contains(table_idx))
+}
+
+fn extend_joined(joined: &HashSet<usize>, idx: usize) -> HashSet<usize> {
+    let mut next = joined.clone();
+    next.insert(idx);
+    next
+}
+
+fn apply_predicates_to_source(
+    db: &GongDB,
+    source: QuerySource,
+    predicates: Vec<Expr>,
+    outer: Option<&EvalScope<'_>>,
+) -> Result<QuerySource, GongDBError> {
+    if predicates.is_empty() {
+        return Ok(source);
+    }
+    let table_scope = source.table_scope.clone();
+    let mut rows = Vec::new();
+    for row in source.rows {
+        let scope = EvalScope {
+            columns: &source.columns,
+            column_scopes: &source.column_scopes,
+            row: &row,
+            table_scope: &table_scope,
+        };
+        let mut keep = true;
+        for predicate in &predicates {
+            let value = eval_expr(db, predicate, &scope, outer)?;
+            if !value_to_bool(&value) {
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            rows.push(row);
+        }
+    }
+    Ok(QuerySource {
+        rows,
+        ..source
+    })
+}
+
+fn join_sources_with_predicates(
+    db: &GongDB,
+    left: QuerySource,
+    right: QuerySource,
+    predicates: &[Expr],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<QuerySource, GongDBError> {
+    let mut columns = left.columns;
+    columns.extend(right.columns);
+    let mut column_scopes = left.column_scopes;
+    column_scopes.extend(right.column_scopes);
+    let table_scope = TableScope {
+        table_name: None,
+        table_alias: None,
+    };
+    let mut rows = Vec::new();
+    for left_row in left.rows {
+        for right_row in &right.rows {
+            let mut combined = left_row.clone();
+            combined.extend(right_row.clone());
+            if !predicates.is_empty() {
+                let scope = EvalScope {
+                    columns: &columns,
+                    column_scopes: &column_scopes,
+                    row: &combined,
+                    table_scope: &table_scope,
+                };
+                let mut keep = true;
+                for predicate in predicates {
+                    let value = eval_expr(db, predicate, &scope, outer)?;
+                    if !value_to_bool(&value) {
+                        keep = false;
+                        break;
+                    }
+                }
+                if !keep {
+                    continue;
+                }
+            }
+            rows.push(combined);
+        }
+    }
+    Ok(QuerySource {
+        columns,
+        column_scopes,
+        rows,
+        table_scope,
+    })
+}
+
+fn resolve_using_pairs(
+    cols: &[Ident],
+    columns: &[Column],
+    _column_scopes: &[TableScope],
+) -> Result<Vec<(usize, usize)>, GongDBError> {
+    let mut pairs = Vec::new();
+    for ident in cols {
+        let name = &ident.value;
+        let mut left = None;
+        let mut right = None;
+        for (idx, col) in columns.iter().enumerate() {
+            if col.name.eq_ignore_ascii_case(name) {
+                if left.is_none() {
+                    left = Some(idx);
+                } else {
+                    right = Some(idx);
+                    break;
+                }
+            }
+        }
+        let (Some(left_idx), Some(right_idx)) = (left, right) else {
+            return Err(GongDBError::new(format!(
+                "unknown column {} in USING clause",
+                name
+            )));
+        };
+        pairs.push((left_idx, right_idx));
+    }
+    Ok(pairs)
+}
+
+fn using_pairs_match(row: &[Value], pairs: &[(usize, usize)]) -> Result<bool, GongDBError> {
+    for (left_idx, right_idx) in pairs {
+        let left = &row[*left_idx];
+        let right = &row[*right_idx];
+        let value = compare_values(&BinaryOperator::Eq, left, right);
+        if !value_to_bool(&value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[async_trait]
@@ -1037,6 +1584,16 @@ struct QuerySource {
     column_scopes: Vec<TableScope>,
     rows: Vec<Vec<Value>>,
     table_scope: TableScope,
+}
+
+struct TableInfo {
+    source: QuerySource,
+    scope: TableScope,
+}
+
+struct PredicateInfo {
+    expr: Expr,
+    tables: Option<Vec<usize>>,
 }
 
 struct QueryResult {
