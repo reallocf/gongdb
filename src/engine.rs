@@ -227,17 +227,31 @@ impl GongDB {
                     .get_table(&table_name)
                     .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
                     .clone();
-                let rows = match insert.source {
-                    InsertSource::Values(values) => values,
-                    _ => {
-                        return Err(GongDBError::new(
-                            "only VALUES insert is supported in phase 2",
-                        ))
+                match insert.source {
+                    InsertSource::Values(values) => {
+                        for exprs in values {
+                            let row = build_insert_row(&table, &insert.columns, &exprs)?;
+                            let _ = self.storage.insert_row(&table_name, &row)?;
+                        }
                     }
-                };
-                for exprs in rows {
-                    let row = build_insert_row(&table, &insert.columns, &exprs)?;
-                    let _ = self.storage.insert_row(&table_name, &row)?;
+                    InsertSource::Select(select) => {
+                        let result = self.evaluate_select_values(&select)?;
+                        if insert.columns.is_empty() {
+                            if result.columns.len() != table.columns.len() {
+                                return Err(GongDBError::new("column count mismatch"));
+                            }
+                        } else if result.columns.len() != insert.columns.len() {
+                            return Err(GongDBError::new("column count mismatch"));
+                        }
+                        for values in result.rows {
+                            let row = build_insert_row_from_values(
+                                &table,
+                                &insert.columns,
+                                &values,
+                            )?;
+                            let _ = self.storage.insert_row(&table_name, &row)?;
+                        }
+                    }
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
@@ -369,12 +383,57 @@ impl GongDB {
         select: &Select,
         view_stack: &mut Vec<String>,
     ) -> Result<QuerySource, GongDBError> {
-        if select.from.len() != 1 {
-            return Err(GongDBError::new(
-                "only single-table queries are supported in phase 2",
-            ));
+        if select.from.is_empty() {
+            return Ok(QuerySource {
+                columns: Vec::new(),
+                rows: vec![Vec::new()],
+                table_scope: TableScope {
+                    table_name: None,
+                    table_alias: None,
+                },
+            });
         }
-        match &select.from[0] {
+
+        let mut sources = Vec::new();
+        for table_ref in &select.from {
+            sources.push(self.resolve_table_ref(table_ref, view_stack)?);
+        }
+
+        if sources.len() == 1 {
+            return Ok(sources.remove(0));
+        }
+
+        let mut rows = vec![Vec::new()];
+        let mut columns = Vec::new();
+        for source in sources {
+            columns.extend(source.columns);
+            let mut next_rows = Vec::new();
+            for left_row in &rows {
+                for right_row in &source.rows {
+                    let mut combined = left_row.clone();
+                    combined.extend(right_row.clone());
+                    next_rows.push(combined);
+                }
+            }
+            rows = next_rows;
+        }
+
+        Ok(QuerySource {
+            columns,
+            rows,
+            table_scope: TableScope {
+                table_name: None,
+                table_alias: None,
+            },
+        })
+    }
+
+    fn resolve_table_ref(
+        &self,
+        table_ref: &crate::ast::TableRef,
+        view_stack: &mut Vec<String>,
+    ) -> Result<QuerySource, GongDBError> {
+        match table_ref {
             crate::ast::TableRef::Named { name, alias } => {
                 let table_name = object_name(name);
                 let table_alias = alias.as_ref().map(|ident| ident.value.clone());
@@ -777,6 +836,38 @@ fn build_insert_row(
     Ok(row)
 }
 
+fn build_insert_row_from_values(
+    table: &TableMeta,
+    columns: &[Ident],
+    values: &[Value],
+) -> Result<Vec<Value>, GongDBError> {
+    let mut row = vec![Value::Null; table.columns.len()];
+    if columns.is_empty() {
+        if values.len() != table.columns.len() {
+            return Err(GongDBError::new("column count mismatch"));
+        }
+        for (idx, value) in values.iter().enumerate() {
+            row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
+        }
+        return Ok(row);
+    }
+    if values.len() != columns.len() {
+        return Err(GongDBError::new("column count mismatch"));
+    }
+    let mut index_by_name = HashMap::new();
+    for (idx, col) in table.columns.iter().enumerate() {
+        index_by_name.insert(col.name.to_lowercase(), idx);
+    }
+    for (col_ident, value) in columns.iter().zip(values.iter()) {
+        let key = col_ident.value.to_lowercase();
+        let idx = *index_by_name
+            .get(&key)
+            .ok_or_else(|| GongDBError::new(format!("unknown column {}", col_ident.value)))?;
+        row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
+    }
+    Ok(row)
+}
+
 fn eval_literal(expr: &Expr) -> Result<Value, GongDBError> {
     match expr {
         Expr::Literal(lit) => match lit {
@@ -938,6 +1029,32 @@ fn eval_expr<'a, 'b>(
                 Ok(between)
             }
         }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let expr_val = eval_expr(db, expr, scope, outer)?;
+            let result = eval_in_list(db, &expr_val, list, scope, outer)?;
+            if *negated {
+                Ok(apply_logical_not(result))
+            } else {
+                Ok(result)
+            }
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let expr_val = eval_expr(db, expr, scope, outer)?;
+            let result = eval_in_subquery(db, &expr_val, subquery, scope)?;
+            if *negated {
+                Ok(apply_logical_not(result))
+            } else {
+                Ok(result)
+            }
+        }
         Expr::Exists(subquery) => {
             let result = db.evaluate_select_values_with_outer(subquery, Some(scope))?;
             Ok(Value::Integer((!result.rows.is_empty()) as i64))
@@ -946,6 +1063,66 @@ fn eval_expr<'a, 'b>(
         _ => Err(GongDBError::new(
             "unsupported expression in phase 2",
         )),
+    }
+}
+
+fn eval_in_list<'a, 'b>(
+    db: &GongDB,
+    expr_val: &Value,
+    list: &[Expr],
+    scope: &EvalScope<'a>,
+    outer: Option<&EvalScope<'b>>,
+) -> Result<Value, GongDBError> {
+    if list.is_empty() {
+        return Ok(Value::Integer(0));
+    }
+    let mut saw_null = false;
+    for item in list {
+        let item_val = eval_expr(db, item, scope, outer)?;
+        match compare_values(&BinaryOperator::Eq, expr_val, &item_val) {
+            Value::Integer(1) => return Ok(Value::Integer(1)),
+            Value::Null => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Integer(0))
+    }
+}
+
+fn eval_in_subquery<'a>(
+    db: &GongDB,
+    expr_val: &Value,
+    subquery: &Select,
+    scope: &EvalScope<'a>,
+) -> Result<Value, GongDBError> {
+    let result = db.evaluate_select_values_with_outer(subquery, Some(scope))?;
+    if result.columns.len() != 1 {
+        return Err(GongDBError::new(
+            "subquery returned more than one column",
+        ));
+    }
+    if result.rows.is_empty() {
+        return Ok(Value::Integer(0));
+    }
+    let mut saw_null = false;
+    for row in result.rows {
+        let item_val = row
+            .get(0)
+            .cloned()
+            .unwrap_or(Value::Null);
+        match compare_values(&BinaryOperator::Eq, expr_val, &item_val) {
+            Value::Integer(1) => return Ok(Value::Integer(1)),
+            Value::Null => saw_null = true,
+            _ => {}
+        }
+    }
+    if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Integer(0))
     }
 }
 
