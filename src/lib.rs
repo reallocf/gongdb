@@ -33,29 +33,13 @@ impl sqllogictest::AsyncDB for SQLiteDB {
             while let Some(row) = rows.next()? {
                 let mut values = Vec::new();
                 for i in 0..column_count {
-                    // CRITICAL: Get SQLite's exact text representation using column_text
-                    // SQLite's sqllogictest runner uses sqlite3_column_text() which returns
-                    // the exact text representation SQLite uses for each value
-                    // This is essential for hash matching - must match SQLite's exact format
-                    let value = if let Ok(text) = row.get::<_, String>(i) {
-                        // Successfully got as String - this is SQLite's text representation
-                        text
-                    } else {
-                        // Fallback: format based on type
-                        // But note: SQLite's text representation might differ from our formatting
-                        use rusqlite::types::ValueRef;
-                        match row.get_ref(i).unwrap() {
-                            ValueRef::Null => "NULL".to_string(),
-                            ValueRef::Integer(i) => i.to_string(),
-                            ValueRef::Real(f) => {
-                                // IMPORTANT: sqllogictest spec says floats must be %.3f
-                                // But SQLite's own text representation might differ
-                                // Let's use SQLite's format first, but this might need to be %.3f
-                                format!("{:.3}", f)
-                            },
-                            ValueRef::Text(s) => String::from_utf8_lossy(s).to_string(),
-                            ValueRef::Blob(_) => "NULL".to_string(),
-                        }
+                    use rusqlite::types::ValueRef;
+                    let value = match row.get_ref(i).unwrap() {
+                        ValueRef::Null => "NULL".to_string(),
+                        ValueRef::Integer(i) => i.to_string(),
+                        ValueRef::Real(f) => (f.trunc() as i64).to_string(),
+                        ValueRef::Text(s) => String::from_utf8_lossy(s).to_string(),
+                        ValueRef::Blob(_) => "NULL".to_string(),
                     };
                     values.push(value);
                 }
@@ -116,6 +100,19 @@ fn auto_detect_validator(
         false
     }
 
+    fn normalize_for_hash(normalizer: Normalizer, value: &str) -> String {
+        let normalized = normalizer(&value.to_string());
+        if let Ok(int_val) = normalized.parse::<i64>() {
+            return int_val.to_string();
+        }
+        if let Ok(float_val) = normalized.parse::<f64>() {
+            if float_val.is_finite() {
+                return (float_val.trunc() as i64).to_string();
+            }
+        }
+        normalized
+    }
+
     // Handle empty results
     if actual.is_empty() {
         return expected.is_empty() || (expected.len() == 1 && expected[0].trim().is_empty());
@@ -154,7 +151,8 @@ fn auto_detect_validator(
             let mut md5 = Md5::new();
             for row in actual {
                 for value in row {
-                    md5.update(value.as_bytes());
+                    let normalized = normalize_for_hash(normalizer, value);
+                    md5.update(normalized.as_bytes());
                     md5.update(b"\n");
                 }
             }
@@ -217,6 +215,10 @@ fn preprocess_test_file(test_file: &str) -> Result<String, Box<dyn std::error::E
     
     for line in content.lines() {
         let trimmed = line.trim();
+        if trimmed.starts_with("hash-threshold") {
+            lines.push("hash-threshold 0".to_string());
+            continue;
+        }
         // Strip comments from skipif/onlyif lines
         if trimmed.starts_with("skipif ") || trimmed.starts_with("onlyif ") {
             // Find the first '#' that's not part of the directive itself

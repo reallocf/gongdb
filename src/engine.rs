@@ -359,10 +359,12 @@ impl GongDB {
                     table_name: Some(table_name.clone()),
                     table_alias: None,
                 };
+                let column_scopes = vec![table_scope.clone(); table.columns.len()];
                 let mut updated_rows = Vec::with_capacity(rows.len());
                 for row in rows {
                     let scope = EvalScope {
                         columns: &table.columns,
+                        column_scopes: &column_scopes,
                         row: &row,
                         table_scope: &table_scope,
                     };
@@ -408,10 +410,12 @@ impl GongDB {
                     table_name: Some(table_name.clone()),
                     table_alias: None,
                 };
+                let column_scopes = vec![table_scope.clone(); table.columns.len()];
                 let mut remaining_rows = Vec::with_capacity(rows.len());
                 for row in rows {
                     let scope = EvalScope {
                         columns: &table.columns,
+                        column_scopes: &column_scopes,
                         row: &row,
                         table_scope: &table_scope,
                     };
@@ -474,13 +478,15 @@ impl GongDB {
                         .storage
                         .get_table(&table_name)
                         .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?;
+                    let table_scope = TableScope {
+                        table_name: Some(table_name),
+                        table_alias,
+                    };
                     QuerySource {
                         columns: table.columns.clone(),
+                        column_scopes: vec![table_scope.clone(); table.columns.len()],
                         rows,
-                        table_scope: TableScope {
-                            table_name: Some(table_name),
-                            table_alias,
-                        },
+                        table_scope,
                     }
                 } else {
                     self.resolve_source(select, view_stack)?
@@ -493,6 +499,7 @@ impl GongDB {
         };
         let QuerySource {
             columns,
+            column_scopes,
             rows,
             table_scope,
         } = source;
@@ -500,6 +507,7 @@ impl GongDB {
         for row in rows {
             let scope = EvalScope {
                 columns: &columns,
+                column_scopes: &column_scopes,
                 row: &row,
                 table_scope: &table_scope,
             };
@@ -527,8 +535,15 @@ impl GongDB {
         }
 
         if let Some(aggregates) = aggregate_projections(&select.projection)? {
-            let values =
-                compute_aggregates(self, &aggregates, &columns, &table_scope, &filtered, outer)?;
+            let values = compute_aggregates(
+                self,
+                &aggregates,
+                &columns,
+                &column_scopes,
+                &table_scope,
+                &filtered,
+                outer,
+            )?;
             return Ok(QueryResult {
                 columns: output_columns,
                 rows: vec![values],
@@ -538,7 +553,16 @@ impl GongDB {
         if !select.order_by.is_empty() {
             let order_by = select.order_by.clone();
             filtered.sort_by(|a, b| {
-                compare_order_by(self, &order_by, &columns, &table_scope, outer, a, b)
+                compare_order_by(
+                    self,
+                    &order_by,
+                    &columns,
+                    &column_scopes,
+                    &table_scope,
+                    outer,
+                    a,
+                    b,
+                )
             });
         }
 
@@ -546,6 +570,7 @@ impl GongDB {
         for row in filtered {
             let scope = EvalScope {
                 columns: &columns,
+                column_scopes: &column_scopes,
                 row: &row,
                 table_scope: &table_scope,
             };
@@ -594,6 +619,7 @@ impl GongDB {
         if select.from.is_empty() {
             return Ok(QuerySource {
                 columns: Vec::new(),
+                column_scopes: Vec::new(),
                 rows: vec![Vec::new()],
                 table_scope: TableScope {
                     table_name: None,
@@ -613,8 +639,10 @@ impl GongDB {
 
         let mut rows = vec![Vec::new()];
         let mut columns = Vec::new();
+        let mut column_scopes = Vec::new();
         for source in sources {
             columns.extend(source.columns);
+            column_scopes.extend(source.column_scopes);
             let mut next_rows = Vec::new();
             for left_row in &rows {
                 for right_row in &source.rows {
@@ -628,6 +656,7 @@ impl GongDB {
 
         Ok(QuerySource {
             columns,
+            column_scopes,
             rows,
             table_scope: TableScope {
                 table_name: None,
@@ -651,6 +680,7 @@ impl GongDB {
             table_name: Some(table_name.to_string()),
             table_alias: table_alias.map(|alias| alias.to_string()),
         };
+        let column_scopes = vec![table_scope.clone(); table.columns.len()];
         let mut rows = Vec::new();
         let mut scan = self.storage.table_scan(table_name)?;
         while let Some(result) = scan.next() {
@@ -658,6 +688,7 @@ impl GongDB {
             if let Some(predicate) = selection {
                 let scope = EvalScope {
                     columns: &table.columns,
+                    column_scopes: &column_scopes,
                     row: &row,
                     table_scope: &table_scope,
                 };
@@ -682,13 +713,15 @@ impl GongDB {
                 let table_alias = alias.as_ref().map(|ident| ident.value.clone());
                 if let Some(table) = self.storage.get_table(&table_name) {
                     let rows = self.storage.scan_table(&table_name)?;
+                    let table_scope = TableScope {
+                        table_name: Some(table_name),
+                        table_alias,
+                    };
                     return Ok(QuerySource {
                         columns: table.columns.clone(),
+                        column_scopes: vec![table_scope.clone(); table.columns.len()],
                         rows,
-                        table_scope: TableScope {
-                            table_name: Some(table_name),
-                            table_alias,
-                        },
+                        table_scope,
                     });
                 }
                 if let Some(view) = self.storage.get_view(&table_name) {
@@ -714,13 +747,16 @@ impl GongDB {
                         }
                         result.columns = columns_from_idents(&view.columns);
                     }
+                    let table_scope = TableScope {
+                        table_name: Some(table_name),
+                        table_alias,
+                    };
+                    let column_count = result.columns.len();
                     return Ok(QuerySource {
                         columns: result.columns,
+                        column_scopes: vec![table_scope.clone(); column_count],
                         rows: result.rows,
-                        table_scope: TableScope {
-                            table_name: Some(table_name),
-                            table_alias,
-                        },
+                        table_scope,
                     });
                 }
                 Err(GongDBError::new(format!(
@@ -749,6 +785,7 @@ impl sqllogictest::AsyncDB for GongDB {
 
 struct QuerySource {
     columns: Vec<Column>,
+    column_scopes: Vec<TableScope>,
     rows: Vec<Vec<Value>>,
     table_scope: TableScope,
 }
@@ -779,6 +816,7 @@ impl TableScope {
 #[derive(Clone, Copy)]
 struct EvalScope<'a> {
     columns: &'a [Column],
+    column_scopes: &'a [TableScope],
     row: &'a [Value],
     table_scope: &'a TableScope,
 }
@@ -1241,8 +1279,10 @@ fn eval_insert_expr(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
         table_name: None,
         table_alias: None,
     };
+    let column_scopes = Vec::new();
     let scope = EvalScope {
         columns: &[],
+        column_scopes: &column_scopes,
         row: &[],
         table_scope: &table_scope,
     };
@@ -1289,8 +1329,10 @@ fn validate_insert_row(
             table_name: Some(table.name.clone()),
             table_alias: None,
         };
+        let column_scopes = vec![table_scope.clone(); table.columns.len()];
         let scope = EvalScope {
             columns: &table.columns,
+            column_scopes: &column_scopes,
             row,
             table_scope: &table_scope,
         };
@@ -1344,6 +1386,25 @@ fn resolve_column_index(name: &str, columns: &[Column]) -> Option<usize> {
         .position(|col| col.name.eq_ignore_ascii_case(name))
 }
 
+fn resolve_qualified_column_index(
+    qualifier: &str,
+    name: &str,
+    columns: &[Column],
+    column_scopes: &[TableScope],
+) -> Option<usize> {
+    columns.iter().enumerate().find_map(|(idx, col)| {
+        if col.name.eq_ignore_ascii_case(name)
+            && column_scopes
+                .get(idx)
+                .is_some_and(|scope| scope.matches_qualifier(qualifier))
+        {
+            Some(idx)
+        } else {
+            None
+        }
+    })
+}
+
 fn split_qualified_identifier(idents: &[Ident]) -> Result<(&str, &str), GongDBError> {
     if idents.len() < 2 {
         return Err(GongDBError::new("invalid qualified identifier"));
@@ -1385,16 +1446,22 @@ fn eval_expr<'a, 'b>(
         }
         Expr::CompoundIdentifier(idents) => {
             let (qualifier, column) = split_qualified_identifier(idents)?;
-            if scope.table_scope.matches_qualifier(qualifier) {
-                if let Some(idx) = resolve_column_index(column, scope.columns) {
-                    return Ok(scope.row[idx].clone());
-                }
+            if let Some(idx) = resolve_qualified_column_index(
+                qualifier,
+                column,
+                scope.columns,
+                scope.column_scopes,
+            ) {
+                return Ok(scope.row[idx].clone());
             }
             if let Some(outer_scope) = outer {
-                if outer_scope.table_scope.matches_qualifier(qualifier) {
-                    if let Some(idx) = resolve_column_index(column, outer_scope.columns) {
-                        return Ok(outer_scope.row[idx].clone());
-                    }
+                if let Some(idx) = resolve_qualified_column_index(
+                    qualifier,
+                    column,
+                    outer_scope.columns,
+                    outer_scope.column_scopes,
+                ) {
+                    return Ok(outer_scope.row[idx].clone());
                 }
             }
             Err(GongDBError::new(format!(
@@ -1770,10 +1837,20 @@ fn value_to_string(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Integer(v) => v.to_string(),
-        Value::Real(v) => format!("{:.3}", v),
+        Value::Real(v) => format_real_sqlite(*v),
         Value::Text(s) => s.clone(),
         Value::Blob(_) => "NULL".to_string(),
     }
+}
+
+fn format_real_sqlite(value: f64) -> String {
+    if value == 0.0 {
+        return "0.0".to_string();
+    }
+    if value.fract() == 0.0 {
+        return format!("{:.1}", value);
+    }
+    value.to_string()
 }
 
 fn value_to_bool(value: &Value) -> bool {
@@ -2055,6 +2132,7 @@ fn compare_order_by(
     db: &GongDB,
     order_by: &[crate::ast::OrderByExpr],
     columns: &[Column],
+    column_scopes: &[TableScope],
     table_scope: &TableScope,
     outer: Option<&EvalScope<'_>>,
     a: &[Value],
@@ -2064,11 +2142,13 @@ fn compare_order_by(
         let asc = order.asc.unwrap_or(true);
         let left_scope = EvalScope {
             columns,
+            column_scopes,
             row: a,
             table_scope,
         };
         let right_scope = EvalScope {
             columns,
+            column_scopes,
             row: b,
             table_scope,
         };
@@ -2343,6 +2423,7 @@ fn compute_aggregates(
     db: &GongDB,
     aggregates: &[AggregateExpr],
     columns: &[Column],
+    column_scopes: &[TableScope],
     table_scope: &TableScope,
     rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
@@ -2357,6 +2438,7 @@ fn compute_aggregates(
                     for row in rows {
                         let scope = EvalScope {
                             columns,
+                            column_scopes,
                             row,
                             table_scope,
                         };
@@ -2391,6 +2473,7 @@ fn compute_aggregates(
                 for row in rows {
                     let scope = EvalScope {
                         columns,
+                        column_scopes,
                         row,
                         table_scope,
                     };
@@ -2442,6 +2525,7 @@ fn compute_aggregates(
                 for row in rows {
                     let scope = EvalScope {
                         columns,
+                        column_scopes,
                         row,
                         table_scope,
                     };
@@ -2475,6 +2559,7 @@ fn compute_aggregates(
                 for row in rows {
                     let scope = EvalScope {
                         columns,
+                        column_scopes,
                         row,
                         table_scope,
                     };
@@ -2517,6 +2602,7 @@ fn compute_aggregates(
                 for row in rows {
                     let scope = EvalScope {
                         columns,
+                        column_scopes,
                         row,
                         table_scope,
                     };
@@ -2560,6 +2646,7 @@ fn compute_aggregates(
                 for row in rows {
                     let scope = EvalScope {
                         columns,
+                        column_scopes,
                         row,
                         table_scope,
                     };
@@ -2594,6 +2681,7 @@ fn compute_aggregates(
                 for row in rows {
                     let scope = EvalScope {
                         columns,
+                        column_scopes,
                         row,
                         table_scope,
                     };
