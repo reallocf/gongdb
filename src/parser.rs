@@ -1161,29 +1161,48 @@ impl Parser {
     }
 
     fn parse_in_expr(&mut self, left: Expr, negated: bool) -> Result<Expr, ParserError> {
-        self.expect_symbol('(')?;
-        if self.current_is_keyword("SELECT") {
-            let select = self.parse_select()?;
-            self.expect_symbol(')')?;
+        if self.eat_symbol('(') {
+            if self.current_is_keyword("SELECT") {
+                let select = self.parse_select()?;
+                self.expect_symbol(')')?;
+                Ok(Expr::InSubquery {
+                    expr: Box::new(left),
+                    subquery: Box::new(select),
+                    negated,
+                })
+            } else {
+                let mut list = Vec::new();
+                if !self.eat_symbol(')') {
+                    loop {
+                        list.push(self.parse_expr()?);
+                        if self.eat_symbol(')') {
+                            break;
+                        }
+                        self.expect_symbol(',')?;
+                    }
+                }
+                Ok(Expr::InList {
+                    expr: Box::new(left),
+                    list,
+                    negated,
+                })
+            }
+        } else {
+            let name = self.parse_object_name()?;
+            let select = Select {
+                distinct: false,
+                projection: vec![SelectItem::Wildcard],
+                from: vec![TableRef::Named { name, alias: None }],
+                selection: None,
+                group_by: Vec::new(),
+                having: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
             Ok(Expr::InSubquery {
                 expr: Box::new(left),
                 subquery: Box::new(select),
-                negated,
-            })
-        } else {
-            let mut list = Vec::new();
-            if !self.eat_symbol(')') {
-                loop {
-                    list.push(self.parse_expr()?);
-                    if self.eat_symbol(')') {
-                        break;
-                    }
-                    self.expect_symbol(',')?;
-                }
-            }
-            Ok(Expr::InList {
-                expr: Box::new(left),
-                list,
                 negated,
             })
         }

@@ -84,6 +84,8 @@ test_file!(test_select2, "tests/sqlite/select2.test");
 test_file!(test_select3, "tests/sqlite/select3.test");
 test_file!(test_select4, "tests/sqlite/select4.test");
 test_file!(test_select5, "tests/sqlite/select5.test");
+test_file!(test_in1, "tests/sqlite/evidence/in1.test");
+test_file!(test_in2, "tests/sqlite/evidence/in2.test");
 
 // Custom tests for phases that need additional coverage
 test_file!(test_phase2_storage_engine, "tests/custom/phase2_storage_engine.test");
@@ -188,6 +190,17 @@ async fn test_phase_5_all() {
     
     let test_files: Vec<&str> = expr_tests.iter().map(|s| s.as_str()).collect();
     run_phase_tests(&test_files, "5 (Expressions - All)").await;
+}
+
+/// Index IN test suite
+#[tokio::test]
+async fn test_index_in() {
+    let mut test_files = Vec::new();
+    collect_test_files(Path::new("tests/sqlite/index/in"), &mut test_files)
+        .expect("Failed to collect index/in test files");
+    test_files.sort();
+    let test_files: Vec<&str> = test_files.iter().map(|s| s.as_str()).collect();
+    run_phase_tests(&test_files, "Index IN").await;
 }
 
 /// Phase 6: DML Implementation
