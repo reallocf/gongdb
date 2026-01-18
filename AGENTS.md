@@ -41,7 +41,7 @@ There are multiple ways to run tests depending on what you want to test:
 To run unit tests (currently none defined in the library):
 
 ```bash
-cargo test --lib
+cargo test --lib -- --no-capture
 ```
 
 ### 2. Run Integration Tests
@@ -50,10 +50,10 @@ The project has integration tests in `tests/sqllogictest.rs`. To run them:
 
 ```bash
 # Run the example test (if example.slt exists)
-cargo test --test sqllogictest test_example_slt
+cargo test --test sqllogictest test_example_slt -- --no-capture
 
 # Run all integration tests (excluding ignored ones)
-cargo test --test sqllogictest
+cargo test --test sqllogictest -- --no-capture
 ```
 
 ### 3. Run All SQLite Tests (Including Ignored)
@@ -61,7 +61,7 @@ cargo test --test sqllogictest
 The full SQLite test suite is marked as `#[ignore]` because it takes a long time. To run it:
 
 ```bash
-cargo test --test sqllogictest -- --ignored
+cargo test --test sqllogictest -- --ignored --no-capture
 ```
 
 This will run all 408 SQLite test files, which may take significant time.
@@ -113,10 +113,10 @@ The project includes:
 cargo build
 
 # Run quick tests
-cargo test --test sqllogictest
+cargo test --test sqllogictest -- --no-capture
 
 # Run all tests (long-running)
-cargo test --test sqllogictest -- --ignored
+cargo test --test sqllogictest -- --ignored --no-capture
 
 # Run via binary
 cargo run --bin run_tests

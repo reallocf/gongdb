@@ -53,12 +53,12 @@ Tests for transaction management:
 
 To run all custom tests:
 ```bash
-cargo test --test sqllogictest test_custom
+cargo test --test sqllogictest test_custom -- --no-capture
 ```
 
 To run a specific custom test:
 ```bash
-cargo test --test sqllogictest test_phase2_storage_engine
+cargo test --test sqllogictest test_phase2_storage_engine -- --no-capture
 ```
 
 ## Integration

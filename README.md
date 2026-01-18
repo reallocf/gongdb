@@ -27,7 +27,7 @@ A database project built with Rust, including comprehensive SQL test coverage us
 
 4. Run tests:
    ```bash
-   cargo test
+   cargo test -- --no-capture
    ```
 
 ## Dependencies
