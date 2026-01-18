@@ -524,6 +524,43 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    pub fn reindex(&mut self, target: Option<&str>) -> Result<(), StorageError> {
+        match target {
+            None => {
+                let index_names: Vec<String> = self.indexes.keys().cloned().collect();
+                for index_name in index_names {
+                    self.rebuild_index(&index_name)?;
+                }
+                self.write_catalog()?;
+                Ok(())
+            }
+            Some(name) => {
+                if let Some(index_name) = self.find_index_name(name) {
+                    self.rebuild_index(&index_name)?;
+                    self.write_catalog()?;
+                    return Ok(());
+                }
+                if let Some(table_name) = self.find_table_name(name) {
+                    let index_names: Vec<String> = self
+                        .indexes
+                        .values()
+                        .filter(|index| index.table.eq_ignore_ascii_case(&table_name))
+                        .map(|index| index.name.clone())
+                        .collect();
+                    for index_name in index_names {
+                        self.rebuild_index(&index_name)?;
+                    }
+                    self.write_catalog()?;
+                    return Ok(());
+                }
+                Err(StorageError::NotFound(format!(
+                    "index or table not found: {}",
+                    name
+                )))
+            }
+        }
+    }
+
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Vec<Value>>, StorageError> {
         let mut rows = Vec::new();
         let mut scan = self.table_scan(table_name)?;
@@ -630,6 +667,64 @@ impl StorageEngine {
         self.insert_index_record_btree(&mut index, entry)?;
         self.indexes.insert(index_name.to_string(), index);
         Ok(())
+    }
+
+    fn rebuild_index(&mut self, index_name: &str) -> Result<(), StorageError> {
+        let index = self
+            .indexes
+            .get(index_name)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
+        let table = self
+            .tables
+            .get(&index.table)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", index.table)))?;
+
+        if let Err(err) = self.free_btree_pages(index.first_page) {
+            if !matches!(err, StorageError::Corrupt(_)) {
+                return Err(err);
+            }
+        }
+
+        let new_root = self.allocate_index_root()?;
+        let mut updated_index = index.clone();
+        updated_index.first_page = new_root;
+        updated_index.last_page = new_root;
+        self.indexes.insert(index_name.to_string(), updated_index);
+
+        let column_map = column_index_map(&table.columns);
+        let mut unique_keys = HashSet::new();
+        let rows = self.scan_table_with_locations(&table.name)?;
+        for (location, row) in rows {
+            let key = index_key_from_row(&index, &column_map, &row)?;
+            if index.unique && !key_has_null(&key) {
+                let encoded_key = encode_index_key(&key)?;
+                if !unique_keys.insert(encoded_key) {
+                    return Err(StorageError::Invalid(format!(
+                        "unique index violation: {}",
+                        index.name
+                    )));
+                }
+            }
+            let entry = IndexEntry { key, row: location };
+            self.insert_index_record(index_name, &entry)?;
+        }
+        Ok(())
+    }
+
+    fn find_index_name(&self, name: &str) -> Option<String> {
+        self.indexes
+            .keys()
+            .find(|index| index.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    fn find_table_name(&self, name: &str) -> Option<String> {
+        self.tables
+            .keys()
+            .find(|table| table.eq_ignore_ascii_case(name))
+            .cloned()
     }
 
     fn index_contains_key(&self, index: &IndexMeta, key: &[Value]) -> Result<bool, StorageError> {

@@ -156,6 +156,11 @@ impl GongDB {
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
+            Statement::Reindex(reindex) => {
+                let target = reindex.name.as_ref().map(object_name);
+                self.storage.reindex(target.as_deref())?;
+                Ok(DBOutput::StatementComplete(0))
+            }
             Statement::DropTable(drop) => {
                 let name = object_name(&drop.name);
                 if self.storage.get_table(&name).is_none() && !drop.if_exists {

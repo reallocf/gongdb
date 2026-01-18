@@ -284,6 +284,7 @@ fn is_keyword(word: &str) -> bool {
             | "BLOB"
             | "NUMERIC"
             | "REPLACE"
+            | "REINDEX"
     )
 }
 
@@ -379,6 +380,7 @@ impl Parser {
             TokenKind::Keyword(k) if k == "DELETE" => Ok(Statement::Delete(self.parse_delete()?)),
             TokenKind::Keyword(k) if k == "CREATE" => self.parse_create(),
             TokenKind::Keyword(k) if k == "DROP" => self.parse_drop(),
+            TokenKind::Keyword(k) if k == "REINDEX" => Ok(Statement::Reindex(self.parse_reindex()?)),
             _ => Err(ParserError::new("unexpected statement")),
         }
     }
@@ -511,6 +513,15 @@ impl Parser {
             return Ok(Statement::DropView(DropView { if_exists, name }));
         }
         Err(ParserError::new("unsupported DROP statement"))
+    }
+
+    fn parse_reindex(&mut self) -> Result<Reindex, ParserError> {
+        self.expect_keyword("REINDEX")?;
+        let name = match self.current() {
+            TokenKind::Eof | TokenKind::Symbol(';') => None,
+            _ => Some(self.parse_object_name()?),
+        };
+        Ok(Reindex { name })
     }
 
     fn parse_insert(&mut self) -> Result<Insert, ParserError> {

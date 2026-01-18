@@ -86,6 +86,7 @@ test_file!(test_select4, "tests/sqlite/select4.test");
 test_file!(test_select5, "tests/sqlite/select5.test");
 test_file!(test_in1, "tests/sqlite/evidence/in1.test");
 test_file!(test_in2, "tests/sqlite/evidence/in2.test");
+test_file!(test_slt_lang_reindex, "tests/sqlite/evidence/slt_lang_reindex.test");
 
 // Custom tests for phases that need additional coverage
 test_file!(test_phase2_storage_engine, "tests/custom/phase2_storage_engine.test");

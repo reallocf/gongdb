@@ -4,6 +4,7 @@ pub enum Statement {
     DropTable(DropTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
+    Reindex(Reindex),
     CreateView(CreateView),
     DropView(DropView),
     Insert(Insert),
@@ -53,6 +54,11 @@ pub struct CreateIndex {
 pub struct DropIndex {
     pub if_exists: bool,
     pub name: ObjectName,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reindex {
+    pub name: Option<ObjectName>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
