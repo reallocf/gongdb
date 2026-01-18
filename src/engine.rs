@@ -1094,7 +1094,7 @@ impl GongDB {
             tables.into_iter().map(|info| Some(info.source)).collect();
 
         let mut joined = HashSet::new();
-        let current_index = 0usize;
+        let current_index = choose_initial_table(&remaining, &row_counts);
         joined.insert(current_index);
 
         let mut current = apply_predicates_to_source(
@@ -1233,6 +1233,44 @@ fn split_conjuncts(expr: &Expr) -> Vec<Expr> {
         }
         _ => vec![expr.clone()],
     }
+}
+
+fn choose_initial_table(predicates: &[PredicateInfo], row_counts: &[usize]) -> usize {
+    if row_counts.is_empty() {
+        return 0;
+    }
+    let mut local_counts = vec![0usize; row_counts.len()];
+    for pred in predicates {
+        if let Some(tables) = &pred.tables {
+            if tables.len() == 1 {
+                if let Some(idx) = tables.first() {
+                    if *idx < local_counts.len() {
+                        local_counts[*idx] += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut best_idx = 0usize;
+    let mut best_local = local_counts[0];
+    let mut best_rows = row_counts[0];
+    for (idx, row_count) in row_counts.iter().enumerate().skip(1) {
+        let local = local_counts[idx];
+        if local > best_local || (local == best_local && *row_count < best_rows) {
+            best_idx = idx;
+            best_local = local;
+            best_rows = *row_count;
+        }
+    }
+    if best_local > 0 {
+        return best_idx;
+    }
+    row_counts
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, rows)| *rows)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
 fn predicate_table_refs(expr: &Expr, tables: &[TableInfo]) -> Option<Vec<usize>> {
