@@ -2686,6 +2686,20 @@ fn eval_expr<'a, 'b>(
                 Ok(result)
             }
         }
+        Expr::Subquery(subquery) => {
+            let result =
+                db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
+            if result.columns.len() != 1 {
+                return Err(GongDBError::new(
+                    "subquery returned more than one column",
+                ));
+            }
+            if let Some(row) = result.rows.first() {
+                Ok(row.get(0).cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(Value::Null)
+            }
+        }
         Expr::Exists(subquery) => {
             let result =
                 db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
