@@ -17,21 +17,35 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
-pub struct GongDBError {
-    message: String,
+pub enum GongDBError {
+    Parse(String),
+    Execution(String),
+    Constraint(String),
+    Storage(StorageError),
 }
 
 impl GongDBError {
     fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
+        Self::Execution(message.into())
+    }
+
+    fn parse(message: impl Into<String>) -> Self {
+        Self::Parse(message.into())
+    }
+
+    fn constraint(message: impl Into<String>) -> Self {
+        Self::Constraint(message.into())
     }
 }
 
 impl std::fmt::Display for GongDBError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        match self {
+            GongDBError::Parse(message)
+            | GongDBError::Execution(message)
+            | GongDBError::Constraint(message) => write!(f, "{}", message),
+            GongDBError::Storage(err) => write!(f, "{}", err),
+        }
     }
 }
 
@@ -39,7 +53,17 @@ impl std::error::Error for GongDBError {}
 
 impl From<StorageError> for GongDBError {
     fn from(err: StorageError) -> Self {
-        GongDBError::new(err.to_string())
+        match err {
+            StorageError::UniqueViolation { table, columns } => GongDBError::constraint(format!(
+                "UNIQUE constraint failed: {}",
+                columns
+                    .iter()
+                    .map(|col| format!("{}.{}", table, col))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => GongDBError::Storage(err),
+        }
     }
 }
 
@@ -81,7 +105,8 @@ impl GongDB {
     }
 
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
-        let stmt = parser::parse_statement(sql).map_err(|e| GongDBError::new(e.message))?;
+        let stmt = parser::parse_statement(sql)
+            .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
         match stmt {
             Statement::BeginTransaction(begin) => self.begin_transaction(begin),
             Statement::Commit => self.commit_transaction(),
@@ -260,7 +285,7 @@ impl GongDB {
                 let table = self
                     .storage
                     .get_table(&table_name)
-                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
                     .clone();
                 for column in &create.columns {
                     let exists = table.columns.iter().any(|c| {
@@ -269,7 +294,7 @@ impl GongDB {
                     });
                     if !exists {
                         return Err(GongDBError::new(format!(
-                            "unknown column {}",
+                            "no such column: {}",
                             column.name.value
                         )));
                     }
@@ -293,7 +318,7 @@ impl GongDB {
                 let name = object_name(&drop.name);
                 if self.storage.get_index(&name).is_none() && !drop.if_exists {
                     return Err(GongDBError::new(format!(
-                        "index not found: {}",
+                        "no such index: {}",
                         name
                     )));
                 }
@@ -311,7 +336,7 @@ impl GongDB {
                 let name = object_name(&drop.name);
                 if self.storage.get_table(&name).is_none() && !drop.if_exists {
                     return Err(GongDBError::new(format!(
-                        "table not found: {}",
+                        "no such table: {}",
                         name
                     )));
                 }
@@ -358,7 +383,7 @@ impl GongDB {
                 let name = object_name(&drop.name);
                 if self.storage.get_view(&name).is_none() && !drop.if_exists {
                     return Err(GongDBError::new(format!(
-                        "view not found: {}",
+                        "no such view: {}",
                         name
                     )));
                 }
@@ -378,7 +403,7 @@ impl GongDB {
                 let table = self
                     .storage
                     .get_table(&table_name)
-                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
                     .clone();
                 let mut inserted = 0u64;
                 let replace = matches!(insert.on_conflict, InsertConflict::Replace);
@@ -506,7 +531,7 @@ impl GongDB {
                 let table = self
                     .storage
                     .get_table(&table_name)
-                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
                     .clone();
                 let rows = self.storage.scan_table(&table_name)?;
                 let table_scope = TableScope {
@@ -535,7 +560,7 @@ impl GongDB {
                         let idx = resolve_column_index(&assignment.column.value, &table.columns)
                             .ok_or_else(|| {
                                 GongDBError::new(format!(
-                                    "unknown column {}",
+                                    "no such column: {}",
                                     assignment.column.value
                                 ))
                             })?;
@@ -559,7 +584,7 @@ impl GongDB {
                 let table = self
                     .storage
                     .get_table(&table_name)
-                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
                     .clone();
                 let rows = self.storage.scan_table(&table_name)?;
                 let table_scope = TableScope {
@@ -708,7 +733,7 @@ impl GongDB {
                     let table = self
                         .storage
                         .get_table(&table_name)
-                        .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?;
+                        .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?;
                     let table_scope = TableScope {
                         table_name: Some(table_name),
                         table_alias,
@@ -1244,7 +1269,7 @@ impl GongDB {
         let table = self
             .storage
             .get_table(table_name)
-            .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?;
+            .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?;
         let table_scope = TableScope {
             table_name: Some(table_name.to_string()),
             table_alias: table_alias.map(|alias| alias.to_string()),
@@ -1359,7 +1384,7 @@ impl GongDB {
                     });
                 }
                 Err(GongDBError::new(format!(
-                    "table not found: {}",
+                    "no such table: {}",
                     table_name
                 )))
             }
@@ -2681,7 +2706,7 @@ fn resolve_using_pairs(
         }
         let (Some(left_idx), Some(right_idx)) = (left, right) else {
             return Err(GongDBError::new(format!(
-                "unknown column {} in USING clause",
+                "no such column: {}",
                 name
             )));
         };
@@ -2931,7 +2956,7 @@ fn validate_constraint_columns(
         let key = column.value.to_lowercase();
         if !column_names.contains(&key) {
             return Err(GongDBError::new(format!(
-                "unknown column in constraint: {}",
+                "no such column: {}",
                 column.value
             )));
         }
@@ -3049,7 +3074,7 @@ fn projection_columns(
                 let indices = qualified_wildcard_indices(&qualifier, column_scopes);
                 if indices.is_empty() {
                     return Err(GongDBError::new(format!(
-                        "unknown table: {}",
+                        "no such table: {}",
                         qualifier
                     )));
                 }
@@ -3121,7 +3146,7 @@ fn build_insert_row(
         }
         let idx = *index_by_name
             .get(&key)
-            .ok_or_else(|| GongDBError::new(format!("unknown column {}", col_ident.value)))?;
+            .ok_or_else(|| GongDBError::new(format!("no such column: {}", col_ident.value)))?;
         let value = eval_insert_expr(db, expr)?;
         row[idx] = apply_affinity(value, &table.columns[idx].data_type);
     }
@@ -3164,7 +3189,7 @@ fn build_insert_row_from_values(
         }
         let idx = *index_by_name
             .get(&key)
-            .ok_or_else(|| GongDBError::new(format!("unknown column {}", col_ident.value)))?;
+            .ok_or_else(|| GongDBError::new(format!("no such column: {}", col_ident.value)))?;
         row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
     }
     validate_insert_row(db, table, &row)?;
@@ -3212,7 +3237,7 @@ fn index_key_for_row(
         let idx = column_map
             .get(&column.name.value.to_lowercase())
             .ok_or_else(|| {
-                GongDBError::new(format!("unknown column in index {}", column.name.value))
+                GongDBError::new(format!("no such column: {}", column.name.value))
             })?;
         key.push(row[*idx].clone());
     }
@@ -3320,7 +3345,7 @@ fn validate_insert_row(
             not_null = true;
         }
         if not_null && matches!(row[idx], Value::Null) {
-            return Err(GongDBError::new(format!(
+            return Err(GongDBError::constraint(format!(
                 "NOT NULL constraint failed: {}.{}",
                 table.name, column.name
             )));
@@ -3344,7 +3369,7 @@ fn validate_insert_row(
             if let TableConstraint::Check(expr) = constraint {
                 let value = eval_expr(db, expr, &scope, None)?;
                 if !value_to_bool(&value) {
-                    return Err(GongDBError::new("CHECK constraint failed"));
+                    return Err(GongDBError::constraint("CHECK constraint failed"));
                 }
             }
         }
@@ -3444,7 +3469,7 @@ fn eval_expr<'a, 'b>(
                 }
             }
             Err(GongDBError::new(format!(
-                "unknown column {}",
+                "no such column: {}",
                 ident.value
             )))
         }
@@ -3469,7 +3494,7 @@ fn eval_expr<'a, 'b>(
                 }
             }
             Err(GongDBError::new(format!(
-                "unknown column {}",
+                "no such column: {}",
                 column
             )))
         }
@@ -4242,7 +4267,7 @@ fn project_row(
                 let qualifier = object_name(name);
                 let indices = qualified_wildcard_indices(&qualifier, scope.column_scopes);
                 if indices.is_empty() {
-                    return Err(GongDBError::new(format!("unknown table: {}", qualifier)));
+                    return Err(GongDBError::new(format!("no such table: {}", qualifier)));
                 }
                 for idx in indices {
                     output.push(row[idx].clone());
@@ -5033,7 +5058,7 @@ fn evaluate_group_projection(
                 let qualifier = object_name(name);
                 let indices = qualified_wildcard_indices(&qualifier, column_scopes);
                 if indices.is_empty() {
-                    return Err(GongDBError::new(format!("unknown table: {}", qualifier)));
+                    return Err(GongDBError::new(format!("no such table: {}", qualifier)));
                 }
                 for idx in indices {
                     output.push(row[idx].clone());

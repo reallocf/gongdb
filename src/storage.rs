@@ -101,6 +101,7 @@ pub enum StorageError {
     Corrupt(String),
     NotFound(String),
     Invalid(String),
+    UniqueViolation { table: String, columns: Vec<String> },
 }
 
 impl std::fmt::Display for StorageError {
@@ -110,6 +111,15 @@ impl std::fmt::Display for StorageError {
             StorageError::Corrupt(msg) => write!(f, "corrupt storage: {}", msg),
             StorageError::NotFound(msg) => write!(f, "not found: {}", msg),
             StorageError::Invalid(msg) => write!(f, "invalid storage: {}", msg),
+            StorageError::UniqueViolation { table, columns } => write!(
+                f,
+                "unique constraint failed: {}",
+                columns
+                    .iter()
+                    .map(|col| format!("{}.{}", table, col))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
@@ -119,6 +129,17 @@ impl std::error::Error for StorageError {}
 impl From<std::io::Error> for StorageError {
     fn from(err: std::io::Error) -> Self {
         StorageError::Io(err)
+    }
+}
+
+fn unique_violation(index: &IndexMeta) -> StorageError {
+    StorageError::UniqueViolation {
+        table: index.table.clone(),
+        columns: index
+            .columns
+            .iter()
+            .map(|col| col.name.value.clone())
+            .collect(),
     }
 }
 
@@ -640,10 +661,7 @@ impl StorageEngine {
                 .clone();
             let key = index_key_from_row(&index, &column_map, row)?;
             if index.unique && !key_has_null(&key) && self.index_contains_key(&index, &key)? {
-                return Err(StorageError::Invalid(format!(
-                    "unique index violation: {}",
-                    index.name
-                )));
+                return Err(unique_violation(&index));
             }
             index_keys.push((index.name, key));
         }
@@ -701,10 +719,7 @@ impl StorageEngine {
                 let encoded_key = encode_index_key(&key)?;
                 if !unique_keys.insert(encoded_key) {
                     self.indexes.remove(&index.name);
-                    return Err(StorageError::Invalid(format!(
-                        "unique index violation: {}",
-                        index.name
-                    )));
+                    return Err(unique_violation(&index));
                 }
             }
             let entry = IndexEntry { key, row: location };
@@ -904,10 +919,7 @@ impl StorageEngine {
             if index.unique && !key_has_null(&key) {
                 let encoded_key = encode_index_key(&key)?;
                 if !unique_keys.insert(encoded_key) {
-                    return Err(StorageError::Invalid(format!(
-                        "unique index violation: {}",
-                        index.name
-                    )));
+                    return Err(unique_violation(&index));
                 }
             }
             let entry = IndexEntry { key, row: location };

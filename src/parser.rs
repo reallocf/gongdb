@@ -3,13 +3,65 @@ use crate::ast::*;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParserError {
     pub message: String,
+    pub near: Option<String>,
+    pub is_eof: bool,
+    pub offset: Option<usize>,
 }
 
 impl ParserError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            near: None,
+            is_eof: false,
+            offset: None,
         }
+    }
+
+    fn with_token(message: impl Into<String>, token: &Token) -> Self {
+        let (near, is_eof) = token_hint(&token.kind);
+        Self {
+            message: message.into(),
+            near,
+            is_eof,
+            offset: if is_eof { None } else { Some(token.pos) },
+        }
+    }
+
+    pub fn sqlite_message(&self) -> String {
+        if self.is_eof {
+            return "incomplete input".to_string();
+        }
+        if let Some(near) = &self.near {
+            return format!("near \"{}\": syntax error", near);
+        }
+        self.message.clone()
+    }
+
+    pub fn sqlite_message_with_sql(&self, sql: &str) -> String {
+        if self.is_eof {
+            return "incomplete input".to_string();
+        }
+        if let Some(near) = &self.near {
+            let mut message = format!("near \"{}\": syntax error", near);
+            if let Some(offset) = self.offset {
+                message = format!("{} in {} at offset {}", message, sql, offset);
+            }
+            return message;
+        }
+        self.message.clone()
+    }
+}
+
+fn token_hint(token: &TokenKind) -> (Option<String>, bool) {
+    match token {
+        TokenKind::Keyword(value) => (Some(value.clone()), false),
+        TokenKind::Ident(value, _) => (Some(value.clone()), false),
+        TokenKind::Number(value) => (Some(value.clone()), false),
+        TokenKind::String(value) => (Some(value.clone()), false),
+        TokenKind::Operator(value) => (Some(value.clone()), false),
+        TokenKind::Symbol(value) => (Some(value.to_string()), false),
+        TokenKind::Eof => (None, true),
     }
 }
 
@@ -27,6 +79,7 @@ enum TokenKind {
 #[derive(Debug, Clone, PartialEq)]
 struct Token {
     kind: TokenKind,
+    pos: usize,
 }
 
 struct Lexer<'a> {
@@ -42,14 +95,17 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Result<Token, ParserError> {
         self.skip_ws_and_comments();
         if self.pos >= self.input.len() {
-            return Ok(Token { kind: TokenKind::Eof });
+            return Ok(Token {
+                kind: TokenKind::Eof,
+                pos: self.pos,
+            });
         }
         let rest = &self.input[self.pos..];
         let mut chars = rest.chars();
         let ch = chars.next().unwrap();
+        let start = self.pos;
 
         if ch.is_ascii_alphabetic() || ch == '_' {
-            let start = self.pos;
             self.pos += ch.len_utf8();
             while self.pos < self.input.len() {
                 let c = self.input[self.pos..].chars().next().unwrap();
@@ -64,15 +120,16 @@ impl<'a> Lexer<'a> {
             if is_keyword(&upper) {
                 return Ok(Token {
                     kind: TokenKind::Keyword(upper),
+                    pos: start,
                 });
             }
             return Ok(Token {
                 kind: TokenKind::Ident(word.to_string(), false),
+                pos: start,
             });
         }
 
         if ch.is_ascii_digit() {
-            let start = self.pos;
             self.pos += 1;
             let mut saw_dot = false;
             while self.pos < self.input.len() {
@@ -89,14 +146,15 @@ impl<'a> Lexer<'a> {
             let num = &self.input[start..self.pos];
             return Ok(Token {
                 kind: TokenKind::Number(num.to_string()),
+                pos: start,
             });
         }
 
         match ch {
-            '\'' => return self.lex_string(),
-            '"' => return self.lex_quoted_ident('"', '"'),
-            '`' => return self.lex_quoted_ident('`', '`'),
-            '[' => return self.lex_quoted_ident('[', ']'),
+            '\'' => return self.lex_string(start),
+            '"' => return self.lex_quoted_ident(start, '"', '"'),
+            '`' => return self.lex_quoted_ident(start, '`', '`'),
+            '[' => return self.lex_quoted_ident(start, '[', ']'),
             _ => {}
         }
 
@@ -113,6 +171,7 @@ impl<'a> Lexer<'a> {
             self.pos += 2;
             return Ok(Token {
                 kind: TokenKind::Operator(op.to_string()),
+                pos: start,
             });
         }
 
@@ -125,15 +184,15 @@ impl<'a> Lexer<'a> {
             }
             _ => {
                 return Err(ParserError::new(format!(
-                    "unexpected character '{}'",
+                    "unrecognized token: \"{}\"",
                     ch
                 )))
             }
         };
-        Ok(Token { kind: token })
+        Ok(Token { kind: token, pos: start })
     }
 
-    fn lex_string(&mut self) -> Result<Token, ParserError> {
+    fn lex_string(&mut self, start: usize) -> Result<Token, ParserError> {
         self.pos += 1;
         let mut value = String::new();
         while self.pos < self.input.len() {
@@ -148,6 +207,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     return Ok(Token {
                         kind: TokenKind::String(value),
+                        pos: start,
                     });
                 }
             } else {
@@ -158,7 +218,7 @@ impl<'a> Lexer<'a> {
         Err(ParserError::new("unterminated string literal"))
     }
 
-    fn lex_quoted_ident(&mut self, open: char, close: char) -> Result<Token, ParserError> {
+    fn lex_quoted_ident(&mut self, start: usize, open: char, close: char) -> Result<Token, ParserError> {
         self.pos += open.len_utf8();
         let mut value = String::new();
         while self.pos < self.input.len() {
@@ -174,6 +234,7 @@ impl<'a> Lexer<'a> {
                     self.pos += close.len_utf8();
                     return Ok(Token {
                         kind: TokenKind::Ident(value, true),
+                        pos: start,
                     });
                 }
             } else {
@@ -316,6 +377,10 @@ impl Parser {
         &self.tokens[self.pos].kind
     }
 
+    fn current_token(&self) -> &Token {
+        &self.tokens[self.pos]
+    }
+
     fn advance(&mut self) {
         if self.pos < self.tokens.len() - 1 {
             self.pos += 1;
@@ -328,10 +393,10 @@ impl Parser {
                 self.advance();
                 Ok(())
             }
-            _ => Err(ParserError::new(format!(
-                "expected keyword {}",
-                keyword
-            ))),
+            _ => Err(ParserError::with_token(
+                format!("expected keyword {}", keyword),
+                self.current_token(),
+            )),
         }
     }
 
@@ -359,10 +424,10 @@ impl Parser {
         if self.eat_symbol(symbol) {
             Ok(())
         } else {
-            Err(ParserError::new(format!(
-                "expected symbol {}",
-                symbol
-            )))
+            Err(ParserError::with_token(
+                format!("expected symbol {}", symbol),
+                self.current_token(),
+            ))
         }
     }
 
@@ -380,7 +445,10 @@ impl Parser {
         if self.eat_operator(op) {
             Ok(())
         } else {
-            Err(ParserError::new(format!("expected operator {}", op)))
+            Err(ParserError::with_token(
+                format!("expected operator {}", op),
+                self.current_token(),
+            ))
         }
     }
 
@@ -399,7 +467,10 @@ impl Parser {
             TokenKind::Keyword(k) if k == "COMMIT" => self.parse_commit(),
             TokenKind::Keyword(k) if k == "END" => self.parse_commit(),
             TokenKind::Keyword(k) if k == "ROLLBACK" => self.parse_rollback(),
-            _ => Err(ParserError::new("unexpected statement")),
+            _ => Err(ParserError::with_token(
+                "unexpected statement",
+                self.current_token(),
+            )),
         }
     }
 
@@ -1254,7 +1325,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Wildcard)
             }
-            _ => Err(ParserError::new("unexpected token in expression")),
+            _ => Err(ParserError::with_token(
+                "unexpected token in expression",
+                self.current_token(),
+            )),
         }
     }
 
@@ -1703,7 +1777,10 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParserError> {
         parser.advance();
     }
     if !matches!(parser.current(), TokenKind::Eof) {
-        return Err(ParserError::new("unexpected token after statement"));
+        return Err(ParserError::with_token(
+            "unexpected token after statement",
+            parser.current_token(),
+        ));
     }
     Ok(stmt)
 }
