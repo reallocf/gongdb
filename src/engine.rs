@@ -3889,13 +3889,7 @@ fn value_to_string(value: &Value) -> String {
 }
 
 fn format_real_sqlite(value: f64) -> String {
-    if value == 0.0 {
-        return "0.0".to_string();
-    }
-    if value.fract() == 0.0 {
-        return format!("{:.1}", value);
-    }
-    value.to_string()
+    format!("{:.3}", value)
 }
 
 fn value_to_bool(value: &Value) -> bool {

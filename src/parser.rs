@@ -350,6 +350,8 @@ fn is_keyword(word: &str) -> bool {
             | "COMMIT"
             | "ROLLBACK"
             | "TRANSACTION"
+            | "TEMP"
+            | "TEMPORARY"
             | "DEFERRED"
             | "IMMEDIATE"
             | "EXCLUSIVE"
