@@ -573,7 +573,20 @@ impl GongDB {
                     outer,
                 )?);
             }
-            rows
+            if select.distinct {
+                let mut unique: Vec<Vec<Value>> = Vec::new();
+                'row: for row in rows {
+                    for existing in &unique {
+                        if rows_equal(existing, &row) {
+                            continue 'row;
+                        }
+                    }
+                    unique.push(row);
+                }
+                unique
+            } else {
+                rows
+            }
         } else {
             let order_table_scope = TableScope {
                 table_name: None,
@@ -610,8 +623,27 @@ impl GongDB {
                     projected: projected_row,
                 });
             }
-            rows.sort_by(|a, b| compare_order_keys(&a.order_values, &b.order_values, &order_plans));
-            rows.into_iter().map(|row| row.projected).collect()
+            let mut sorted_rows = if select.distinct {
+                let mut unique: Vec<SortedRow> = Vec::new();
+                'row: for row in rows {
+                    for existing in &unique {
+                        if rows_equal(&existing.projected, &row.projected) {
+                            continue 'row;
+                        }
+                    }
+                    unique.push(row);
+                }
+                unique
+            } else {
+                rows
+            };
+            sorted_rows.sort_by(|a, b| {
+                compare_order_keys(&a.order_values, &b.order_values, &order_plans)
+            });
+            sorted_rows
+                .into_iter()
+                .map(|row| row.projected)
+                .collect()
         };
 
         Ok(QueryResult {
@@ -2183,6 +2215,15 @@ struct OrderByPlan {
 struct SortedRow {
     order_values: Vec<Value>,
     projected: Vec<Value>,
+}
+
+fn rows_equal(left: &[Value], right: &[Value]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .all(|(l, r)| values_equal(l, r))
 }
 
 fn resolve_order_by_plans(
