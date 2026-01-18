@@ -3515,6 +3515,36 @@ fn eval_expr<'a, 'b>(
                 ));
             }
             match func_name.as_str() {
+                "coalesce" => {
+                    if args.len() < 2 {
+                        return Err(GongDBError::new("COALESCE expects at least two arguments"));
+                    }
+                    for arg in args {
+                        let value = eval_expr(db, arg, scope, outer)?;
+                        if !matches!(value, Value::Null) {
+                            return Ok(value);
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                "nullif" => {
+                    if args.len() != 2 {
+                        return Err(GongDBError::new("NULLIF expects two arguments"));
+                    }
+                    let left = eval_expr(db, &args[0], scope, outer)?;
+                    if matches!(left, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    let right = eval_expr(db, &args[1], scope, outer)?;
+                    if matches!(right, Value::Null) {
+                        return Ok(left);
+                    }
+                    if values_equal(&left, &right) {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(left)
+                    }
+                }
                 "abs" => {
                     if args.len() != 1 {
                         return Err(GongDBError::new("ABS expects one argument"));
