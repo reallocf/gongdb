@@ -124,26 +124,19 @@ cargo run --bin run_tests
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below. Note that both `git commit` and `git push` happen **outside** the codex CLI workflow (handled by the build script `build_gongdb.py` or manually).
 
 **MANDATORY WORKFLOW:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+4. **Hand off** - Provide context for next session
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+**IMPORTANT NOTES:**
+- Both `git commit` and `git push` are handled outside the codex CLI (by the build script or manually)
+- The build script (`build_gongdb.py`) automatically commits changes after each codex session
+- `bd sync` is also handled outside the codex CLI workflow
+- **You are the only one working with beads** - don't worry about conflicts or coordination issues
+- Focus on completing the work - the build script handles git operations and bead synchronization
+- Always update bead status before ending the session
