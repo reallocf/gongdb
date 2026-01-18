@@ -90,7 +90,7 @@ impl GongDB {
                 for spec in plan.auto_indexes {
                     let index_name =
                         next_auto_index_name(&self.storage, &name, &mut counter, &mut used_names);
-                    let first_page = self.storage.allocate_data_page()?;
+                    let first_page = self.storage.allocate_index_root()?;
                     let meta = IndexMeta {
                         name: index_name,
                         table: name.clone(),
@@ -130,7 +130,7 @@ impl GongDB {
                     }
                 }
                 if self.storage.get_index(&index_name).is_none() {
-                    let first_page = self.storage.allocate_data_page()?;
+                    let first_page = self.storage.allocate_index_root()?;
                     let meta = IndexMeta {
                         name: index_name.clone(),
                         table: table_name,

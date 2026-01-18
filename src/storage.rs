@@ -12,6 +12,9 @@ const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
 const CATALOG_FORMAT_VERSION: u32 = 4;
+const PAGE_TYPE_DATA: u8 = 1;
+const PAGE_TYPE_BTREE_LEAF: u8 = 2;
+const PAGE_TYPE_BTREE_INTERNAL: u8 = 3;
 const HEADER_PAGE_SIZE_OFFSET: usize = 8;
 const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
 const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
@@ -28,7 +31,7 @@ pub enum Value {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RowLocation {
+pub(crate) struct RowLocation {
     page_id: u32,
     slot: u16,
 }
@@ -37,6 +40,18 @@ struct RowLocation {
 struct IndexEntry {
     key: Vec<Value>,
     row: RowLocation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InternalCell {
+    key: Vec<Value>,
+    right_child: u32,
+}
+
+#[derive(Debug, Clone)]
+struct BtreeSplit {
+    key: Vec<Value>,
+    right_page: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -299,7 +314,7 @@ impl StorageEngine {
 
         self.free_page_chain(table.first_page)?;
         for index in &dependent_indexes {
-            self.free_page_chain(index.first_page)?;
+            self.free_btree_pages(index.first_page)?;
         }
 
         self.tables.remove(name);
@@ -355,6 +370,20 @@ impl StorageEngine {
         let mut indexes: Vec<IndexMeta> = self.indexes.values().cloned().collect();
         indexes.sort_by(|a, b| a.name.cmp(&b.name));
         indexes
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn scan_index_range(
+        &self,
+        index_name: &str,
+        lower: Option<&[Value]>,
+        upper: Option<&[Value]>,
+    ) -> Result<Vec<RowLocation>, StorageError> {
+        let index = self
+            .indexes
+            .get(index_name)
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
+        self.btree_scan_range(index.first_page, lower, upper)
     }
 
     pub fn schema_version(&self) -> u32 {
@@ -445,6 +474,7 @@ impl StorageEngine {
         let column_map = column_index_map(&table.columns);
         let mut unique_keys = HashSet::new();
 
+        self.write_page(index.first_page, &init_btree_page(PAGE_TYPE_BTREE_LEAF))?;
         self.indexes.insert(index.name.clone(), index.clone());
 
         let rows = self.scan_table_with_locations(&table.name)?;
@@ -474,7 +504,7 @@ impl StorageEngine {
             .get(name)
             .cloned()
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", name)))?;
-        self.free_page_chain(index.first_page)?;
+        self.free_btree_pages(index.first_page)?;
         self.indexes.remove(name);
         self.write_catalog()?;
         self.bump_schema_version()
@@ -550,8 +580,8 @@ impl StorageEngine {
                 .indexes
                 .remove(&index_name)
                 .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
-            self.free_page_chain(index.first_page)?;
-            let new_first_page = self.allocate_data_page()?;
+            self.free_btree_pages(index.first_page)?;
+            let new_first_page = self.allocate_index_root()?;
             index.first_page = new_first_page;
             index.last_page = new_first_page;
             self.indexes.insert(index_name, index);
@@ -575,43 +605,97 @@ impl StorageEngine {
             .indexes
             .remove(index_name)
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
-        self.insert_index_record_into_pages(&mut index, entry)?;
+        self.insert_index_record_btree(&mut index, entry)?;
         self.indexes.insert(index_name.to_string(), index);
         Ok(())
     }
 
-    fn insert_index_record_into_pages(
+    fn index_contains_key(&self, index: &IndexMeta, key: &[Value]) -> Result<bool, StorageError> {
+        self.btree_contains_key(index.first_page, key)
+    }
+
+    fn insert_index_record_btree(
         &mut self,
         index: &mut IndexMeta,
         entry: &IndexEntry,
     ) -> Result<(), StorageError> {
-        let record = encode_index_entry(entry)?;
-        let mut page_id = index.last_page;
-        let mut page = self.read_page(page_id)?;
-        if !has_space_for_record(&page, record.len()) {
-            let new_page_id = self.allocate_data_page()?;
-            let new_page = init_data_page();
-            set_next_page_id(&mut page, new_page_id);
-            self.write_page(page_id, &page)?;
-            page_id = new_page_id;
-            page = new_page;
-            index.last_page = new_page_id;
+        let split = self.btree_insert_recursive(index.first_page, entry)?;
+        if let Some(split) = split {
+            let new_root = self.allocate_btree_page(PAGE_TYPE_BTREE_INTERNAL)?;
+            let mut page = init_btree_page(PAGE_TYPE_BTREE_INTERNAL);
+            set_next_page_id(&mut page, index.first_page);
+            let cell = InternalCell {
+                key: split.key,
+                right_child: split.right_page,
+            };
+            let record = encode_internal_cell(&cell)?;
+            insert_record(&mut page, &record)?;
+            self.write_page(new_root, &page)?;
+            index.first_page = new_root;
         }
-        let _ = insert_record(&mut page, &record)?;
-        self.write_page(page_id, &page)?;
         Ok(())
     }
 
-    fn index_contains_key(&self, index: &IndexMeta, key: &[Value]) -> Result<bool, StorageError> {
-        let mut page_id = index.first_page;
+    fn btree_contains_key(&self, root: u32, key: &[Value]) -> Result<bool, StorageError> {
+        let mut page_id = root;
         loop {
             let page = self.read_page(page_id)?;
-            let records = read_records(&page);
-            for record in records {
-                let entry = decode_index_entry(&record)?;
-                if entry.key == key {
-                    return Ok(true);
+            match page_type(&page) {
+                PAGE_TYPE_BTREE_LEAF => {
+                    let entries = read_leaf_entries(&page)?;
+                    for entry in entries {
+                        match compare_index_keys(&entry.key, key) {
+                            std::cmp::Ordering::Less => continue,
+                            std::cmp::Ordering::Equal => return Ok(true),
+                            std::cmp::Ordering::Greater => break,
+                        }
+                    }
+                    return Ok(false);
                 }
+                PAGE_TYPE_BTREE_INTERNAL => {
+                    let leftmost = get_next_page_id(&page);
+                    let cells = read_internal_cells(&page)?;
+                    let (child, _) = btree_choose_child(key, leftmost, &cells);
+                    page_id = child;
+                }
+                _ => {
+                    return Err(StorageError::Corrupt(
+                        "invalid btree page type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn btree_scan_range(
+        &self,
+        root: u32,
+        lower: Option<&[Value]>,
+        upper: Option<&[Value]>,
+    ) -> Result<Vec<RowLocation>, StorageError> {
+        let mut page_id = self.btree_find_leaf(root, lower)?;
+        let mut rows = Vec::new();
+        loop {
+            let page = self.read_page(page_id)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(StorageError::Corrupt(
+                    "invalid btree leaf page".to_string(),
+                ));
+            }
+            let entries = read_leaf_entries(&page)?;
+            for entry in entries {
+                if let Some(low) = lower {
+                    if compare_index_keys(&entry.key, low) == std::cmp::Ordering::Less {
+                        continue;
+                    }
+                }
+                if let Some(high) = upper {
+                    if compare_index_keys(&entry.key, high) == std::cmp::Ordering::Greater {
+                        return Ok(rows);
+                    }
+                }
+                rows.push(entry.row);
             }
             let next = get_next_page_id(&page);
             if next == 0 {
@@ -619,7 +703,177 @@ impl StorageEngine {
             }
             page_id = next;
         }
-        Ok(false)
+        Ok(rows)
+    }
+
+    #[allow(dead_code)]
+    fn btree_find_leaf(
+        &self,
+        root: u32,
+        key: Option<&[Value]>,
+    ) -> Result<u32, StorageError> {
+        let mut page_id = root;
+        loop {
+            let page = self.read_page(page_id)?;
+            match page_type(&page) {
+                PAGE_TYPE_BTREE_LEAF => return Ok(page_id),
+                PAGE_TYPE_BTREE_INTERNAL => {
+                    let leftmost = get_next_page_id(&page);
+                    let cells = read_internal_cells(&page)?;
+                    let child = if let Some(key) = key {
+                        let (child, _) = btree_choose_child(key, leftmost, &cells);
+                        child
+                    } else {
+                        leftmost
+                    };
+                    page_id = child;
+                }
+                _ => {
+                    return Err(StorageError::Corrupt(
+                        "invalid btree page type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn btree_insert_recursive(
+        &mut self,
+        page_id: u32,
+        entry: &IndexEntry,
+    ) -> Result<Option<BtreeSplit>, StorageError> {
+        let page = self.read_page(page_id)?;
+        match page_type(&page) {
+            PAGE_TYPE_BTREE_LEAF => self.btree_insert_leaf(page_id, &page, entry),
+            PAGE_TYPE_BTREE_INTERNAL => self.btree_insert_internal(page_id, &page, entry),
+            _ => Err(StorageError::Corrupt(
+                "invalid btree page type".to_string(),
+            )),
+        }
+    }
+
+    fn btree_insert_leaf(
+        &mut self,
+        page_id: u32,
+        page: &[u8],
+        entry: &IndexEntry,
+    ) -> Result<Option<BtreeSplit>, StorageError> {
+        let next_leaf = get_next_page_id(page);
+        let mut entries = read_leaf_entries(page)?;
+        insert_leaf_entry_sorted(&mut entries, entry.clone());
+
+        match build_leaf_page(&entries, next_leaf) {
+            Ok(new_page) => {
+                self.write_page(page_id, &new_page)?;
+                Ok(None)
+            }
+            Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                let split = split_leaf_entries(entries);
+                let right_page_id = self.allocate_btree_page(PAGE_TYPE_BTREE_LEAF)?;
+                let left_page = build_leaf_page(&split.left, right_page_id)?;
+                let right_page = build_leaf_page(&split.right, next_leaf)?;
+                self.write_page(page_id, &left_page)?;
+                self.write_page(right_page_id, &right_page)?;
+                Ok(Some(BtreeSplit {
+                    key: split.split_key,
+                    right_page: right_page_id,
+                }))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn btree_insert_internal(
+        &mut self,
+        page_id: u32,
+        page: &[u8],
+        entry: &IndexEntry,
+    ) -> Result<Option<BtreeSplit>, StorageError> {
+        let leftmost = get_next_page_id(page);
+        let mut cells = read_internal_cells(page)?;
+        let (child_page, child_index) = btree_choose_child(&entry.key, leftmost, &cells);
+        let split = self.btree_insert_recursive(child_page, entry)?;
+        let Some(split) = split else {
+            return Ok(None);
+        };
+
+        cells.insert(
+            child_index,
+            InternalCell {
+                key: split.key,
+                right_child: split.right_page,
+            },
+        );
+
+        match build_internal_page(leftmost, &cells) {
+            Ok(new_page) => {
+                self.write_page(page_id, &new_page)?;
+                Ok(None)
+            }
+            Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                let split_result = split_internal_cells(leftmost, cells)?;
+                let right_page_id = self.allocate_btree_page(PAGE_TYPE_BTREE_INTERNAL)?;
+                let left_page =
+                    build_internal_page(split_result.left_leftmost, &split_result.left_cells)?;
+                let right_page =
+                    build_internal_page(split_result.right_leftmost, &split_result.right_cells)?;
+                self.write_page(page_id, &left_page)?;
+                self.write_page(right_page_id, &right_page)?;
+                Ok(Some(BtreeSplit {
+                    key: split_result.split_key,
+                    right_page: right_page_id,
+                }))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn free_btree_pages(&mut self, root: u32) -> Result<(), StorageError> {
+        let pages = self.collect_btree_pages(root)?;
+        for page_id in pages {
+            self.free_page(page_id)?;
+        }
+        Ok(())
+    }
+
+    fn collect_btree_pages(&self, root: u32) -> Result<Vec<u32>, StorageError> {
+        if root == 0 {
+            return Err(StorageError::Corrupt("invalid btree root".to_string()));
+        }
+        let mut pages = Vec::new();
+        let mut stack = vec![root];
+        let mut seen = HashSet::new();
+        while let Some(page_id) = stack.pop() {
+            if !seen.insert(page_id) {
+                return Err(StorageError::Corrupt(format!(
+                    "btree page loop at {}",
+                    page_id
+                )));
+            }
+            let page = self.read_page(page_id)?;
+            pages.push(page_id);
+            match page_type(&page) {
+                PAGE_TYPE_BTREE_LEAF => {}
+                PAGE_TYPE_BTREE_INTERNAL => {
+                    let leftmost = get_next_page_id(&page);
+                    if leftmost != 0 {
+                        stack.push(leftmost);
+                    }
+                    let cells = read_internal_cells(&page)?;
+                    for cell in cells {
+                        if cell.right_child != 0 {
+                            stack.push(cell.right_child);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(StorageError::Corrupt(
+                        "invalid btree page type".to_string(),
+                    ))
+                }
+            }
+        }
+        Ok(pages)
     }
 
     pub fn allocate_data_page(&mut self) -> Result<u32, StorageError> {
@@ -634,6 +888,30 @@ impl StorageEngine {
         self.write_page(page_id, &page)?;
         self.write_header()?;
         Ok(page_id)
+    }
+
+    pub fn allocate_btree_page(&mut self, page_type: u8) -> Result<u32, StorageError> {
+        if page_type != PAGE_TYPE_BTREE_LEAF && page_type != PAGE_TYPE_BTREE_INTERNAL {
+            return Err(StorageError::Invalid(format!(
+                "invalid btree page type {}",
+                page_type
+            )));
+        }
+        if let Some(page_id) = self.free_pages.pop() {
+            let page = init_btree_page(page_type);
+            self.write_page(page_id, &page)?;
+            return Ok(page_id);
+        }
+        let page_id = self.next_page_id;
+        self.next_page_id += 1;
+        let page = init_btree_page(page_type);
+        self.write_page(page_id, &page)?;
+        self.write_header()?;
+        Ok(page_id)
+    }
+
+    pub fn allocate_index_root(&mut self) -> Result<u32, StorageError> {
+        self.allocate_btree_page(PAGE_TYPE_BTREE_LEAF)
     }
 
     fn find_foreign_key_dependency(&self, target: &str) -> Option<String> {
@@ -862,7 +1140,17 @@ fn object_name_string(name: &ObjectName) -> String {
 
 fn init_data_page() -> Vec<u8> {
     let mut page = vec![0; PAGE_SIZE];
-    page[0] = 1;
+    page[0] = PAGE_TYPE_DATA;
+    write_u16(&mut page, 1, 0);
+    write_u16(&mut page, 3, 12);
+    write_u16(&mut page, 5, PAGE_SIZE as u16);
+    write_u32(&mut page, 7, 0);
+    page
+}
+
+fn init_btree_page(page_type: u8) -> Vec<u8> {
+    let mut page = vec![0; PAGE_SIZE];
+    page[0] = page_type;
     write_u16(&mut page, 1, 0);
     write_u16(&mut page, 3, 12);
     write_u16(&mut page, 5, PAGE_SIZE as u16);
@@ -1003,6 +1291,203 @@ fn decode_index_entry(record: &[u8]) -> Result<IndexEntry, StorageError> {
         key,
         row: RowLocation { page_id, slot },
     })
+}
+
+fn encode_internal_cell(cell: &InternalCell) -> Result<Vec<u8>, StorageError> {
+    let mut buf = encode_index_key(&cell.key)?;
+    buf.extend_from_slice(&cell.right_child.to_le_bytes());
+    Ok(buf)
+}
+
+fn decode_internal_cell(record: &[u8]) -> Result<InternalCell, StorageError> {
+    if record.len() < 2 + 4 {
+        return Err(StorageError::Corrupt("invalid internal cell".to_string()));
+    }
+    let mut pos = 0;
+    let count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut key = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (value, new_pos) = decode_value(record, pos)?;
+        pos = new_pos;
+        key.push(value);
+    }
+    if pos + 4 > record.len() {
+        return Err(StorageError::Corrupt("invalid internal cell child".to_string()));
+    }
+    let right_child = read_u32(record, pos);
+    Ok(InternalCell { key, right_child })
+}
+
+fn page_type(page: &[u8]) -> u8 {
+    page[0]
+}
+
+fn read_leaf_entries(page: &[u8]) -> Result<Vec<IndexEntry>, StorageError> {
+    let records = read_records(page);
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        entries.push(decode_index_entry(&record)?);
+    }
+    Ok(entries)
+}
+
+fn read_internal_cells(page: &[u8]) -> Result<Vec<InternalCell>, StorageError> {
+    let records = read_records(page);
+    let mut cells = Vec::with_capacity(records.len());
+    for record in records {
+        cells.push(decode_internal_cell(&record)?);
+    }
+    Ok(cells)
+}
+
+fn build_leaf_page(entries: &[IndexEntry], next_leaf: u32) -> Result<Vec<u8>, StorageError> {
+    let mut page = init_btree_page(PAGE_TYPE_BTREE_LEAF);
+    set_next_page_id(&mut page, next_leaf);
+    for entry in entries {
+        let record = encode_index_entry(entry)?;
+        insert_record(&mut page, &record)?;
+    }
+    Ok(page)
+}
+
+fn build_internal_page(
+    leftmost_child: u32,
+    cells: &[InternalCell],
+) -> Result<Vec<u8>, StorageError> {
+    let mut page = init_btree_page(PAGE_TYPE_BTREE_INTERNAL);
+    set_next_page_id(&mut page, leftmost_child);
+    for cell in cells {
+        let record = encode_internal_cell(cell)?;
+        insert_record(&mut page, &record)?;
+    }
+    Ok(page)
+}
+
+fn insert_leaf_entry_sorted(entries: &mut Vec<IndexEntry>, entry: IndexEntry) {
+    let idx = entries
+        .binary_search_by(|existing| compare_index_entry(existing, &entry))
+        .unwrap_or_else(|idx| idx);
+    entries.insert(idx, entry);
+}
+
+struct LeafSplit {
+    left: Vec<IndexEntry>,
+    right: Vec<IndexEntry>,
+    split_key: Vec<Value>,
+}
+
+fn split_leaf_entries(entries: Vec<IndexEntry>) -> LeafSplit {
+    let mid = entries.len() / 2;
+    let right = entries[mid..].to_vec();
+    let left = entries[..mid].to_vec();
+    let split_key = right
+        .first()
+        .map(|entry| entry.key.clone())
+        .unwrap_or_default();
+    LeafSplit {
+        left,
+        right,
+        split_key,
+    }
+}
+
+struct InternalSplit {
+    left_leftmost: u32,
+    left_cells: Vec<InternalCell>,
+    right_leftmost: u32,
+    right_cells: Vec<InternalCell>,
+    split_key: Vec<Value>,
+}
+
+fn split_internal_cells(
+    leftmost_child: u32,
+    cells: Vec<InternalCell>,
+) -> Result<InternalSplit, StorageError> {
+    if cells.is_empty() {
+        return Err(StorageError::Corrupt("empty internal node".to_string()));
+    }
+    let mid = cells.len() / 2;
+    let split_key = cells[mid].key.clone();
+
+    let mut children = Vec::with_capacity(cells.len() + 1);
+    children.push(leftmost_child);
+    for cell in &cells {
+        children.push(cell.right_child);
+    }
+
+    let left_leftmost = children[0];
+    let left_cells = cells[..mid].to_vec();
+    let right_leftmost = children[mid + 1];
+    let right_cells = cells[mid + 1..].to_vec();
+
+    Ok(InternalSplit {
+        left_leftmost,
+        left_cells,
+        right_leftmost,
+        right_cells,
+        split_key,
+    })
+}
+
+fn btree_choose_child(
+    key: &[Value],
+    leftmost_child: u32,
+    cells: &[InternalCell],
+) -> (u32, usize) {
+    let mut child = leftmost_child;
+    let mut index = 0;
+    for cell in cells {
+        if compare_index_keys(key, &cell.key) == std::cmp::Ordering::Less {
+            return (child, index);
+        }
+        child = cell.right_child;
+        index += 1;
+    }
+    (child, index)
+}
+
+fn compare_index_entry(a: &IndexEntry, b: &IndexEntry) -> std::cmp::Ordering {
+    compare_index_keys(&a.key, &b.key).then_with(|| compare_row_location(&a.row, &b.row))
+}
+
+fn compare_row_location(a: &RowLocation, b: &RowLocation) -> std::cmp::Ordering {
+    a.page_id
+        .cmp(&b.page_id)
+        .then_with(|| a.slot.cmp(&b.slot))
+}
+
+fn compare_index_keys(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    let len = a.len().min(b.len());
+    for idx in 0..len {
+        let ord = compare_index_value(&a[idx], &b[idx]);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn compare_index_value(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        (Value::Integer(l), Value::Integer(r)) => l.cmp(r),
+        (Value::Real(l), Value::Real(r)) => l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Integer(l), Value::Real(r)) => (*l as f64)
+            .partial_cmp(r)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Real(l), Value::Integer(r)) => l
+            .partial_cmp(&(*r as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Text(l), Value::Text(r)) => l.cmp(r),
+        (Value::Blob(_), Value::Blob(_)) => std::cmp::Ordering::Equal,
+        (Value::Text(_), _) => std::cmp::Ordering::Greater,
+        (_, Value::Text(_)) => std::cmp::Ordering::Less,
+        (Value::Blob(_), _) => std::cmp::Ordering::Greater,
+        (_, Value::Blob(_)) => std::cmp::Ordering::Less,
+    }
 }
 
 fn encode_value(value: &Value, buf: &mut Vec<u8>) -> Result<(), StorageError> {

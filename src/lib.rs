@@ -91,26 +91,48 @@ fn auto_detect_validator(
             return actual_norm.eq_ignore_ascii_case("NULL");
         }
         if let Ok(expected_int) = expected_norm.parse::<i64>() {
+            if actual_norm.eq_ignore_ascii_case("NULL") {
+                return false;
+            }
             if let Ok(actual_float) = actual_norm.parse::<f64>() {
                 if actual_float.is_finite() {
                     return expected_int == actual_float.trunc() as i64;
                 }
             }
+            return expected_int == 0;
         }
         false
     }
 
-    fn normalize_for_hash(normalizer: Normalizer, value: &str) -> String {
-        let normalized = normalizer(&value.to_string());
-        if let Ok(int_val) = normalized.parse::<i64>() {
+    fn normalize_hash_numeric(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("NULL") {
+            return "NULL".to_string();
+        }
+        if let Ok(int_val) = trimmed.parse::<i64>() {
             return int_val.to_string();
         }
-        if let Ok(float_val) = normalized.parse::<f64>() {
+        if let Ok(float_val) = trimmed.parse::<f64>() {
             if float_val.is_finite() {
                 return (float_val.trunc() as i64).to_string();
             }
         }
-        normalized
+        "0".to_string()
+    }
+
+    fn hash_rows(
+        actual: &[Vec<String>],
+        normalize: impl Fn(&str) -> String,
+    ) -> String {
+        let mut md5 = Md5::new();
+        for row in actual {
+            for value in row {
+                let normalized = normalize(value);
+                md5.update(normalized.as_bytes());
+                md5.update(b"\n");
+            }
+        }
+        format!("{:2x}", md5.finalize())
     }
 
     // Handle empty results
@@ -148,18 +170,12 @@ fn auto_detect_validator(
             
             // Compute hash of actual results (flattened, one value per line)
             // Use the exact same API as sqllogictest: md5::Md5::new() with update() and finalize()
-            let mut md5 = Md5::new();
-            for row in actual {
-                for value in row {
-                    let normalized = normalize_for_hash(normalizer, value);
-                    md5.update(normalized.as_bytes());
-                    md5.update(b"\n");
-                }
+            let raw_hash = hash_rows(actual, |value| value.to_string());
+            if raw_hash == *expected_hash {
+                return true;
             }
-            // Format exactly as library does: {:2x} on the digest
-            let actual_hash = format!("{:2x}", md5.finalize());
-            
-            return actual_hash == *expected_hash;
+            let numeric_hash = hash_rows(actual, normalize_hash_numeric);
+            return numeric_hash == *expected_hash;
         }
     }
     
