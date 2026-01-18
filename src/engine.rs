@@ -255,10 +255,95 @@ impl GongDB {
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
+            Statement::Update(update) => {
+                let table_name = object_name(&update.table);
+                if self.storage.get_view(&table_name).is_some() {
+                    return Err(GongDBError::new(format!(
+                        "cannot modify view {}",
+                        table_name
+                    )));
+                }
+                let table = self
+                    .storage
+                    .get_table(&table_name)
+                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .clone();
+                let rows = self.storage.scan_table(&table_name)?;
+                let table_scope = TableScope {
+                    table_name: Some(table_name.clone()),
+                    table_alias: None,
+                };
+                let mut updated_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let scope = EvalScope {
+                        columns: &table.columns,
+                        row: &row,
+                        table_scope: &table_scope,
+                    };
+                    if let Some(predicate) = &update.selection {
+                        let value = eval_expr(self, predicate, &scope, None)?;
+                        if !value_to_bool(&value) {
+                            updated_rows.push(row);
+                            continue;
+                        }
+                    }
+                    let mut new_row = row.clone();
+                    for assignment in &update.assignments {
+                        let idx = resolve_column_index(&assignment.column.value, &table.columns)
+                            .ok_or_else(|| {
+                                GongDBError::new(format!(
+                                    "unknown column {}",
+                                    assignment.column.value
+                                ))
+                            })?;
+                        let value = eval_expr(self, &assignment.value, &scope, None)?;
+                        new_row[idx] = apply_affinity(value, &table.columns[idx].data_type);
+                    }
+                    updated_rows.push(new_row);
+                }
+                self.storage.replace_table_rows(&table_name, &updated_rows)?;
+                Ok(DBOutput::StatementComplete(0))
+            }
+            Statement::Delete(delete) => {
+                let table_name = object_name(&delete.table);
+                if self.storage.get_view(&table_name).is_some() {
+                    return Err(GongDBError::new(format!(
+                        "cannot modify view {}",
+                        table_name
+                    )));
+                }
+                let table = self
+                    .storage
+                    .get_table(&table_name)
+                    .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
+                    .clone();
+                let rows = self.storage.scan_table(&table_name)?;
+                let table_scope = TableScope {
+                    table_name: Some(table_name.clone()),
+                    table_alias: None,
+                };
+                let mut remaining_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let scope = EvalScope {
+                        columns: &table.columns,
+                        row: &row,
+                        table_scope: &table_scope,
+                    };
+                    if let Some(predicate) = &delete.selection {
+                        let value = eval_expr(self, predicate, &scope, None)?;
+                        if value_to_bool(&value) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                    remaining_rows.push(row);
+                }
+                self.storage
+                    .replace_table_rows(&table_name, &remaining_rows)?;
+                Ok(DBOutput::StatementComplete(0))
+            }
             Statement::Select(select) => self.run_select(&select),
-            _ => Err(GongDBError::new(
-                "statement not supported in phase 2",
-            )),
         }
     }
 

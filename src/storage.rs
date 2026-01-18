@@ -466,6 +466,50 @@ impl StorageEngine {
         Ok(rows)
     }
 
+    pub fn replace_table_rows(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<(), StorageError> {
+        let table = self
+            .tables
+            .get(table_name)
+            .cloned()
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?;
+        self.free_page_chain(table.first_page)?;
+        let new_first_page = self.allocate_data_page()?;
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.first_page = new_first_page;
+            table.last_page = new_first_page;
+        }
+
+        let index_names: Vec<String> = self
+            .indexes
+            .values()
+            .filter(|index| index.table.eq_ignore_ascii_case(table_name))
+            .map(|index| index.name.clone())
+            .collect();
+        for index_name in index_names {
+            let mut index = self
+                .indexes
+                .remove(&index_name)
+                .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
+            self.free_page_chain(index.first_page)?;
+            let new_first_page = self.allocate_data_page()?;
+            index.first_page = new_first_page;
+            index.last_page = new_first_page;
+            self.indexes.insert(index_name, index);
+        }
+
+        for row in rows {
+            self.insert_row_with_location(table_name, row)?;
+        }
+        if rows.is_empty() {
+            self.write_catalog()?;
+        }
+        Ok(())
+    }
+
     fn insert_index_record(
         &mut self,
         index_name: &str,
