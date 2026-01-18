@@ -386,6 +386,20 @@ impl StorageEngine {
         self.btree_scan_range(index.first_page, lower, upper)
     }
 
+    pub(crate) fn scan_index_rows(
+        &self,
+        index_name: &str,
+        lower: Option<&[Value]>,
+        upper: Option<&[Value]>,
+    ) -> Result<Vec<Vec<Value>>, StorageError> {
+        let locations = self.scan_index_range(index_name, lower, upper)?;
+        let mut rows = Vec::with_capacity(locations.len());
+        for location in &locations {
+            rows.push(self.read_row_at(location)?);
+        }
+        Ok(rows)
+    }
+
     pub fn schema_version(&self) -> u32 {
         self.schema_version
     }
@@ -550,6 +564,14 @@ impl StorageEngine {
             page_id = next;
         }
         Ok(rows)
+    }
+
+    pub(crate) fn read_row_at(&self, location: &RowLocation) -> Result<Vec<Value>, StorageError> {
+        let page = self.read_page(location.page_id)?;
+        let record = read_record_at_slot(&page, location.slot).ok_or_else(|| {
+            StorageError::Corrupt("invalid row location".to_string())
+        })?;
+        decode_row(&record)
     }
 
     pub fn replace_table_rows(
@@ -1219,6 +1241,21 @@ fn read_records_with_slots(page: &[u8]) -> Vec<(u16, Vec<u8>)> {
         }
     }
     records
+}
+
+fn read_record_at_slot(page: &[u8], slot: u16) -> Option<Vec<u8>> {
+    let slot_count = read_u16(page, 1) as usize;
+    let slot = slot as usize;
+    if slot >= slot_count {
+        return None;
+    }
+    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+    let record_offset = read_u16(page, slot_offset) as usize;
+    let record_len = read_u16(page, slot_offset + 2) as usize;
+    if record_offset + record_len > PAGE_SIZE {
+        return None;
+    }
+    Some(page[record_offset..record_offset + record_len].to_vec())
 }
 
 fn encode_row(row: &[Value]) -> Result<Vec<u8>, StorageError> {

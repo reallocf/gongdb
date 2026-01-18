@@ -1,7 +1,7 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
-    InsertConflict, InsertSource, JoinConstraint, JoinOperator, Literal, NullsOrder, Select,
-    SelectItem, Statement, TableConstraint, TableRef, With,
+    InsertConflict, InsertSource, JoinConstraint, JoinOperator, Literal, NullsOrder, OrderByExpr,
+    Select, SelectItem, SortOrder, Statement, TableConstraint, TableRef, With,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
@@ -514,19 +514,22 @@ impl GongDB {
         cte_context: Option<&CteContext>,
     ) -> Result<QueryResult, GongDBError> {
         let mut selection_applied = false;
+        let mut preordered_by_index = false;
         let source = if select.from.len() == 1 {
             if let crate::ast::TableRef::Named { name, alias } = &select.from[0] {
                 let table_name = object_name(name);
                 if self.storage.get_table(&table_name).is_some() {
                     let table_alias = alias.as_ref().map(|ident| ident.value.clone());
-                    let rows = self.scan_table_rows(
+                    let (rows, ordered_by_index) = self.scan_table_rows(
                         &table_name,
                         table_alias.as_deref(),
                         select.selection.as_ref(),
+                        &select.order_by,
                         outer,
                         cte_context,
                     )?;
                     selection_applied = select.selection.is_some();
+                    preordered_by_index = ordered_by_index;
                     let table = self
                         .storage
                         .get_table(&table_name)
@@ -917,9 +920,11 @@ impl GongDB {
             } else {
                 rows
             };
-            sorted_rows.sort_by(|a, b| {
-                compare_order_keys(&a.order_values, &b.order_values, &order_plans)
-            });
+            if !preordered_by_index {
+                sorted_rows.sort_by(|a, b| {
+                    compare_order_keys(&a.order_values, &b.order_values, &order_plans)
+                });
+            }
             sorted_rows
                 .into_iter()
                 .map(|row| row.projected)
@@ -1057,9 +1062,10 @@ impl GongDB {
         table_name: &str,
         table_alias: Option<&str>,
         selection: Option<&Expr>,
+        order_by: &[OrderByExpr],
         outer: Option<&EvalScope<'_>>,
         cte_context: Option<&CteContext>,
-    ) -> Result<Vec<Vec<Value>>, GongDBError> {
+    ) -> Result<(Vec<Vec<Value>>, bool), GongDBError> {
         let table = self
             .storage
             .get_table(table_name)
@@ -1069,11 +1075,23 @@ impl GongDB {
             table_alias: table_alias.map(|alias| alias.to_string()),
         };
         let column_scopes = vec![table_scope.clone(); table.columns.len()];
-        let mut rows = Vec::new();
-        let mut scan = self.storage.table_scan(table_name)?;
-        while let Some(result) = scan.next() {
-            let row = result?;
-            if let Some(predicate) = selection {
+        let mut ordered_by_index = false;
+        let mut rows = if let Some(plan) =
+            choose_index_scan_plan(self, table, selection, order_by, &table_scope)
+        {
+            ordered_by_index = plan.ordered_by;
+            scan_rows_with_index(self, &plan)?
+        } else {
+            let mut rows = Vec::new();
+            let mut scan = self.storage.table_scan(table_name)?;
+            while let Some(result) = scan.next() {
+                rows.push(result?);
+            }
+            rows
+        };
+        if let Some(predicate) = selection {
+            let mut filtered = Vec::new();
+            for row in rows.drain(..) {
                 let scope = EvalScope {
                     columns: &table.columns,
                     column_scopes: &column_scopes,
@@ -1085,10 +1103,11 @@ impl GongDB {
                 if !value_to_bool(&value) {
                     continue;
                 }
+                filtered.push(row);
             }
-            rows.push(row);
+            rows = filtered;
         }
-        Ok(rows)
+        Ok((rows, ordered_by_index))
     }
 
     fn resolve_table_ref(
@@ -1395,6 +1414,434 @@ impl GongDB {
             rows,
             table_scope,
         })
+    }
+}
+
+#[derive(Clone)]
+struct IndexScanPlan {
+    index_name: String,
+    lower: Option<Vec<Value>>,
+    upper: Option<Vec<Value>>,
+    ordered_by: bool,
+}
+
+#[derive(Clone, Default)]
+struct IndexColumnConstraint {
+    eq: Option<Value>,
+    lower: Option<Value>,
+    upper: Option<Value>,
+}
+
+enum Constraint {
+    Eq(Value),
+    Lower(Value),
+    Upper(Value),
+}
+
+fn choose_index_scan_plan(
+    db: &GongDB,
+    table: &TableMeta,
+    selection: Option<&Expr>,
+    order_by: &[OrderByExpr],
+    table_scope: &TableScope,
+) -> Option<IndexScanPlan> {
+    let indexes: Vec<IndexMeta> = db
+        .storage
+        .list_indexes()
+        .into_iter()
+        .filter(|index| index.table.eq_ignore_ascii_case(&table.name))
+        .collect();
+    if indexes.is_empty() {
+        return None;
+    }
+
+    let constraints = selection
+        .map(|selection| extract_index_constraints(db, selection, table_scope, &table.columns))
+        .unwrap_or_default();
+
+    let mut best_eq: Option<(IndexScanPlan, usize, bool)> = None;
+    let mut best_range: Option<(IndexScanPlan, bool)> = None;
+
+    for index in &indexes {
+        let ordered = order_by_matches_index(order_by, index, table_scope, &table.columns);
+        if let Some(key) = build_eq_key(index, &constraints) {
+            let ordered_by = !order_by.is_empty() && ordered;
+            let plan = IndexScanPlan {
+                index_name: index.name.clone(),
+                lower: Some(key.clone()),
+                upper: Some(key),
+                ordered_by,
+            };
+            let column_count = index.columns.len();
+            let should_replace = match &best_eq {
+                None => true,
+                Some((_, best_columns, best_ordered)) => {
+                    column_count > *best_columns
+                        || (column_count == *best_columns && ordered_by && !*best_ordered)
+                }
+            };
+            if should_replace {
+                best_eq = Some((plan, column_count, ordered_by));
+            }
+            continue;
+        }
+
+        if index.columns.len() == 1 {
+            let column_name = index.columns[0].name.value.to_lowercase();
+            if let Some(constraint) = constraints.get(&column_name) {
+                if let Some(eq) = &constraint.eq {
+                    let ordered_by = !order_by.is_empty() && ordered;
+                    let plan = IndexScanPlan {
+                        index_name: index.name.clone(),
+                        lower: Some(vec![eq.clone()]),
+                        upper: Some(vec![eq.clone()]),
+                        ordered_by,
+                    };
+                    best_eq = Some((plan, 1, ordered_by));
+                    continue;
+                }
+                let lower = constraint.lower.clone().map(|value| vec![value]);
+                let upper = constraint.upper.clone().map(|value| vec![value]);
+                if lower.is_some() || upper.is_some() {
+                    let ordered_by = !order_by.is_empty() && ordered;
+                    let plan = IndexScanPlan {
+                        index_name: index.name.clone(),
+                        lower,
+                        upper,
+                        ordered_by,
+                    };
+                    let should_replace = match &best_range {
+                        None => true,
+                        Some((_, best_ordered)) => ordered_by && !*best_ordered,
+                    };
+                    if should_replace {
+                        best_range = Some((plan, ordered_by));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((plan, _, _)) = best_eq {
+        return Some(plan);
+    }
+    if let Some((plan, _)) = best_range {
+        return Some(plan);
+    }
+
+    if !order_by.is_empty() {
+        let mut best_order: Option<IndexScanPlan> = None;
+        let mut best_extra = usize::MAX;
+        for index in &indexes {
+            if !order_by_matches_index(order_by, index, table_scope, &table.columns) {
+                continue;
+            }
+            let extra = index.columns.len().saturating_sub(order_by.len());
+            if extra < best_extra {
+                best_extra = extra;
+                best_order = Some(IndexScanPlan {
+                    index_name: index.name.clone(),
+                    lower: None,
+                    upper: None,
+                    ordered_by: true,
+                });
+            }
+        }
+        if best_order.is_some() {
+            return best_order;
+        }
+    }
+
+    None
+}
+
+fn scan_rows_with_index(db: &GongDB, plan: &IndexScanPlan) -> Result<Vec<Vec<Value>>, GongDBError> {
+    let lower = plan.lower.as_deref();
+    let upper = plan.upper.as_deref();
+    Ok(db
+        .storage
+        .scan_index_rows(&plan.index_name, lower, upper)?)
+}
+
+fn build_eq_key(
+    index: &IndexMeta,
+    constraints: &HashMap<String, IndexColumnConstraint>,
+) -> Option<Vec<Value>> {
+    let mut key = Vec::with_capacity(index.columns.len());
+    for column in &index.columns {
+        let entry = constraints.get(&column.name.value.to_lowercase())?;
+        let value = entry.eq.clone()?;
+        key.push(value);
+    }
+    Some(key)
+}
+
+fn extract_index_constraints(
+    db: &GongDB,
+    selection: &Expr,
+    table_scope: &TableScope,
+    columns: &[Column],
+) -> HashMap<String, IndexColumnConstraint> {
+    let mut constraints: HashMap<String, IndexColumnConstraint> = HashMap::new();
+    for expr in split_conjuncts(selection) {
+        match &expr {
+            Expr::Between {
+                expr,
+                negated: false,
+                low,
+                high,
+            } => {
+                let (idx, name) =
+                    match column_ref_for_expr(expr, table_scope, columns) {
+                        Some(value) => value,
+                        None => continue,
+                    };
+                let low_val = match eval_constant_expr(db, low) {
+                    Some(value) => apply_affinity(value, &columns[idx].data_type),
+                    None => continue,
+                };
+                let high_val = match eval_constant_expr(db, high) {
+                    Some(value) => apply_affinity(value, &columns[idx].data_type),
+                    None => continue,
+                };
+                let entry = constraints
+                    .entry(name)
+                    .or_insert_with(IndexColumnConstraint::default);
+                if entry.eq.is_none() {
+                    apply_lower_bound(entry, low_val);
+                    apply_upper_bound(entry, high_val);
+                }
+            }
+            Expr::IsNull {
+                expr,
+                negated: false,
+            } => {
+                if let Some((_idx, name)) = column_ref_for_expr(expr, table_scope, columns) {
+                    let entry = constraints
+                        .entry(name)
+                        .or_insert_with(IndexColumnConstraint::default);
+                    entry.eq = Some(Value::Null);
+                    entry.lower = None;
+                    entry.upper = None;
+                }
+            }
+            Expr::BinaryOp { left, op, right } => {
+                if let Some((name, constraint)) =
+                    extract_binary_constraint(db, left, op, right, table_scope, columns)
+                {
+                    let entry = constraints
+                        .entry(name)
+                        .or_insert_with(IndexColumnConstraint::default);
+                    match constraint {
+                        Constraint::Eq(value) => {
+                            entry.eq = Some(value);
+                            entry.lower = None;
+                            entry.upper = None;
+                        }
+                        Constraint::Lower(value) => {
+                            if entry.eq.is_none() {
+                                apply_lower_bound(entry, value);
+                            }
+                        }
+                        Constraint::Upper(value) => {
+                            if entry.eq.is_none() {
+                                apply_upper_bound(entry, value);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    constraints
+}
+
+fn apply_lower_bound(entry: &mut IndexColumnConstraint, value: Value) {
+    match entry.lower.take() {
+        Some(existing) => {
+            if compare_order_values(&existing, &value) == std::cmp::Ordering::Greater {
+                entry.lower = Some(existing);
+            } else {
+                entry.lower = Some(value);
+            }
+        }
+        None => entry.lower = Some(value),
+    }
+}
+
+fn apply_upper_bound(entry: &mut IndexColumnConstraint, value: Value) {
+    match entry.upper.take() {
+        Some(existing) => {
+            if compare_order_values(&existing, &value) == std::cmp::Ordering::Less {
+                entry.upper = Some(existing);
+            } else {
+                entry.upper = Some(value);
+            }
+        }
+        None => entry.upper = Some(value),
+    }
+}
+
+fn extract_binary_constraint(
+    db: &GongDB,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    table_scope: &TableScope,
+    columns: &[Column],
+) -> Option<(String, Constraint)> {
+    if let Some((idx, name)) = column_ref_for_expr(left, table_scope, columns) {
+        let value = eval_constant_expr(db, right)?;
+        return constraint_from_operator(
+            op,
+            name,
+            apply_affinity(value, &columns[idx].data_type),
+        );
+    }
+    if let Some((idx, name)) = column_ref_for_expr(right, table_scope, columns) {
+        let value = eval_constant_expr(db, left)?;
+        let inverted = invert_comparison_operator(op)?;
+        return constraint_from_operator(
+            &inverted,
+            name,
+            apply_affinity(value, &columns[idx].data_type),
+        );
+    }
+    None
+}
+
+fn constraint_from_operator(
+    op: &BinaryOperator,
+    column: String,
+    value: Value,
+) -> Option<(String, Constraint)> {
+    match op {
+        BinaryOperator::Eq => Some((column, Constraint::Eq(value))),
+        BinaryOperator::Lt | BinaryOperator::LtEq => Some((column, Constraint::Upper(value))),
+        BinaryOperator::Gt | BinaryOperator::GtEq => Some((column, Constraint::Lower(value))),
+        _ => None,
+    }
+}
+
+fn invert_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Eq => Some(BinaryOperator::Eq),
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        _ => None,
+    }
+}
+
+fn order_by_matches_index(
+    order_by: &[OrderByExpr],
+    index: &IndexMeta,
+    table_scope: &TableScope,
+    columns: &[Column],
+) -> bool {
+    if order_by.is_empty() {
+        return false;
+    }
+    if order_by.len() > index.columns.len() {
+        return false;
+    }
+    for (idx, order) in order_by.iter().enumerate() {
+        if order.asc == Some(false) {
+            return false;
+        }
+        if matches!(order.nulls.as_ref(), Some(NullsOrder::Last)) {
+            return false;
+        }
+        let column = match column_ref_for_expr(&order.expr, table_scope, columns) {
+            Some((_idx, name)) => name,
+            None => return false,
+        };
+        let index_column = &index.columns[idx];
+        if !index_column.name.value.eq_ignore_ascii_case(&column) {
+            return false;
+        }
+        if matches!(index_column.order, Some(SortOrder::Desc)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn column_ref_for_expr(
+    expr: &Expr,
+    table_scope: &TableScope,
+    columns: &[Column],
+) -> Option<(usize, String)> {
+    match expr {
+        Expr::Identifier(ident) => resolve_column_index(&ident.value, columns)
+            .map(|idx| (idx, columns[idx].name.to_lowercase())),
+        Expr::CompoundIdentifier(idents) => {
+            let (qualifier, name) = split_qualified_identifier(idents).ok()?;
+            if !table_scope.matches_qualifier(qualifier) {
+                return None;
+            }
+            resolve_column_index(name, columns)
+                .map(|idx| (idx, columns[idx].name.to_lowercase()))
+        }
+        _ => None,
+    }
+}
+
+fn eval_constant_expr(db: &GongDB, expr: &Expr) -> Option<Value> {
+    if !expr_is_constant(expr) {
+        return None;
+    }
+    let scope = EvalScope {
+        columns: &[],
+        column_scopes: &[],
+        row: &[],
+        table_scope: &TableScope {
+            table_name: None,
+            table_alias: None,
+        },
+        cte_context: None,
+    };
+    eval_expr(db, expr, &scope, None).ok()
+}
+
+fn expr_is_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Wildcard => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_is_constant(left) && expr_is_constant(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_is_constant(expr),
+        Expr::Function { args, distinct, .. } => {
+            !*distinct && args.iter().all(expr_is_constant)
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => operand
+            .as_ref()
+            .map(|expr| expr_is_constant(expr))
+            .unwrap_or(true)
+            && when_then.iter().all(|(when_expr, then_expr)| {
+                expr_is_constant(when_expr) && expr_is_constant(then_expr)
+            })
+            && else_result
+                .as_ref()
+                .map(|expr| expr_is_constant(expr))
+                .unwrap_or(true),
+        Expr::Between { expr, low, high, .. } => {
+            expr_is_constant(expr) && expr_is_constant(low) && expr_is_constant(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_is_constant(expr) && list.iter().all(expr_is_constant)
+        }
+        Expr::IsNull { expr, .. } => expr_is_constant(expr),
+        Expr::Cast { expr, .. } => expr_is_constant(expr),
+        Expr::Nested(expr) => expr_is_constant(expr),
+        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::Subquery(_) => false,
     }
 }
 
