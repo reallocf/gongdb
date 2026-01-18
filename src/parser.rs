@@ -614,6 +614,23 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select, ParserError> {
+        let mut select = self.parse_select_base()?;
+        while self.eat_keyword("UNION") {
+            let operator = if self.eat_keyword("ALL") {
+                CompoundOperator::UnionAll
+            } else {
+                CompoundOperator::Union
+            };
+            let right = self.parse_select_base()?;
+            select.compounds.push(CompoundSelect {
+                operator,
+                select: Box::new(right),
+            });
+        }
+        Ok(select)
+    }
+
+    fn parse_select_base(&mut self) -> Result<Select, ParserError> {
         let with = if self.eat_keyword("WITH") {
             Some(self.parse_with_clause()?)
         } else {
@@ -621,6 +638,9 @@ impl Parser {
         };
         self.expect_keyword("SELECT")?;
         let distinct = self.eat_keyword("DISTINCT");
+        if !distinct {
+            self.eat_keyword("ALL");
+        }
         let projection = self.parse_select_list()?;
         let from = if self.eat_keyword("FROM") {
             self.parse_table_refs()?
@@ -675,6 +695,7 @@ impl Parser {
             order_by,
             limit,
             offset,
+            compounds: Vec::new(),
         })
     }
 
@@ -802,7 +823,14 @@ impl Parser {
                     alias,
                 });
             }
-            return Err(ParserError::new("unexpected '(' in FROM"));
+            let table_ref = self.parse_table_ref()?;
+            self.expect_symbol(')')?;
+            if self.parse_optional_alias()?.is_some() {
+                return Err(ParserError::new(
+                    "alias for parenthesized table reference is not supported",
+                ));
+            }
+            return Ok(table_ref);
         }
         let name = self.parse_object_name()?;
         let alias = self.parse_optional_alias()?;
@@ -878,9 +906,9 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParserError> {
-        let mut expr = self.parse_comparison()?;
+        let mut expr = self.parse_not()?;
         while self.eat_keyword("AND") {
-            let right = self.parse_comparison()?;
+            let right = self.parse_not()?;
             expr = Expr::BinaryOp {
                 left: Box::new(expr),
                 op: BinaryOperator::And,
@@ -888,6 +916,16 @@ impl Parser {
             };
         }
         Ok(expr)
+    }
+
+    fn parse_not(&mut self) -> Result<Expr, ParserError> {
+        if self.eat_keyword("NOT") {
+            return Ok(Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: Box::new(self.parse_not()?),
+            });
+        }
+        self.parse_comparison()
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParserError> {
@@ -1087,12 +1125,6 @@ impl Parser {
                 expr: Box::new(self.parse_unary()?),
             });
         }
-        if self.eat_keyword("NOT") {
-            return Ok(Expr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr: Box::new(self.parse_unary()?),
-            });
-        }
         if self.eat_keyword("EXISTS") {
             self.expect_symbol('(')?;
             let select = self.parse_select()?;
@@ -1269,6 +1301,7 @@ impl Parser {
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
+                compounds: Vec::new(),
             };
             Ok(Expr::InSubquery {
                 expr: Box::new(left),
@@ -1580,6 +1613,12 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParserError> {
     }
     let mut parser = Parser::new(tokens);
     let stmt = parser.parse_statement()?;
+    while matches!(parser.current(), TokenKind::Symbol(';')) {
+        parser.advance();
+    }
+    if !matches!(parser.current(), TokenKind::Eof) {
+        return Err(ParserError::new("unexpected token after statement"));
+    }
     Ok(stmt)
 }
 

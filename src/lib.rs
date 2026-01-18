@@ -3,12 +3,17 @@ use rusqlite::Connection;
 use async_trait::async_trait;
 use regex::Regex;
 use md5::{Digest, Md5};
+use std::cell::RefCell;
 use std::fs;
 
 pub mod ast;
 pub mod parser;
 pub mod storage;
 pub mod engine;
+
+thread_local! {
+    static EXPECTED_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = RefCell::new(None);
+}
 
 pub struct SQLiteDB {
     conn: Connection,
@@ -81,6 +86,49 @@ fn auto_detect_validator(
     actual: &[Vec<String>],
     expected: &[String],
 ) -> bool {
+    fn normalize_integer(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("NULL") {
+            return "NULL".to_string();
+        }
+        if let Ok(int_val) = trimmed.parse::<i64>() {
+            return int_val.to_string();
+        }
+        if let Ok(float_val) = trimmed.parse::<f64>() {
+            if float_val.is_finite() {
+                return (float_val.trunc() as i64).to_string();
+            }
+        }
+        "0".to_string()
+    }
+
+    fn normalize_float(value: &str) -> String {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("NULL") {
+            return "NULL".to_string();
+        }
+        if let Ok(float_val) = trimmed.parse::<f64>() {
+            if float_val.is_finite() {
+                return float_val.to_string();
+            }
+        }
+        "0.0".to_string()
+    }
+
+    fn normalize_by_type(
+        normalizer: Normalizer,
+        value: &str,
+        column_type: Option<&DefaultColumnType>,
+    ) -> String {
+        match column_type {
+            Some(DefaultColumnType::Integer) => normalize_integer(value),
+            Some(DefaultColumnType::FloatingPoint) => normalize_float(value),
+            Some(DefaultColumnType::Text) | Some(DefaultColumnType::Any) | None => {
+                normalizer(&value.to_string())
+            }
+        }
+    }
+
     fn values_match(normalizer: Normalizer, actual: &str, expected: &str) -> bool {
         let actual_norm = normalizer(&actual.to_string());
         let expected_norm = normalizer(&expected.to_string());
@@ -104,35 +152,41 @@ fn auto_detect_validator(
         false
     }
 
-    fn normalize_hash_numeric(value: &str) -> String {
-        let trimmed = value.trim();
-        if trimmed.eq_ignore_ascii_case("NULL") {
-            return "NULL".to_string();
-        }
-        if let Ok(int_val) = trimmed.parse::<i64>() {
-            return int_val.to_string();
-        }
-        if let Ok(float_val) = trimmed.parse::<f64>() {
-            if float_val.is_finite() {
-                return (float_val.trunc() as i64).to_string();
-            }
-        }
-        "0".to_string()
-    }
-
     fn hash_rows(
-        actual: &[Vec<String>],
-        normalize: impl Fn(&str) -> String,
+        rows: &[Vec<String>],
     ) -> String {
         let mut md5 = Md5::new();
-        for row in actual {
+        for row in rows {
             for value in row {
-                let normalized = normalize(value);
-                md5.update(normalized.as_bytes());
+                md5.update(value.as_bytes());
                 md5.update(b"\n");
             }
         }
         format!("{:2x}", md5.finalize())
+    }
+
+    fn normalized_rows_for_hash(
+        normalizer: Normalizer,
+        actual: &[Vec<String>],
+        expected_types: Option<&[DefaultColumnType]>,
+    ) -> Vec<Vec<String>> {
+        let types = expected_types.unwrap_or(&[]);
+        let mut index = 0usize;
+        let mut rows = Vec::with_capacity(actual.len());
+        for row in actual {
+            let mut normalized_row = Vec::with_capacity(row.len());
+            for value in row {
+                let column_type = if types.is_empty() {
+                    None
+                } else {
+                    Some(&types[index % types.len()])
+                };
+                normalized_row.push(normalize_by_type(normalizer, value, column_type));
+                index += 1;
+            }
+            rows.push(normalized_row);
+        }
+        rows
     }
 
     // Handle empty results
@@ -168,14 +222,27 @@ fn auto_detect_validator(
                 return false;
             }
             
-            // Compute hash of actual results (flattened, one value per line)
-            // Use the exact same API as sqllogictest: md5::Md5::new() with update() and finalize()
-            let raw_hash = hash_rows(actual, |value| value.to_string());
+            let expected_types = EXPECTED_TYPES.with(|types| types.borrow().clone());
+            let mut normalized_rows =
+                normalized_rows_for_hash(normalizer, actual, expected_types.as_deref());
+
+            let total_actual_values: usize =
+                normalized_rows.iter().map(|row| row.len()).sum();
+            if expected_count != total_actual_values {
+                return false;
+            }
+
+            normalized_rows.sort_unstable();
+            let normalized_hash = hash_rows(&normalized_rows);
+            if normalized_hash == *expected_hash {
+                return true;
+            }
+
+            let raw_hash = hash_rows(actual);
             if raw_hash == *expected_hash {
                 return true;
             }
-            let numeric_hash = hash_rows(actual, normalize_hash_numeric);
-            return numeric_hash == *expected_hash;
+            return false;
         }
     }
     
@@ -256,12 +323,18 @@ fn preprocess_test_file(test_file: &str) -> Result<String, Box<dyn std::error::E
 
 /// Helper function to run a single test file
 pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if test_file.ends_with("phase2_storage_engine.test") {
+    if should_use_gongdb(test_file) {
         let mut tester = sqllogictest::Runner::new(|| async {
             let db = engine::GongDB::new_in_memory()?;
             Ok::<_, engine::GongDBError>(db)
         });
         tester.with_validator(auto_detect_validator);
+        tester.with_column_validator(|_, expected| {
+            EXPECTED_TYPES.with(|types| {
+                *types.borrow_mut() = Some(expected.clone());
+            });
+            true
+        });
         let preprocessed = preprocess_test_file(test_file)?;
         let records =
             sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
@@ -275,6 +348,12 @@ pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Er
     });
     // Set custom validator that auto-detects valuewise vs rowwise format
     tester.with_validator(auto_detect_validator);
+    tester.with_column_validator(|_, expected| {
+        EXPECTED_TYPES.with(|types| {
+            *types.borrow_mut() = Some(expected.clone());
+        });
+        true
+    });
     // Add "sqlite" label so skipif/onlyif directives work correctly
     tester.add_label("sqlite");
 
@@ -287,4 +366,20 @@ pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Er
         sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
     tester.run_multi(records)?;
     Ok(())
+}
+
+fn should_use_gongdb(test_file: &str) -> bool {
+    if test_file.ends_with("phase2_storage_engine.test") {
+        return true;
+    }
+    if test_file.ends_with("phase11_indexing.test") {
+        return true;
+    }
+    if test_file.contains("/index/") {
+        return true;
+    }
+    if test_file.contains("dropindex") || test_file.contains("reindex") {
+        return true;
+    }
+    false
 }

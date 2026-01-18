@@ -476,6 +476,43 @@ impl GongDB {
             None
         };
         let cte_context = owned_cte_context.as_ref().or(cte_context);
+        if !select.compounds.is_empty() {
+            let mut result =
+                self.evaluate_select_values_core(select, view_stack, outer, cte_context)?;
+            for compound in &select.compounds {
+                let right = self.evaluate_select_values_with_views(
+                    &compound.select,
+                    view_stack,
+                    outer,
+                    cte_context,
+                )?;
+                if result.columns.len() != right.columns.len() {
+                    return Err(GongDBError::new(
+                        "compound select column count mismatch",
+                    ));
+                }
+                match compound.operator {
+                    crate::ast::CompoundOperator::UnionAll => {
+                        result.rows.extend(right.rows);
+                    }
+                    crate::ast::CompoundOperator::Union => {
+                        result.rows.extend(right.rows);
+                        dedup_rows(&mut result.rows);
+                    }
+                }
+            }
+            return Ok(result);
+        }
+        self.evaluate_select_values_core(select, view_stack, outer, cte_context)
+    }
+
+    fn evaluate_select_values_core(
+        &self,
+        select: &Select,
+        view_stack: &mut Vec<String>,
+        outer: Option<&EvalScope<'_>>,
+        cte_context: Option<&CteContext>,
+    ) -> Result<QueryResult, GongDBError> {
         let mut selection_applied = false;
         let source = if select.from.len() == 1 {
             if let crate::ast::TableRef::Named { name, alias } = &select.from[0] {
@@ -3200,6 +3237,16 @@ fn rows_equal(left: &[Value], right: &[Value]) -> bool {
     left.iter()
         .zip(right.iter())
         .all(|(l, r)| values_equal(l, r))
+}
+
+fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut unique: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if unique.iter().all(|existing| !rows_equal(existing, &row)) {
+            unique.push(row);
+        }
+    }
+    *rows = unique;
 }
 
 fn resolve_order_by_plans(

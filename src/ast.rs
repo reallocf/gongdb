@@ -120,6 +120,7 @@ pub struct Select {
     pub order_by: Vec<OrderByExpr>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    pub compounds: Vec<CompoundSelect>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +128,18 @@ pub enum SelectItem {
     Expr { expr: Expr, alias: Option<Ident> },
     Wildcard,
     QualifiedWildcard(ObjectName),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompoundOperator {
+    Union,
+    UnionAll,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundSelect {
+    pub operator: CompoundOperator,
+    pub select: Box<Select>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

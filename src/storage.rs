@@ -1,7 +1,7 @@
 use crate::ast::{
-    BinaryOperator, ColumnConstraint, Cte, DataType, Expr, Ident, IndexedColumn, Literal,
-    NullsOrder, ObjectName, OrderByExpr, Select, SelectItem, SortOrder, TableConstraint, TableRef,
-    UnaryOperator, With,
+    BinaryOperator, ColumnConstraint, CompoundOperator, CompoundSelect, Cte, DataType, Expr, Ident,
+    IndexedColumn, Literal, NullsOrder, ObjectName, OrderByExpr, Select, SelectItem, SortOrder,
+    TableConstraint, TableRef, UnaryOperator, With,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -2608,6 +2608,14 @@ fn encode_select(select: &Select, buf: &mut Vec<u8>) -> Result<(), StorageError>
     }
     encode_optional_expr(&select.limit, buf)?;
     encode_optional_expr(&select.offset, buf)?;
+    if select.compounds.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("too many compound selects".to_string()));
+    }
+    buf.extend_from_slice(&(select.compounds.len() as u16).to_le_bytes());
+    for compound in &select.compounds {
+        encode_compound_operator(&compound.operator, buf)?;
+        encode_select(&compound.select, buf)?;
+    }
     Ok(())
 }
 
@@ -2672,6 +2680,24 @@ fn decode_select(record: &[u8], pos: usize) -> Result<(Select, usize), StorageEr
     cursor = new_pos;
     let (offset, new_pos) = decode_optional_expr(record, cursor)?;
     cursor = new_pos;
+    let mut compounds = Vec::new();
+    if cursor < record.len() {
+        if cursor + 2 > record.len() {
+            return Err(StorageError::Corrupt("invalid select compounds".to_string()));
+        }
+        let compound_len = read_u16(record, cursor) as usize;
+        cursor += 2;
+        for _ in 0..compound_len {
+            let (operator, new_pos) = decode_compound_operator(record, cursor)?;
+            cursor = new_pos;
+            let (select, new_pos) = decode_select(record, cursor)?;
+            cursor = new_pos;
+            compounds.push(CompoundSelect {
+                operator,
+                select: Box::new(select),
+            });
+        }
+    }
     Ok((
         Select {
             with,
@@ -2684,9 +2710,38 @@ fn decode_select(record: &[u8], pos: usize) -> Result<(Select, usize), StorageEr
             order_by,
             limit,
             offset,
+            compounds,
         },
         cursor,
     ))
+}
+
+fn encode_compound_operator(op: &CompoundOperator, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    let value = match op {
+        CompoundOperator::Union => 0u8,
+        CompoundOperator::UnionAll => 1u8,
+    };
+    buf.push(value);
+    Ok(())
+}
+
+fn decode_compound_operator(
+    record: &[u8],
+    pos: usize,
+) -> Result<(CompoundOperator, usize), StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid compound operator".to_string()));
+    }
+    let op = match record[pos] {
+        0 => CompoundOperator::Union,
+        1 => CompoundOperator::UnionAll,
+        _ => {
+            return Err(StorageError::Corrupt(
+                "invalid compound operator".to_string(),
+            ))
+        }
+    };
+    Ok((op, pos + 1))
 }
 
 fn encode_with_clause(with: &Option<With>, buf: &mut Vec<u8>) -> Result<(), StorageError> {
