@@ -371,6 +371,7 @@ impl Parser {
         match self.current() {
             TokenKind::Keyword(k) if k == "SELECT" => Ok(Statement::Select(self.parse_select()?)),
             TokenKind::Keyword(k) if k == "INSERT" => Ok(Statement::Insert(self.parse_insert()?)),
+            TokenKind::Keyword(k) if k == "REPLACE" => Ok(Statement::Insert(self.parse_replace()?)),
             TokenKind::Keyword(k) if k == "UPDATE" => Ok(Statement::Update(self.parse_update()?)),
             TokenKind::Keyword(k) if k == "DELETE" => Ok(Statement::Delete(self.parse_delete()?)),
             TokenKind::Keyword(k) if k == "CREATE" => self.parse_create(),
@@ -511,6 +512,23 @@ impl Parser {
 
     fn parse_insert(&mut self) -> Result<Insert, ParserError> {
         self.expect_keyword("INSERT")?;
+        let mut on_conflict = InsertConflict::Abort;
+        if self.eat_keyword("OR") {
+            if self.eat_keyword("REPLACE") {
+                on_conflict = InsertConflict::Replace;
+            } else {
+                return Err(ParserError::new("unsupported INSERT conflict clause"));
+            }
+        }
+        self.parse_insert_body(on_conflict)
+    }
+
+    fn parse_replace(&mut self) -> Result<Insert, ParserError> {
+        self.expect_keyword("REPLACE")?;
+        self.parse_insert_body(InsertConflict::Replace)
+    }
+
+    fn parse_insert_body(&mut self, on_conflict: InsertConflict) -> Result<Insert, ParserError> {
         self.eat_keyword("INTO");
         let table = self.parse_object_name()?;
         let columns = if self.eat_symbol('(') {
@@ -541,6 +559,7 @@ impl Parser {
                 table,
                 columns,
                 source: InsertSource::Values(rows),
+                on_conflict,
             })
         } else {
             let select = self.parse_select()?;
@@ -548,6 +567,7 @@ impl Parser {
                 table,
                 columns,
                 source: InsertSource::Select(Box::new(select)),
+                on_conflict,
             })
         }
     }

@@ -61,12 +61,19 @@ pub struct Insert {
     pub table: ObjectName,
     pub columns: Vec<Ident>,
     pub source: InsertSource,
+    pub on_conflict: InsertConflict,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     Select(Box<Select>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertConflict {
+    Abort,
+    Replace,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,6 +1,6 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
-    InsertSource, Select, SelectItem, Statement, TableConstraint,
+    InsertConflict, InsertSource, Select, SelectItem, Statement, TableConstraint,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
@@ -228,33 +228,114 @@ impl GongDB {
                     .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
                     .clone();
                 let mut inserted = 0u64;
-                match insert.source {
-                    InsertSource::Values(values) => {
-                        for exprs in values {
-                            let row =
-                                build_insert_row(self, &table, &insert.columns, &exprs)?;
-                            let _ = self.storage.insert_row(&table_name, &row)?;
-                            inserted += 1;
+                let replace = matches!(insert.on_conflict, InsertConflict::Replace);
+                if replace {
+                    let unique_indexes = unique_indexes_for_table(&self.storage, &table_name);
+                    if unique_indexes.is_empty() {
+                        match &insert.source {
+                            InsertSource::Values(values) => {
+                                for exprs in values {
+                                    let row =
+                                        build_insert_row(self, &table, &insert.columns, exprs)?;
+                                    let _ = self.storage.insert_row(&table_name, &row)?;
+                                    inserted += 1;
+                                }
+                            }
+                            InsertSource::Select(select) => {
+                                let result = self.evaluate_select_values(select)?;
+                                if insert.columns.is_empty() {
+                                    if result.columns.len() != table.columns.len() {
+                                        return Err(GongDBError::new("column count mismatch"));
+                                    }
+                                } else if result.columns.len() != insert.columns.len() {
+                                    return Err(GongDBError::new("column count mismatch"));
+                                }
+                                for values in result.rows {
+                                    let row = build_insert_row_from_values(
+                                        self,
+                                        &table,
+                                        &insert.columns,
+                                        &values,
+                                    )?;
+                                    let _ = self.storage.insert_row(&table_name, &row)?;
+                                    inserted += 1;
+                                }
+                            }
                         }
+                    } else {
+                        let mut rows = self.storage.scan_table(&table_name)?;
+                        let column_map = column_index_map(&table.columns);
+                        match &insert.source {
+                            InsertSource::Values(values) => {
+                                for exprs in values {
+                                    let row =
+                                        build_insert_row(self, &table, &insert.columns, exprs)?;
+                                    apply_replace_row(
+                                        &mut rows,
+                                        row,
+                                        &unique_indexes,
+                                        &column_map,
+                                    )?;
+                                    inserted += 1;
+                                }
+                            }
+                            InsertSource::Select(select) => {
+                                let result = self.evaluate_select_values(select)?;
+                                if insert.columns.is_empty() {
+                                    if result.columns.len() != table.columns.len() {
+                                        return Err(GongDBError::new("column count mismatch"));
+                                    }
+                                } else if result.columns.len() != insert.columns.len() {
+                                    return Err(GongDBError::new("column count mismatch"));
+                                }
+                                for values in result.rows {
+                                    let row = build_insert_row_from_values(
+                                        self,
+                                        &table,
+                                        &insert.columns,
+                                        &values,
+                                    )?;
+                                    apply_replace_row(
+                                        &mut rows,
+                                        row,
+                                        &unique_indexes,
+                                        &column_map,
+                                    )?;
+                                    inserted += 1;
+                                }
+                            }
+                        }
+                        self.storage.replace_table_rows(&table_name, &rows)?;
                     }
-                    InsertSource::Select(select) => {
-                        let result = self.evaluate_select_values(&select)?;
-                        if insert.columns.is_empty() {
-                            if result.columns.len() != table.columns.len() {
+                } else {
+                    match &insert.source {
+                        InsertSource::Values(values) => {
+                            for exprs in values {
+                                let row =
+                                    build_insert_row(self, &table, &insert.columns, exprs)?;
+                                let _ = self.storage.insert_row(&table_name, &row)?;
+                                inserted += 1;
+                            }
+                        }
+                        InsertSource::Select(select) => {
+                            let result = self.evaluate_select_values(select)?;
+                            if insert.columns.is_empty() {
+                                if result.columns.len() != table.columns.len() {
+                                    return Err(GongDBError::new("column count mismatch"));
+                                }
+                            } else if result.columns.len() != insert.columns.len() {
                                 return Err(GongDBError::new("column count mismatch"));
                             }
-                        } else if result.columns.len() != insert.columns.len() {
-                            return Err(GongDBError::new("column count mismatch"));
-                        }
-                        for values in result.rows {
-                            let row = build_insert_row_from_values(
-                                self,
-                                &table,
-                                &insert.columns,
-                                &values,
-                            )?;
-                            let _ = self.storage.insert_row(&table_name, &row)?;
-                            inserted += 1;
+                            for values in result.rows {
+                                let row = build_insert_row_from_values(
+                                    self,
+                                    &table,
+                                    &insert.columns,
+                                    &values,
+                                )?;
+                                let _ = self.storage.insert_row(&table_name, &row)?;
+                                inserted += 1;
+                            }
                         }
                     }
                 }
@@ -991,6 +1072,96 @@ fn build_default_row(db: &GongDB, table: &TableMeta) -> Result<Vec<Value>, GongD
         row.push(apply_affinity(value, &column.data_type));
     }
     Ok(row)
+}
+
+fn column_index_map(columns: &[Column]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (idx, column) in columns.iter().enumerate() {
+        map.insert(column.name.to_lowercase(), idx);
+    }
+    map
+}
+
+fn unique_indexes_for_table(storage: &StorageEngine, table_name: &str) -> Vec<IndexMeta> {
+    storage
+        .list_indexes()
+        .into_iter()
+        .filter(|index| index.unique && index.table.eq_ignore_ascii_case(table_name))
+        .collect()
+}
+
+fn index_key_for_row(
+    index: &IndexMeta,
+    column_map: &HashMap<String, usize>,
+    row: &[Value],
+) -> Result<Vec<Value>, GongDBError> {
+    let mut key = Vec::with_capacity(index.columns.len());
+    for column in &index.columns {
+        let idx = column_map
+            .get(&column.name.value.to_lowercase())
+            .ok_or_else(|| {
+                GongDBError::new(format!("unknown column in index {}", column.name.value))
+            })?;
+        key.push(row[*idx].clone());
+    }
+    Ok(key)
+}
+
+fn key_has_null(values: &[Value]) -> bool {
+    values.iter().any(|value| matches!(value, Value::Null))
+}
+
+fn conflict_keys_for_row(
+    unique_indexes: &[IndexMeta],
+    column_map: &HashMap<String, usize>,
+    row: &[Value],
+) -> Result<Vec<Option<Vec<Value>>>, GongDBError> {
+    let mut keys = Vec::with_capacity(unique_indexes.len());
+    for index in unique_indexes {
+        let key = index_key_for_row(index, column_map, row)?;
+        if key_has_null(&key) {
+            keys.push(None);
+        } else {
+            keys.push(Some(key));
+        }
+    }
+    Ok(keys)
+}
+
+fn row_conflicts_with_keys(
+    row: &[Value],
+    unique_indexes: &[IndexMeta],
+    column_map: &HashMap<String, usize>,
+    conflict_keys: &[Option<Vec<Value>>],
+) -> Result<bool, GongDBError> {
+    for (index, key) in unique_indexes.iter().zip(conflict_keys.iter()) {
+        let Some(conflict_key) = key else {
+            continue;
+        };
+        let row_key = index_key_for_row(index, column_map, row)?;
+        if &row_key == conflict_key {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_replace_row(
+    rows: &mut Vec<Vec<Value>>,
+    new_row: Vec<Value>,
+    unique_indexes: &[IndexMeta],
+    column_map: &HashMap<String, usize>,
+) -> Result<(), GongDBError> {
+    let conflict_keys = conflict_keys_for_row(unique_indexes, column_map, &new_row)?;
+    let mut next_rows = Vec::with_capacity(rows.len() + 1);
+    for row in rows.drain(..) {
+        if !row_conflicts_with_keys(&row, unique_indexes, column_map, &conflict_keys)? {
+            next_rows.push(row);
+        }
+    }
+    next_rows.push(new_row);
+    *rows = next_rows;
+    Ok(())
 }
 
 fn eval_insert_expr(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
