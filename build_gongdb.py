@@ -522,14 +522,9 @@ def log_task_completed(task_id: str):
 
 
 def log_task_not_completed(task_id: str):
-    """Log that task was not completed and stop for review"""
+    """Log that task was not completed and continue to next task"""
     logger.log(f"✗ Task {task_id} was NOT completed.")
-    logger.log("Stopping for human review.")
-    logger.log("")
-    logger.log("Please review the work and either:")
-    logger.log("  1. Complete the task manually and mark it done")
-    logger.log("  2. Update the task with additional context")
-    logger.log("  3. Run this script again to continue")
+    logger.log("Continuing to next task...")
 
 
 def log_final_summary(iteration: int, remaining_tasks: int):
@@ -606,10 +601,10 @@ def main():
         # Handle task completion
         if task_completed:
             log_task_completed(task_id)
-            continue
         else:
             log_task_not_completed(task_id)
-            break
+        # Continue to next task regardless of completion status
+        continue
     
     remaining_tasks = get_total_open_tasks()
     log_final_summary(iteration, remaining_tasks)
