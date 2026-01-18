@@ -1,6 +1,7 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
-    InsertConflict, InsertSource, NullsOrder, Select, SelectItem, Statement, TableConstraint,
+    InsertConflict, InsertSource, Literal, NullsOrder, Select, SelectItem, Statement,
+    TableConstraint,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
@@ -526,7 +527,7 @@ impl GongDB {
 
         let output_columns = projection_columns(&select.projection, &columns, &column_scopes)?;
 
-        if is_count_star(select) {
+        if is_count_star(select) && select.having.is_none() {
             let count = filtered.len() as i64;
             return Ok(QueryResult {
                 columns: output_columns,
@@ -534,19 +535,73 @@ impl GongDB {
             });
         }
 
-        if let Some(aggregates) = aggregate_projections(&select.projection)? {
-            let values = compute_aggregates(
-                self,
-                &aggregates,
-                &columns,
-                &column_scopes,
-                &table_scope,
-                &filtered,
-                outer,
-            )?;
+        let projection_aggregates = aggregate_projections(&select.projection)?;
+        let having_has_aggregate = select
+            .having
+            .as_ref()
+            .is_some_and(|expr| expr_contains_aggregate(expr));
+
+        if select.having.is_some() && projection_aggregates.is_none() && !having_has_aggregate {
+            return Err(GongDBError::new("HAVING requires aggregate expressions"));
+        }
+
+        if projection_aggregates.is_some() || having_has_aggregate {
+            let aggregate_values = if let Some(aggregates) = projection_aggregates.as_ref() {
+                compute_aggregates(
+                    self,
+                    aggregates,
+                    &columns,
+                    &column_scopes,
+                    &table_scope,
+                    &filtered,
+                    outer,
+                )?
+            } else {
+                Vec::new()
+            };
+
+            if let Some(having) = &select.having {
+                let passes = eval_having_clause(
+                    self,
+                    having,
+                    &columns,
+                    &column_scopes,
+                    &table_scope,
+                    &filtered,
+                    outer,
+                )?;
+                if !passes {
+                    return Ok(QueryResult {
+                        columns: output_columns,
+                        rows: Vec::new(),
+                    });
+                }
+            }
+
+            let rows = if projection_aggregates.is_some() {
+                vec![aggregate_values]
+            } else {
+                let empty_scope = EvalScope {
+                    columns: &[],
+                    column_scopes: &[],
+                    row: &[],
+                    table_scope: &TableScope {
+                        table_name: None,
+                        table_alias: None,
+                    },
+                };
+                vec![project_row(
+                    self,
+                    &select.projection,
+                    &[],
+                    &empty_scope,
+                    outer,
+                )?]
+            };
+
             return Ok(QueryResult {
                 columns: output_columns,
-                rows: vec![values],
+                rows,
             });
         }
 
@@ -2420,6 +2475,51 @@ fn is_count_star(select: &Select) -> bool {
     }
 }
 
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function { name, args, .. } => {
+            let func_name = name.value.to_ascii_lowercase();
+            if is_aggregate_function_call(func_name.as_str(), args) {
+                true
+            } else {
+                args.iter().any(expr_contains_aggregate)
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_contains_aggregate(expr))
+                || when_then.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_aggregate(when_expr) || expr_contains_aggregate(then_expr)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_aggregate(expr))
+        }
+        Expr::Between { expr, low, high, .. } => {
+            expr_contains_aggregate(expr)
+                || expr_contains_aggregate(low)
+                || expr_contains_aggregate(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_contains_aggregate(expr) || list.iter().any(expr_contains_aggregate)
+        }
+        Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
+        Expr::IsNull { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Cast { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Nested(expr) => expr_contains_aggregate(expr),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 struct AggregateExpr {
     kind: AggregateKind,
@@ -2437,6 +2537,436 @@ enum AggregateKind {
     Max,
     Total,
     GroupConcat,
+}
+
+fn eval_having_clause(
+    db: &GongDB,
+    expr: &Expr,
+    columns: &[Column],
+    column_scopes: &[TableScope],
+    table_scope: &TableScope,
+    rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<bool, GongDBError> {
+    let rewritten = replace_aggregate_calls(db, expr, columns, column_scopes, table_scope, rows, outer)?;
+    let empty_scope = EvalScope {
+        columns: &[],
+        column_scopes: &[],
+        row: &[],
+        table_scope: &TableScope {
+            table_name: None,
+            table_alias: None,
+        },
+    };
+    let value = eval_expr(db, &rewritten, &empty_scope, outer)?;
+    Ok(value_to_bool(&value))
+}
+
+fn replace_aggregate_calls(
+    db: &GongDB,
+    expr: &Expr,
+    columns: &[Column],
+    column_scopes: &[TableScope],
+    table_scope: &TableScope,
+    rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<Expr, GongDBError> {
+    match expr {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
+            let maybe_aggregate = aggregate_expr_from_function(name, args, *distinct)?;
+            if let Some(aggregate) = maybe_aggregate {
+                let value = compute_single_aggregate(db, &aggregate, columns, column_scopes, table_scope, rows, outer)?;
+                Ok(Expr::Literal(value_to_literal(&value)))
+            } else {
+                let mut new_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    new_args.push(replace_aggregate_calls(
+                        db,
+                        arg,
+                        columns,
+                        column_scopes,
+                        table_scope,
+                        rows,
+                        outer,
+                    )?);
+                }
+                Ok(Expr::Function {
+                    name: name.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                })
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+            left: Box::new(replace_aggregate_calls(
+                db,
+                left,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+            op: op.clone(),
+            right: Box::new(replace_aggregate_calls(
+                db,
+                right,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+        }),
+        Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_aggregate_calls(
+                db,
+                expr,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+        }),
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            let new_operand = if let Some(expr) = operand {
+                Some(Box::new(replace_aggregate_calls(
+                    db,
+                    expr,
+                    columns,
+                    column_scopes,
+                    table_scope,
+                    rows,
+                    outer,
+                )?))
+            } else {
+                None
+            };
+            let mut new_when_then = Vec::with_capacity(when_then.len());
+            for (when_expr, then_expr) in when_then {
+                new_when_then.push((
+                    replace_aggregate_calls(
+                        db,
+                        when_expr,
+                        columns,
+                        column_scopes,
+                        table_scope,
+                        rows,
+                        outer,
+                    )?,
+                    replace_aggregate_calls(
+                        db,
+                        then_expr,
+                        columns,
+                        column_scopes,
+                        table_scope,
+                        rows,
+                        outer,
+                    )?,
+                ));
+            }
+            let new_else = if let Some(expr) = else_result {
+                Some(Box::new(replace_aggregate_calls(
+                    db,
+                    expr,
+                    columns,
+                    column_scopes,
+                    table_scope,
+                    rows,
+                    outer,
+                )?))
+            } else {
+                None
+            };
+            Ok(Expr::Case {
+                operand: new_operand,
+                when_then: new_when_then,
+                else_result: new_else,
+            })
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(Expr::Between {
+            expr: Box::new(replace_aggregate_calls(
+                db,
+                expr,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+            negated: *negated,
+            low: Box::new(replace_aggregate_calls(
+                db,
+                low,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+            high: Box::new(replace_aggregate_calls(
+                db,
+                high,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+        }),
+        Expr::InList { expr, list, negated } => {
+            let mut new_list = Vec::with_capacity(list.len());
+            for item in list {
+                new_list.push(replace_aggregate_calls(
+                    db,
+                    item,
+                    columns,
+                    column_scopes,
+                    table_scope,
+                    rows,
+                    outer,
+                )?);
+            }
+            Ok(Expr::InList {
+                expr: Box::new(replace_aggregate_calls(
+                    db,
+                    expr,
+                    columns,
+                    column_scopes,
+                    table_scope,
+                    rows,
+                    outer,
+                )?),
+                list: new_list,
+                negated: *negated,
+            })
+        }
+        Expr::InSubquery { expr, subquery, negated } => Ok(Expr::InSubquery {
+            expr: Box::new(replace_aggregate_calls(
+                db,
+                expr,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+            subquery: subquery.clone(),
+            negated: *negated,
+        }),
+        Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+            expr: Box::new(replace_aggregate_calls(
+                db,
+                expr,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+            negated: *negated,
+        }),
+        Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+            expr: Box::new(replace_aggregate_calls(
+                db,
+                expr,
+                columns,
+                column_scopes,
+                table_scope,
+                rows,
+                outer,
+            )?),
+            data_type: data_type.clone(),
+        }),
+        Expr::Nested(expr) => Ok(Expr::Nested(Box::new(replace_aggregate_calls(
+            db,
+            expr,
+            columns,
+            column_scopes,
+            table_scope,
+            rows,
+            outer,
+        )?))),
+        _ => Ok(expr.clone()),
+    }
+}
+
+fn aggregate_expr_from_function(
+    name: &Ident,
+    args: &[Expr],
+    distinct: bool,
+) -> Result<Option<AggregateExpr>, GongDBError> {
+    let func_name = name.value.to_ascii_lowercase();
+    match func_name.as_str() {
+        "sum" => {
+            if args.len() != 1 {
+                return Err(GongDBError::new("SUM expects one argument"));
+            }
+            Ok(Some(AggregateExpr {
+                kind: AggregateKind::Sum,
+                expr: Some(args[0].clone()),
+                distinct,
+                separator: None,
+            }))
+        }
+        "count" => {
+            if args.is_empty() || args.iter().all(|arg| matches!(arg, Expr::Wildcard)) {
+                if distinct {
+                    return Err(GongDBError::new("COUNT DISTINCT does not support *"));
+                }
+                Ok(Some(AggregateExpr {
+                    kind: AggregateKind::Count,
+                    expr: None,
+                    distinct: false,
+                    separator: None,
+                }))
+            } else if args.len() == 1 {
+                if matches!(args[0], Expr::Wildcard) {
+                    if distinct {
+                        return Err(GongDBError::new("COUNT DISTINCT does not support *"));
+                    }
+                    Ok(Some(AggregateExpr {
+                        kind: AggregateKind::Count,
+                        expr: None,
+                        distinct: false,
+                        separator: None,
+                    }))
+                } else {
+                    Ok(Some(AggregateExpr {
+                        kind: AggregateKind::Count,
+                        expr: Some(args[0].clone()),
+                        distinct,
+                        separator: None,
+                    }))
+                }
+            } else {
+                Err(GongDBError::new("COUNT expects at most one argument"))
+            }
+        }
+        "avg" => {
+            if args.len() != 1 {
+                return Err(GongDBError::new("AVG expects one argument"));
+            }
+            Ok(Some(AggregateExpr {
+                kind: AggregateKind::Avg,
+                expr: Some(args[0].clone()),
+                distinct,
+                separator: None,
+            }))
+        }
+        "min" => {
+            if args.len() == 1 {
+                Ok(Some(AggregateExpr {
+                    kind: AggregateKind::Min,
+                    expr: Some(args[0].clone()),
+                    distinct,
+                    separator: None,
+                }))
+            } else if distinct {
+                Err(GongDBError::new(
+                    "DISTINCT is only valid for single-argument aggregates",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        "max" => {
+            if args.len() == 1 {
+                Ok(Some(AggregateExpr {
+                    kind: AggregateKind::Max,
+                    expr: Some(args[0].clone()),
+                    distinct,
+                    separator: None,
+                }))
+            } else if distinct {
+                Err(GongDBError::new(
+                    "DISTINCT is only valid for single-argument aggregates",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        "total" => {
+            if args.len() != 1 {
+                return Err(GongDBError::new("TOTAL expects one argument"));
+            }
+            Ok(Some(AggregateExpr {
+                kind: AggregateKind::Total,
+                expr: Some(args[0].clone()),
+                distinct,
+                separator: None,
+            }))
+        }
+        "group_concat" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(GongDBError::new(
+                    "GROUP_CONCAT expects one or two arguments",
+                ));
+            }
+            if distinct && args.len() != 1 {
+                return Err(GongDBError::new(
+                    "DISTINCT is only valid for single-argument aggregates",
+                ));
+            }
+            Ok(Some(AggregateExpr {
+                kind: AggregateKind::GroupConcat,
+                expr: Some(args[0].clone()),
+                distinct,
+                separator: if args.len() == 2 {
+                    Some(args[1].clone())
+                } else {
+                    None
+                },
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn compute_single_aggregate(
+    db: &GongDB,
+    aggregate: &AggregateExpr,
+    columns: &[Column],
+    column_scopes: &[TableScope],
+    table_scope: &TableScope,
+    rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
+) -> Result<Value, GongDBError> {
+    let mut values = compute_aggregates(
+        db,
+        std::slice::from_ref(aggregate),
+        columns,
+        column_scopes,
+        table_scope,
+        rows,
+        outer,
+    )?;
+    Ok(values.pop().unwrap_or(Value::Null))
+}
+
+fn value_to_literal(value: &Value) -> Literal {
+    match value {
+        Value::Null => Literal::Null,
+        Value::Integer(v) => Literal::Integer(*v),
+        Value::Real(v) => Literal::Float(*v),
+        Value::Text(text) => Literal::String(text.clone()),
+        Value::Blob(bytes) => Literal::Blob(bytes.clone()),
+    }
 }
 
 fn aggregate_projections(
