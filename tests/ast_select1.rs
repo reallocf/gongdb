@@ -266,6 +266,7 @@ fn build_select1_sample_ast() -> Vec<Statement> {
         order_by: vec![OrderByExpr {
             expr: Expr::Identifier(Ident::new("a")),
             asc: Some(true),
+            nulls: None,
         }],
         limit: None,
         offset: None,

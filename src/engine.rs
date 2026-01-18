@@ -1,6 +1,6 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
-    InsertConflict, InsertSource, Select, SelectItem, Statement, TableConstraint,
+    InsertConflict, InsertSource, NullsOrder, Select, SelectItem, Statement, TableConstraint,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
@@ -550,59 +550,56 @@ impl GongDB {
             });
         }
 
-        if !select.order_by.is_empty() {
-            let order_by = select.order_by.clone();
-            filtered.sort_by(|a, b| {
-                compare_order_by(
-                    self,
-                    &order_by,
-                    &columns,
-                    &column_scopes,
-                    &table_scope,
-                    outer,
-                    a,
-                    b,
-                )
-            });
-        }
+        let order_plans = if select.order_by.is_empty() {
+            Vec::new()
+        } else {
+            resolve_order_by_plans(&select.order_by, &output_columns)?
+        };
 
-        let mut projected = Vec::new();
-        for row in filtered {
-            let scope = EvalScope {
-                columns: &columns,
-                column_scopes: &column_scopes,
-                row: &row,
-                table_scope: &table_scope,
-            };
-            let mut output = Vec::new();
-            for item in &select.projection {
-                match item {
-                    SelectItem::Wildcard => {
-                        for value in &row {
-                            output.push(value.clone());
-                        }
-                    }
-                    SelectItem::Expr { expr, .. } => {
-                        let value = eval_expr(self, expr, &scope, outer)?;
-                        output.push(value);
-                    }
-                    SelectItem::QualifiedWildcard(name) => {
-                        let qualifier = object_name(name);
-                        let indices = qualified_wildcard_indices(&qualifier, &column_scopes);
-                        if indices.is_empty() {
-                            return Err(GongDBError::new(format!(
-                                "unknown table: {}",
-                                qualifier
-                            )));
-                        }
-                        for idx in indices {
-                            output.push(row[idx].clone());
-                        }
-                    }
-                }
+        let projected = if order_plans.is_empty() {
+            let mut rows = Vec::with_capacity(filtered.len());
+            for row in filtered {
+                let scope = EvalScope {
+                    columns: &columns,
+                    column_scopes: &column_scopes,
+                    row: &row,
+                    table_scope: &table_scope,
+                };
+                rows.push(project_row(
+                    self,
+                    &select.projection,
+                    &row,
+                    &scope,
+                    outer,
+                )?);
             }
-            projected.push(output);
-        }
+            rows
+        } else {
+            let mut rows = Vec::with_capacity(filtered.len());
+            for row in filtered {
+                let scope = EvalScope {
+                    columns: &columns,
+                    column_scopes: &column_scopes,
+                    row: &row,
+                    table_scope: &table_scope,
+                };
+                let projected_row = project_row(
+                    self,
+                    &select.projection,
+                    &row,
+                    &scope,
+                    outer,
+                )?;
+                let order_values =
+                    compute_order_values(self, &order_plans, &projected_row, &scope, outer)?;
+                rows.push(SortedRow {
+                    order_values,
+                    projected: projected_row,
+                });
+            }
+            rows.sort_by(|a, b| compare_order_keys(&a.order_values, &b.order_values, &order_plans));
+            rows.into_iter().map(|row| row.projected).collect()
+        };
 
         Ok(QueryResult {
             columns: output_columns,
@@ -2157,38 +2154,163 @@ fn values_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
-fn compare_order_by(
-    db: &GongDB,
+#[derive(Clone)]
+enum OrderByValueSource {
+    Expr(Expr),
+    ProjectionIndex(usize),
+}
+
+#[derive(Clone)]
+struct OrderByPlan {
+    source: OrderByValueSource,
+    asc: bool,
+    nulls: Option<NullsOrder>,
+}
+
+struct SortedRow {
+    order_values: Vec<Value>,
+    projected: Vec<Value>,
+}
+
+fn resolve_order_by_plans(
     order_by: &[crate::ast::OrderByExpr],
-    columns: &[Column],
-    column_scopes: &[TableScope],
-    table_scope: &TableScope,
-    outer: Option<&EvalScope<'_>>,
-    a: &[Value],
-    b: &[Value],
-) -> std::cmp::Ordering {
+    output_columns: &[Column],
+) -> Result<Vec<OrderByPlan>, GongDBError> {
+    let output_names: Vec<String> = output_columns.iter().map(|col| col.name.clone()).collect();
+    let mut plans = Vec::with_capacity(order_by.len());
     for order in order_by {
         let asc = order.asc.unwrap_or(true);
-        let left_scope = EvalScope {
-            columns,
-            column_scopes,
-            row: a,
-            table_scope,
+        let source = match &order.expr {
+            Expr::Literal(crate::ast::Literal::Integer(idx)) => {
+                if *idx <= 0 || (*idx as usize) > output_columns.len() {
+                    return Err(GongDBError::new("ORDER BY position out of range"));
+                }
+                OrderByValueSource::ProjectionIndex((*idx as usize) - 1)
+            }
+            Expr::Identifier(ident) => {
+                if let Some(pos) = output_names
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(&ident.value))
+                {
+                    OrderByValueSource::ProjectionIndex(pos)
+                } else {
+                    OrderByValueSource::Expr(order.expr.clone())
+                }
+            }
+            _ => OrderByValueSource::Expr(order.expr.clone()),
         };
-        let right_scope = EvalScope {
-            columns,
-            column_scopes,
-            row: b,
-            table_scope,
+        plans.push(OrderByPlan {
+            source,
+            asc,
+            nulls: order.nulls.clone(),
+        });
+    }
+    Ok(plans)
+}
+
+fn project_row(
+    db: &GongDB,
+    projection: &[SelectItem],
+    row: &[Value],
+    scope: &EvalScope<'_>,
+    outer: Option<&EvalScope<'_>>,
+) -> Result<Vec<Value>, GongDBError> {
+    let mut output = Vec::new();
+    for item in projection {
+        match item {
+            SelectItem::Wildcard => {
+                output.extend(row.iter().cloned());
+            }
+            SelectItem::Expr { expr, .. } => {
+                let value = eval_expr(db, expr, scope, outer)?;
+                output.push(value);
+            }
+            SelectItem::QualifiedWildcard(name) => {
+                let qualifier = object_name(name);
+                let indices = qualified_wildcard_indices(&qualifier, scope.column_scopes);
+                if indices.is_empty() {
+                    return Err(GongDBError::new(format!("unknown table: {}", qualifier)));
+                }
+                for idx in indices {
+                    output.push(row[idx].clone());
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn compute_order_values(
+    db: &GongDB,
+    plans: &[OrderByPlan],
+    projected_row: &[Value],
+    scope: &EvalScope<'_>,
+    outer: Option<&EvalScope<'_>>,
+) -> Result<Vec<Value>, GongDBError> {
+    let mut values = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let value = match &plan.source {
+            OrderByValueSource::Expr(expr) => eval_expr(db, expr, scope, outer)?,
+            OrderByValueSource::ProjectionIndex(idx) => {
+                projected_row.get(*idx).cloned().unwrap_or(Value::Null)
+            }
         };
-        let left = eval_expr(db, &order.expr, &left_scope, outer).unwrap_or(Value::Null);
-        let right = eval_expr(db, &order.expr, &right_scope, outer).unwrap_or(Value::Null);
-        let ord = compare_order_values(&left, &right);
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn compare_order_keys(
+    left: &[Value],
+    right: &[Value],
+    plans: &[OrderByPlan],
+) -> std::cmp::Ordering {
+    for (idx, plan) in plans.iter().enumerate() {
+        let left_val = &left[idx];
+        let right_val = &right[idx];
+        let ord = compare_order_values_with_nulls(left_val, right_val, plan.asc, plan.nulls.as_ref());
         if ord != std::cmp::Ordering::Equal {
-            return if asc { ord } else { ord.reverse() };
+            return ord;
         }
     }
     std::cmp::Ordering::Equal
+}
+
+fn compare_order_values_with_nulls(
+    left: &Value,
+    right: &Value,
+    asc: bool,
+    nulls: Option<&NullsOrder>,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) | (_, Value::Null) => {
+            let nulls_first = match nulls {
+                Some(NullsOrder::First) => true,
+                Some(NullsOrder::Last) => false,
+                None => asc,
+            };
+            if matches!(left, Value::Null) {
+                if nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            } else if nulls_first {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        _ => {
+            let ord = compare_order_values(left, right);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        }
+    }
 }
 
 fn compare_order_values(left: &Value, right: &Value) -> std::cmp::Ordering {

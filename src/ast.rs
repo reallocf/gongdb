@@ -146,6 +146,13 @@ pub enum JoinConstraint {
 pub struct OrderByExpr {
     pub expr: Expr,
     pub asc: Option<bool>,
+    pub nulls: Option<NullsOrder>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NullsOrder {
+    First,
+    Last,
 }
 
 #[derive(Debug, Clone, PartialEq)]

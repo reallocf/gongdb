@@ -1,6 +1,7 @@
 use crate::ast::{
     BinaryOperator, ColumnConstraint, DataType, Expr, Ident, IndexedColumn, Literal, ObjectName,
-    OrderByExpr, Select, SelectItem, SortOrder, TableConstraint, TableRef, UnaryOperator,
+    NullsOrder, OrderByExpr, Select, SelectItem, SortOrder, TableConstraint, TableRef,
+    UnaryOperator,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -2289,10 +2290,16 @@ fn decode_table_ref(record: &[u8], pos: usize) -> Result<(TableRef, usize), Stor
 
 fn encode_order_by_expr(order: &OrderByExpr, buf: &mut Vec<u8>) -> Result<(), StorageError> {
     encode_expr(&order.expr, buf)?;
-    let tag = match order.asc {
-        None => 0,
-        Some(true) => 1,
-        Some(false) => 2,
+    let tag = match (order.asc, order.nulls.as_ref()) {
+        (None, None) => 0,
+        (Some(true), None) => 1,
+        (Some(false), None) => 2,
+        (None, Some(NullsOrder::First)) => 3,
+        (None, Some(NullsOrder::Last)) => 4,
+        (Some(true), Some(NullsOrder::First)) => 5,
+        (Some(true), Some(NullsOrder::Last)) => 6,
+        (Some(false), Some(NullsOrder::First)) => 7,
+        (Some(false), Some(NullsOrder::Last)) => 8,
     };
     buf.push(tag);
     Ok(())
@@ -2303,10 +2310,16 @@ fn decode_order_by_expr(record: &[u8], pos: usize) -> Result<(OrderByExpr, usize
     if cursor >= record.len() {
         return Err(StorageError::Corrupt("invalid order by expr".to_string()));
     }
-    let asc = match record[cursor] {
-        0 => None,
-        1 => Some(true),
-        2 => Some(false),
+    let (asc, nulls) = match record[cursor] {
+        0 => (None, None),
+        1 => (Some(true), None),
+        2 => (Some(false), None),
+        3 => (None, Some(NullsOrder::First)),
+        4 => (None, Some(NullsOrder::Last)),
+        5 => (Some(true), Some(NullsOrder::First)),
+        6 => (Some(true), Some(NullsOrder::Last)),
+        7 => (Some(false), Some(NullsOrder::First)),
+        8 => (Some(false), Some(NullsOrder::Last)),
         tag => {
             return Err(StorageError::Corrupt(format!(
                 "unknown order by tag {}",
@@ -2315,7 +2328,7 @@ fn decode_order_by_expr(record: &[u8], pos: usize) -> Result<(OrderByExpr, usize
         }
     };
     cursor += 1;
-    Ok((OrderByExpr { expr, asc }, cursor))
+    Ok((OrderByExpr { expr, asc, nulls }, cursor))
 }
 
 fn encode_optional_expr(expr: &Option<Expr>, buf: &mut Vec<u8>) -> Result<(), StorageError> {

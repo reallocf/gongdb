@@ -795,7 +795,18 @@ impl Parser {
             } else {
                 None
             };
-            items.push(OrderByExpr { expr, asc });
+            let nulls = if self.eat_keyword("NULLS") {
+                if self.eat_keyword("FIRST") {
+                    Some(crate::ast::NullsOrder::First)
+                } else if self.eat_keyword("LAST") {
+                    Some(crate::ast::NullsOrder::Last)
+                } else {
+                    return Err(ParserError::new("expected FIRST or LAST after NULLS"));
+                }
+            } else {
+                None
+            };
+            items.push(OrderByExpr { expr, asc, nulls });
             if !self.eat_symbol(',') {
                 break;
             }
