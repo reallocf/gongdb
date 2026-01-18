@@ -1465,6 +1465,30 @@ fn eval_expr<'a, 'b>(
                 _ => Err(GongDBError::new("unsupported function")),
             }
         }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let left_val = eval_expr(db, left, scope, outer)?;
+            if matches!(value_to_truth_value(&left_val), Some(false)) {
+                return Ok(Value::Integer(0));
+            }
+            let right_val = eval_expr(db, right, scope, outer)?;
+            Ok(apply_logical_and(&left_val, &right_val))
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => {
+            let left_val = eval_expr(db, left, scope, outer)?;
+            if matches!(value_to_truth_value(&left_val), Some(true)) {
+                return Ok(Value::Integer(1));
+            }
+            let right_val = eval_expr(db, right, scope, outer)?;
+            Ok(apply_logical_or(&left_val, &right_val))
+        }
         Expr::BinaryOp { left, op, right } => {
             let left_val = eval_expr(db, left, scope, outer)?;
             let right_val = eval_expr(db, right, scope, outer)?;

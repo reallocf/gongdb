@@ -226,14 +226,19 @@ async fn test_phase_6() {
     run_phase_tests(&test_files, "6 (DML)").await;
 }
 
-/// Phase 7: Query Execution
-/// Tests table scan, WHERE, projection, ORDER BY, DISTINCT
+/// Phase 7: Query Execution - WHERE Clause Filtering
+/// Tests select1 and random/select suites
 #[tokio::test]
 async fn test_phase_7() {
-    run_phase_tests(&[
-        "tests/sqlite/select1.test",
-        "tests/sqlite/select2.test",
-    ], "7 (Query Execution)").await;
+    let mut test_files = Vec::new();
+    collect_test_files(Path::new("tests/sqlite/random/select"), &mut test_files)
+        .expect("Failed to collect random/select test files");
+    test_files.sort();
+    let mut phase_tests = Vec::new();
+    phase_tests.push("tests/sqlite/select1.test".to_string());
+    phase_tests.extend(test_files);
+    let test_files: Vec<&str> = phase_tests.iter().map(|s| s.as_str()).collect();
+    run_phase_tests(&test_files, "7 (WHERE Clause Filtering)").await;
 }
 
 /// Phase 8: Aggregation
