@@ -783,6 +783,34 @@ fn eval_expr(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value, Go
             let value = eval_expr(expr, columns, row)?;
             Ok(cast_value(value, data_type))
         }
+        Expr::Case {
+            operand,
+            when_then,
+            else_result,
+        } => {
+            let operand_value = match operand {
+                Some(expr) => Some(eval_expr(expr, columns, row)?),
+                None => None,
+            };
+            for (when_expr, then_expr) in when_then {
+                let is_match = if let Some(ref value) = operand_value {
+                    let when_value = eval_expr(when_expr, columns, row)?;
+                    let comparison = compare_values(&BinaryOperator::Eq, value, &when_value);
+                    value_to_bool(&comparison)
+                } else {
+                    let condition = eval_expr(when_expr, columns, row)?;
+                    value_to_bool(&condition)
+                };
+                if is_match {
+                    return eval_expr(then_expr, columns, row);
+                }
+            }
+            if let Some(expr) = else_result {
+                eval_expr(expr, columns, row)
+            } else {
+                Ok(Value::Null)
+            }
+        }
         _ => Err(GongDBError::new(
             "unsupported expression in phase 2",
         )),
