@@ -263,20 +263,30 @@ impl GongDB {
 
     fn evaluate_select_values(&self, select: &Select) -> Result<QueryResult, GongDBError> {
         let mut view_stack = Vec::new();
-        self.evaluate_select_values_with_views(select, &mut view_stack)
+        self.evaluate_select_values_with_views(select, &mut view_stack, None)
     }
 
     fn evaluate_select_values_with_views(
         &self,
         select: &Select,
         view_stack: &mut Vec<String>,
+        outer: Option<&EvalScope<'_>>,
     ) -> Result<QueryResult, GongDBError> {
         let source = self.resolve_source(select, view_stack)?;
-        let columns = source.columns;
+        let QuerySource {
+            columns,
+            rows,
+            table_scope,
+        } = source;
         let mut filtered = Vec::new();
-        for row in source.rows {
+        for row in rows {
+            let scope = EvalScope {
+                columns: &columns,
+                row: &row,
+                table_scope: &table_scope,
+            };
             if let Some(predicate) = &select.selection {
-                let value = eval_expr(predicate, &columns, &row)?;
+                let value = eval_expr(self, predicate, &scope, outer)?;
                 if !value_to_bool(&value) {
                     continue;
                 }
@@ -295,7 +305,8 @@ impl GongDB {
         }
 
         if let Some(aggregates) = aggregate_projections(&select.projection)? {
-            let values = compute_aggregates(&aggregates, &columns, &filtered)?;
+            let values =
+                compute_aggregates(self, &aggregates, &columns, &table_scope, &filtered, outer)?;
             return Ok(QueryResult {
                 columns: output_columns,
                 rows: vec![values],
@@ -304,11 +315,18 @@ impl GongDB {
 
         if !select.order_by.is_empty() {
             let order_by = select.order_by.clone();
-            filtered.sort_by(|a, b| compare_order_by(&order_by, &columns, a, b));
+            filtered.sort_by(|a, b| {
+                compare_order_by(self, &order_by, &columns, &table_scope, outer, a, b)
+            });
         }
 
         let mut projected = Vec::new();
         for row in filtered {
+            let scope = EvalScope {
+                columns: &columns,
+                row: &row,
+                table_scope: &table_scope,
+            };
             let mut output = Vec::new();
             for item in &select.projection {
                 match item {
@@ -318,7 +336,7 @@ impl GongDB {
                         }
                     }
                     SelectItem::Expr { expr, .. } => {
-                        let value = eval_expr(expr, &columns, &row)?;
+                        let value = eval_expr(self, expr, &scope, outer)?;
                         output.push(value);
                     }
                     _ => {
@@ -337,6 +355,15 @@ impl GongDB {
         })
     }
 
+    fn evaluate_select_values_with_outer(
+        &self,
+        select: &Select,
+        outer: Option<&EvalScope<'_>>,
+    ) -> Result<QueryResult, GongDBError> {
+        let mut view_stack = Vec::new();
+        self.evaluate_select_values_with_views(select, &mut view_stack, outer)
+    }
+
     fn resolve_source(
         &self,
         select: &Select,
@@ -348,13 +375,18 @@ impl GongDB {
             ));
         }
         match &select.from[0] {
-            crate::ast::TableRef::Named { name, .. } => {
+            crate::ast::TableRef::Named { name, alias } => {
                 let table_name = object_name(name);
+                let table_alias = alias.as_ref().map(|ident| ident.value.clone());
                 if let Some(table) = self.storage.get_table(&table_name) {
                     let rows = self.storage.scan_table(&table_name)?;
                     return Ok(QuerySource {
                         columns: table.columns.clone(),
                         rows,
+                        table_scope: TableScope {
+                            table_name: Some(table_name),
+                            table_alias,
+                        },
                     });
                 }
                 if let Some(view) = self.storage.get_view(&table_name) {
@@ -368,7 +400,8 @@ impl GongDB {
                         )));
                     }
                     view_stack.push(table_name.clone());
-                    let mut result = self.evaluate_select_values_with_views(&view.query, view_stack)?;
+                    let mut result =
+                        self.evaluate_select_values_with_views(&view.query, view_stack, None)?;
                     view_stack.pop();
                     if !view.columns.is_empty() {
                         if view.columns.len() != result.columns.len() {
@@ -382,6 +415,10 @@ impl GongDB {
                     return Ok(QuerySource {
                         columns: result.columns,
                         rows: result.rows,
+                        table_scope: TableScope {
+                            table_name: Some(table_name),
+                            table_alias,
+                        },
                     });
                 }
                 Err(GongDBError::new(format!(
@@ -411,11 +448,37 @@ impl sqllogictest::AsyncDB for GongDB {
 struct QuerySource {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
+    table_scope: TableScope,
 }
 
 struct QueryResult {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
+}
+
+#[derive(Clone, Debug)]
+struct TableScope {
+    table_name: Option<String>,
+    table_alias: Option<String>,
+}
+
+impl TableScope {
+    fn matches_qualifier(&self, qualifier: &str) -> bool {
+        if let Some(alias) = &self.table_alias {
+            return alias.eq_ignore_ascii_case(qualifier);
+        }
+        if let Some(name) = &self.table_name {
+            return name.eq_ignore_ascii_case(qualifier);
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EvalScope<'a> {
+    columns: &'a [Column],
+    row: &'a [Value],
+    table_scope: &'a TableScope,
 }
 
 fn column_from_def(def: ColumnDef) -> Column {
@@ -746,23 +809,69 @@ fn eval_literal(expr: &Expr) -> Result<Value, GongDBError> {
     }
 }
 
-fn eval_expr(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value, GongDBError> {
+fn resolve_column_index(name: &str, columns: &[Column]) -> Option<usize> {
+    columns
+        .iter()
+        .position(|col| col.name.eq_ignore_ascii_case(name))
+}
+
+fn split_qualified_identifier(idents: &[Ident]) -> Result<(&str, &str), GongDBError> {
+    if idents.len() < 2 {
+        return Err(GongDBError::new("invalid qualified identifier"));
+    }
+    let column = &idents[idents.len() - 1].value;
+    let qualifier = &idents[idents.len() - 2].value;
+    Ok((qualifier.as_str(), column.as_str()))
+}
+
+fn eval_expr<'a, 'b>(
+    db: &GongDB,
+    expr: &Expr,
+    scope: &EvalScope<'a>,
+    outer: Option<&EvalScope<'b>>,
+) -> Result<Value, GongDBError> {
     match expr {
         Expr::Literal(_) => eval_literal(expr),
         Expr::Identifier(ident) => {
-            let idx = columns
-                .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(&ident.value))
-                .ok_or_else(|| GongDBError::new(format!("unknown column {}", ident.value)))?;
-            Ok(row[idx].clone())
+            if let Some(idx) = resolve_column_index(&ident.value, scope.columns) {
+                return Ok(scope.row[idx].clone());
+            }
+            if let Some(outer_scope) = outer {
+                if let Some(idx) = resolve_column_index(&ident.value, outer_scope.columns) {
+                    return Ok(outer_scope.row[idx].clone());
+                }
+            }
+            Err(GongDBError::new(format!(
+                "unknown column {}",
+                ident.value
+            )))
+        }
+        Expr::CompoundIdentifier(idents) => {
+            let (qualifier, column) = split_qualified_identifier(idents)?;
+            if scope.table_scope.matches_qualifier(qualifier) {
+                if let Some(idx) = resolve_column_index(column, scope.columns) {
+                    return Ok(scope.row[idx].clone());
+                }
+            }
+            if let Some(outer_scope) = outer {
+                if outer_scope.table_scope.matches_qualifier(qualifier) {
+                    if let Some(idx) = resolve_column_index(column, outer_scope.columns) {
+                        return Ok(outer_scope.row[idx].clone());
+                    }
+                }
+            }
+            Err(GongDBError::new(format!(
+                "unknown column {}",
+                column
+            )))
         }
         Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_expr(left, columns, row)?;
-            let right_val = eval_expr(right, columns, row)?;
+            let left_val = eval_expr(db, left, scope, outer)?;
+            let right_val = eval_expr(db, right, scope, outer)?;
             apply_binary_op(op, left_val, right_val)
         }
         Expr::UnaryOp { op, expr } => {
-            let value = eval_expr(expr, columns, row)?;
+            let value = eval_expr(db, expr, scope, outer)?;
             match op {
                 crate::ast::UnaryOperator::Plus => Ok(value),
                 crate::ast::UnaryOperator::Minus => match value {
@@ -775,12 +884,12 @@ fn eval_expr(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value, Go
             }
         }
         Expr::IsNull { expr, negated } => {
-            let value = eval_expr(expr, columns, row)?;
+            let value = eval_expr(db, expr, scope, outer)?;
             let is_null = matches!(value, Value::Null);
             Ok(Value::Integer((if *negated { !is_null } else { is_null }) as i64))
         }
         Expr::Cast { expr, data_type } => {
-            let value = eval_expr(expr, columns, row)?;
+            let value = eval_expr(db, expr, scope, outer)?;
             Ok(cast_value(value, data_type))
         }
         Expr::Case {
@@ -789,28 +898,51 @@ fn eval_expr(expr: &Expr, columns: &[Column], row: &[Value]) -> Result<Value, Go
             else_result,
         } => {
             let operand_value = match operand {
-                Some(expr) => Some(eval_expr(expr, columns, row)?),
+                Some(expr) => Some(eval_expr(db, expr, scope, outer)?),
                 None => None,
             };
             for (when_expr, then_expr) in when_then {
                 let is_match = if let Some(ref value) = operand_value {
-                    let when_value = eval_expr(when_expr, columns, row)?;
+                    let when_value = eval_expr(db, when_expr, scope, outer)?;
                     let comparison = compare_values(&BinaryOperator::Eq, value, &when_value);
                     value_to_bool(&comparison)
                 } else {
-                    let condition = eval_expr(when_expr, columns, row)?;
+                    let condition = eval_expr(db, when_expr, scope, outer)?;
                     value_to_bool(&condition)
                 };
                 if is_match {
-                    return eval_expr(then_expr, columns, row);
+                    return eval_expr(db, then_expr, scope, outer);
                 }
             }
             if let Some(expr) = else_result {
-                eval_expr(expr, columns, row)
+                eval_expr(db, expr, scope, outer)
             } else {
                 Ok(Value::Null)
             }
         }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let expr_val = eval_expr(db, expr, scope, outer)?;
+            let low_val = eval_expr(db, low, scope, outer)?;
+            let high_val = eval_expr(db, high, scope, outer)?;
+            let lower_cmp = compare_values(&BinaryOperator::GtEq, &expr_val, &low_val);
+            let upper_cmp = compare_values(&BinaryOperator::LtEq, &expr_val, &high_val);
+            let between = apply_logical_and(&lower_cmp, &upper_cmp);
+            if *negated {
+                Ok(apply_logical_not(between))
+            } else {
+                Ok(between)
+            }
+        }
+        Expr::Exists(subquery) => {
+            let result = db.evaluate_select_values_with_outer(subquery, Some(scope))?;
+            Ok(Value::Integer((!result.rows.is_empty()) as i64))
+        }
+        Expr::Nested(expr) => eval_expr(db, expr, scope, outer),
         _ => Err(GongDBError::new(
             "unsupported expression in phase 2",
         )),
@@ -1203,15 +1335,28 @@ fn values_equal(left: &Value, right: &Value) -> bool {
 }
 
 fn compare_order_by(
+    db: &GongDB,
     order_by: &[crate::ast::OrderByExpr],
     columns: &[Column],
+    table_scope: &TableScope,
+    outer: Option<&EvalScope<'_>>,
     a: &[Value],
     b: &[Value],
 ) -> std::cmp::Ordering {
     for order in order_by {
         let asc = order.asc.unwrap_or(true);
-        let left = eval_expr(&order.expr, columns, a).unwrap_or(Value::Null);
-        let right = eval_expr(&order.expr, columns, b).unwrap_or(Value::Null);
+        let left_scope = EvalScope {
+            columns,
+            row: a,
+            table_scope,
+        };
+        let right_scope = EvalScope {
+            columns,
+            row: b,
+            table_scope,
+        };
+        let left = eval_expr(db, &order.expr, &left_scope, outer).unwrap_or(Value::Null);
+        let right = eval_expr(db, &order.expr, &right_scope, outer).unwrap_or(Value::Null);
         let ord = compare_order_values(&left, &right);
         if ord != std::cmp::Ordering::Equal {
             return if asc { ord } else { ord.reverse() };
@@ -1339,9 +1484,12 @@ fn aggregate_projections(
 }
 
 fn compute_aggregates(
+    db: &GongDB,
     aggregates: &[AggregateExpr],
     columns: &[Column],
+    table_scope: &TableScope,
     rows: &[Vec<Value>],
+    outer: Option<&EvalScope<'_>>,
 ) -> Result<Vec<Value>, GongDBError> {
     let mut results = Vec::with_capacity(aggregates.len());
     for agg in aggregates {
@@ -1350,7 +1498,12 @@ fn compute_aggregates(
                 let count = if let Some(expr) = &agg.expr {
                     let mut tally = 0i64;
                     for row in rows {
-                        let value = eval_expr(expr, columns, row)?;
+                        let scope = EvalScope {
+                            columns,
+                            row,
+                            table_scope,
+                        };
+                        let value = eval_expr(db, expr, &scope, outer)?;
                         if !matches!(value, Value::Null) {
                             tally += 1;
                         }
@@ -1370,7 +1523,12 @@ fn compute_aggregates(
                 let mut any_real = false;
                 let mut has_value = false;
                 for row in rows {
-                    let value = eval_expr(expr, columns, row)?;
+                    let scope = EvalScope {
+                        columns,
+                        row,
+                        table_scope,
+                    };
+                    let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
                         continue;
                     }
