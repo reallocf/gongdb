@@ -524,7 +524,7 @@ impl GongDB {
             filtered.push(row);
         }
 
-        let output_columns = projection_columns(&select.projection, &columns)?;
+        let output_columns = projection_columns(&select.projection, &columns, &column_scopes)?;
 
         if is_count_star(select) {
             let count = filtered.len() as i64;
@@ -586,10 +586,18 @@ impl GongDB {
                         let value = eval_expr(self, expr, &scope, outer)?;
                         output.push(value);
                     }
-                    _ => {
-                        return Err(GongDBError::new(
-                            "qualified wildcard not supported in phase 2",
-                        ))
+                    SelectItem::QualifiedWildcard(name) => {
+                        let qualifier = object_name(name);
+                        let indices = qualified_wildcard_indices(&qualifier, &column_scopes);
+                        if indices.is_empty() {
+                            return Err(GongDBError::new(format!(
+                                "unknown table: {}",
+                                qualifier
+                            )));
+                        }
+                        for idx in indices {
+                            output.push(row[idx].clone());
+                        }
                     }
                 }
             }
@@ -1019,9 +1027,24 @@ fn object_name(name: &crate::ast::ObjectName) -> String {
         .join(".")
 }
 
+fn qualified_wildcard_indices(qualifier: &str, column_scopes: &[TableScope]) -> Vec<usize> {
+    column_scopes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, scope)| {
+            if scope.matches_qualifier(qualifier) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn projection_columns(
     projection: &[SelectItem],
     source_columns: &[Column],
+    column_scopes: &[TableScope],
 ) -> Result<Vec<Column>, GongDBError> {
     let mut columns = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
@@ -1048,10 +1071,16 @@ fn projection_columns(
                     constraints: Vec::new(),
                 });
             }
-            SelectItem::QualifiedWildcard(_) => {
-                return Err(GongDBError::new(
-                    "qualified wildcard not supported in phase 2",
-                ))
+            SelectItem::QualifiedWildcard(name) => {
+                let qualifier = object_name(name);
+                let indices = qualified_wildcard_indices(&qualifier, column_scopes);
+                if indices.is_empty() {
+                    return Err(GongDBError::new(format!(
+                        "unknown table: {}",
+                        qualifier
+                    )));
+                }
+                columns.extend(indices.into_iter().map(|idx| source_columns[idx].clone()));
             }
         }
     }
