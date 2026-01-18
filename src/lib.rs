@@ -1,6 +1,4 @@
-use sqllogictest::{DBOutput, DefaultColumnType, Normalizer};
-use rusqlite::Connection;
-use async_trait::async_trait;
+use sqllogictest::{DefaultColumnType, Normalizer};
 use regex::Regex;
 use md5::{Digest, Md5};
 use std::cell::RefCell;
@@ -13,65 +11,6 @@ pub mod engine;
 
 thread_local! {
     static EXPECTED_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = RefCell::new(None);
-}
-
-pub struct SQLiteDB {
-    conn: Connection,
-}
-
-#[async_trait]
-impl sqllogictest::AsyncDB for SQLiteDB {
-    type Error = rusqlite::Error;
-    type ColumnType = DefaultColumnType;
-
-    async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-        // Check if it's a query (SELECT) or a statement
-        let sql_upper = sql.trim().to_uppercase();
-        
-        if sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH") {
-            // It's a query - return results
-            let mut stmt = self.conn.prepare(sql)?;
-            let column_count = stmt.column_count();
-            let mut rows = stmt.query([])?;
-            
-            let mut all_rows = Vec::new();
-            while let Some(row) = rows.next()? {
-                let mut values = Vec::new();
-                for i in 0..column_count {
-                    use rusqlite::types::ValueRef;
-                    let value = match row.get_ref(i).unwrap() {
-                        ValueRef::Null => "NULL".to_string(),
-                        ValueRef::Integer(i) => i.to_string(),
-                        ValueRef::Real(f) => (f.trunc() as i64).to_string(),
-                        ValueRef::Text(s) => String::from_utf8_lossy(s).to_string(),
-                        ValueRef::Blob(_) => "NULL".to_string(),
-                    };
-                    values.push(value);
-                }
-                all_rows.push(values);
-            }
-            
-            Ok(DBOutput::Rows {
-                types: vec![DefaultColumnType::Text; column_count],
-                rows: all_rows,
-            })
-        } else {
-            // It's a statement - execute it
-            self.conn.execute(sql, [])?;
-            Ok(DBOutput::StatementComplete(0))
-        }
-    }
-
-    async fn shutdown(&mut self) {
-        // SQLite connection will be closed when dropped
-    }
-}
-
-impl SQLiteDB {
-    pub fn new() -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open_in_memory()?;
-        Ok(SQLiteDB { conn })
-    }
 }
 
 /// Custom validator that auto-detects valuewise vs rowwise format and handles hash-based comparison
@@ -323,28 +262,9 @@ fn preprocess_test_file(test_file: &str) -> Result<String, Box<dyn std::error::E
 
 /// Helper function to run a single test file
 pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if should_use_gongdb(test_file) {
-        let mut tester = sqllogictest::Runner::new(|| async {
-            let db = engine::GongDB::new_in_memory()?;
-            Ok::<_, engine::GongDBError>(db)
-        });
-        tester.with_validator(auto_detect_validator);
-        tester.with_column_validator(|_, expected| {
-            EXPECTED_TYPES.with(|types| {
-                *types.borrow_mut() = Some(expected.clone());
-            });
-            true
-        });
-        let preprocessed = preprocess_test_file(test_file)?;
-        let records =
-            sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
-        tester.run_multi(records)?;
-        return Ok(());
-    }
-
     let mut tester = sqllogictest::Runner::new(|| async {
-        let db = SQLiteDB::new()?;
-        Ok::<_, rusqlite::Error>(db)
+        let db = engine::GongDB::new_in_memory()?;
+        Ok::<_, engine::GongDBError>(db)
     });
     // Set custom validator that auto-detects valuewise vs rowwise format
     tester.with_validator(auto_detect_validator);
@@ -366,23 +286,4 @@ pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Er
         sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
     tester.run_multi(records)?;
     Ok(())
-}
-
-fn should_use_gongdb(test_file: &str) -> bool {
-    if test_file.ends_with("phase2_storage_engine.test") {
-        return true;
-    }
-    if test_file.ends_with("phase11_indexing.test") {
-        return true;
-    }
-    if test_file.ends_with("phase13_transactions.test") {
-        return true;
-    }
-    if test_file.contains("/index/") {
-        return true;
-    }
-    if test_file.contains("dropindex") || test_file.contains("reindex") {
-        return true;
-    }
-    false
 }
