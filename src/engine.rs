@@ -7,6 +7,7 @@ use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
@@ -38,18 +39,21 @@ impl From<StorageError> for GongDBError {
 
 pub struct GongDB {
     storage: StorageEngine,
+    stats_cache: RefCell<HashMap<String, TableStats>>,
 }
 
 impl GongDB {
     pub fn new_in_memory() -> Result<Self, GongDBError> {
         Ok(Self {
             storage: StorageEngine::new_in_memory()?,
+            stats_cache: RefCell::new(HashMap::new()),
         })
     }
 
     pub fn new_on_disk(path: &str) -> Result<Self, GongDBError> {
         Ok(Self {
             storage: StorageEngine::new_on_disk(path)?,
+            stats_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -84,6 +88,7 @@ impl GongDB {
                     last_page: first_page,
                 };
                 self.storage.create_table(meta)?;
+                self.invalidate_table_stats(&name);
 
                 let mut counter = 1;
                 let mut used_names = HashSet::new();
@@ -133,7 +138,7 @@ impl GongDB {
                     let first_page = self.storage.allocate_index_root()?;
                     let meta = IndexMeta {
                         name: index_name.clone(),
-                        table: table_name,
+                        table: table_name.clone(),
                         columns: create.columns,
                         unique: create.unique,
                         first_page,
@@ -141,6 +146,7 @@ impl GongDB {
                     };
                     self.storage.create_index(meta)?;
                 }
+                self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::DropIndex(drop) => {
@@ -172,6 +178,7 @@ impl GongDB {
                 if self.storage.get_table(&name).is_some() {
                     self.storage.drop_table(&name)?;
                 }
+                self.invalidate_table_stats(&name);
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::CreateView(create) => {
@@ -345,6 +352,7 @@ impl GongDB {
                         }
                     }
                 }
+                self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(inserted))
             }
             Statement::Update(update) => {
@@ -397,6 +405,7 @@ impl GongDB {
                     updated_rows.push(new_row);
                 }
                 self.storage.replace_table_rows(&table_name, &updated_rows)?;
+                self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::Delete(delete) => {
@@ -439,6 +448,7 @@ impl GongDB {
                 }
                 self.storage
                     .replace_table_rows(&table_name, &remaining_rows)?;
+                self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::Select(select) => self.run_select(&select),
@@ -456,6 +466,23 @@ impl GongDB {
             types: vec![DefaultColumnType::Text; result.columns.len()],
             rows: output_rows,
         })
+    }
+
+    fn invalidate_table_stats(&self, table_name: &str) {
+        self.stats_cache
+            .borrow_mut()
+            .remove(&table_name.to_ascii_lowercase());
+    }
+
+    fn get_table_stats(&self, table: &TableMeta) -> Result<TableStats, GongDBError> {
+        let key = table.name.to_ascii_lowercase();
+        if let Some(stats) = self.stats_cache.borrow().get(&key) {
+            return Ok(stats.clone());
+        }
+        let rows = self.storage.scan_table(&table.name)?;
+        let stats = compute_table_stats(&table.columns, &rows);
+        self.stats_cache.borrow_mut().insert(key, stats.clone());
+        Ok(stats)
     }
 
     fn evaluate_select_values(&self, select: &Select) -> Result<QueryResult, GongDBError> {
@@ -1235,20 +1262,63 @@ impl GongDB {
         outer: Option<&EvalScope<'_>>,
         cte_context: Option<&CteContext>,
     ) -> Result<QuerySource, GongDBError> {
+        let table_count = tables.len();
+        let table_stats: Vec<TableStats> = tables
+            .iter()
+            .map(|info| compute_table_stats(&info.source.columns, &info.source.rows))
+            .collect();
+
         let mut remaining: Vec<PredicateInfo> = predicates
             .into_iter()
-            .map(|expr| PredicateInfo {
-                tables: predicate_table_refs(&expr, &tables),
-                expr,
+            .map(|expr| {
+                let tables_ref = predicate_table_refs(&expr, &tables);
+                let selectivity =
+                    estimate_predicate_selectivity(self, &expr, &tables_ref, &tables, &table_stats);
+                PredicateInfo {
+                    tables: tables_ref,
+                    expr,
+                    selectivity,
+                }
             })
             .collect();
-        let table_count = tables.len();
-        let row_counts: Vec<usize> = tables.iter().map(|info| info.source.rows.len()).collect();
+
         let mut sources: Vec<Option<QuerySource>> =
             tables.into_iter().map(|info| Some(info.source)).collect();
 
+        let base_rows: Vec<f64> = table_stats
+            .iter()
+            .map(|stats| stats.row_count as f64)
+            .collect();
+        let mut local_selectivity = vec![1.0; table_count];
+        for pred in &remaining {
+            if let Some(tables) = &pred.tables {
+                if tables.len() == 1 {
+                    local_selectivity[tables[0]] *= pred.selectivity;
+                }
+            }
+        }
+        let estimated_table_rows: Vec<f64> = base_rows
+            .iter()
+            .zip(local_selectivity.iter())
+            .map(|(rows, sel)| {
+                if *rows == 0.0 {
+                    0.0
+                } else {
+                    (*rows * *sel).max(1.0)
+                }
+            })
+            .collect();
+
         let mut joined = HashSet::new();
-        let current_index = choose_initial_table(&remaining, &row_counts);
+        let mut current_index = 0usize;
+        let mut best_cost = f64::INFINITY;
+        for (idx, rows) in estimated_table_rows.iter().enumerate() {
+            let cost = base_rows[idx] + rows;
+            if cost < best_cost {
+                best_cost = cost;
+                current_index = idx;
+            }
+        }
         joined.insert(current_index);
 
         let mut current = apply_predicates_to_source(
@@ -1258,36 +1328,28 @@ impl GongDB {
             outer,
             cte_context,
         )?;
+        let mut current_est_rows = estimated_table_rows[current_index];
 
         while joined.len() < table_count {
             let mut best_idx = None;
-            let mut best_applicable = 0usize;
-            let mut best_rows = usize::MAX;
-            for (idx, row_count) in row_counts.iter().enumerate() {
+            let mut best_join_cost = f64::INFINITY;
+            let mut best_est_rows = 0.0;
+            for idx in 0..table_count {
                 if joined.contains(&idx) {
                     continue;
                 }
-                let mut applicable = 0usize;
-                for pred in &remaining {
-                    if let Some(tables) = &pred.tables {
-                        if tables_contains(tables, idx)
-                            && tables_subset(tables, &joined, idx)
-                        {
-                            applicable += 1;
-                        }
-                    }
-                }
-                if applicable > 0 {
-                    if applicable > best_applicable
-                        || (applicable == best_applicable && *row_count < best_rows)
-                    {
-                        best_idx = Some(idx);
-                        best_applicable = applicable;
-                        best_rows = *row_count;
-                    }
-                } else if best_idx.is_none() && *row_count < best_rows {
+                let candidate_rows = estimated_table_rows[idx];
+                let join_selectivity = estimate_join_selectivity(&remaining, &joined, idx);
+                let estimated_rows = if current_est_rows == 0.0 || candidate_rows == 0.0 {
+                    0.0
+                } else {
+                    (current_est_rows * candidate_rows * join_selectivity).max(1.0)
+                };
+                let join_cost = current_est_rows * candidate_rows + estimated_rows;
+                if join_cost < best_join_cost {
+                    best_join_cost = join_cost;
                     best_idx = Some(idx);
-                    best_rows = *row_count;
+                    best_est_rows = estimated_rows;
                 }
             }
 
@@ -1316,6 +1378,7 @@ impl GongDB {
                 cte_context,
             )?;
             joined.insert(idx);
+            current_est_rows = best_est_rows;
         }
 
         Ok(current)
@@ -1443,6 +1506,202 @@ enum Constraint {
     Upper(Value),
 }
 
+const DEFAULT_EQ_SELECTIVITY: f64 = 0.1;
+const DEFAULT_RANGE_SELECTIVITY: f64 = 0.3;
+const DEFAULT_SINGLE_BOUND_SELECTIVITY: f64 = 0.5;
+const MIN_SELECTIVITY: f64 = 0.0001;
+const INDEX_ROW_LOOKUP_COST: f64 = 2.0;
+
+#[derive(Clone, Default)]
+struct ColumnStats {
+    null_count: usize,
+    distinct_count: usize,
+}
+
+#[derive(Clone, Default)]
+struct TableStats {
+    row_count: usize,
+    column_stats: HashMap<String, ColumnStats>,
+}
+
+fn compute_table_stats(columns: &[Column], rows: &[Vec<Value>]) -> TableStats {
+    let mut column_stats: HashMap<String, ColumnStats> = HashMap::new();
+    let mut distinct_sets: Vec<HashSet<String>> = Vec::with_capacity(columns.len());
+    for column in columns {
+        column_stats.insert(column.name.to_ascii_lowercase(), ColumnStats::default());
+        distinct_sets.push(HashSet::new());
+    }
+
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            let key = columns[idx].name.to_ascii_lowercase();
+            if let Some(stats) = column_stats.get_mut(&key) {
+                match value {
+                    Value::Null => stats.null_count += 1,
+                    _ => {
+                        distinct_sets[idx].insert(value_signature(value));
+                    }
+                }
+            }
+        }
+    }
+
+    for (idx, column) in columns.iter().enumerate() {
+        if let Some(stats) = column_stats.get_mut(&column.name.to_ascii_lowercase()) {
+            stats.distinct_count = distinct_sets[idx].len();
+        }
+    }
+
+    TableStats {
+        row_count: rows.len(),
+        column_stats,
+    }
+}
+
+fn value_signature(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Integer(num) => format!("i:{}", num),
+        Value::Real(num) => format!("r:{:x}", num.to_bits()),
+        Value::Text(text) => format!("t:{}", text),
+        Value::Blob(bytes) => {
+            let mut out = String::with_capacity(bytes.len() * 2 + 2);
+            out.push_str("b:");
+            for byte in bytes {
+                out.push_str(&format!("{:02x}", byte));
+            }
+            out
+        }
+    }
+}
+
+fn clamp_selectivity(selectivity: f64) -> f64 {
+    if selectivity <= 0.0 {
+        MIN_SELECTIVITY
+    } else if selectivity > 1.0 {
+        1.0
+    } else {
+        selectivity
+    }
+}
+
+fn estimate_eq_selectivity(
+    value: &Value,
+    stats: Option<&ColumnStats>,
+    total_rows: usize,
+) -> f64 {
+    match value {
+        Value::Null => {
+            if let Some(stats) = stats {
+                if total_rows > 0 {
+                    return clamp_selectivity(stats.null_count as f64 / total_rows as f64);
+                }
+            }
+            DEFAULT_EQ_SELECTIVITY
+        }
+        _ => {
+            if let Some(stats) = stats {
+                if stats.distinct_count > 0 {
+                    return clamp_selectivity(1.0 / stats.distinct_count as f64);
+                }
+            }
+            DEFAULT_EQ_SELECTIVITY
+        }
+    }
+}
+
+fn estimate_range_selectivity(constraint: &IndexColumnConstraint) -> f64 {
+    if constraint.lower.is_some() && constraint.upper.is_some() {
+        DEFAULT_RANGE_SELECTIVITY
+    } else {
+        DEFAULT_SINGLE_BOUND_SELECTIVITY
+    }
+}
+
+fn estimate_selectivity_for_constraints(
+    constraints: &HashMap<String, IndexColumnConstraint>,
+    stats: Option<&TableStats>,
+) -> f64 {
+    let mut selectivity = 1.0;
+    for (name, constraint) in constraints {
+        let column_stats = stats
+            .and_then(|table_stats| table_stats.column_stats.get(name));
+        if let Some(eq) = &constraint.eq {
+            let total_rows = stats.map(|stats| stats.row_count).unwrap_or(0);
+            selectivity *= estimate_eq_selectivity(eq, column_stats, total_rows);
+        } else if constraint.lower.is_some() || constraint.upper.is_some() {
+            selectivity *= estimate_range_selectivity(constraint);
+        }
+    }
+    clamp_selectivity(selectivity)
+}
+
+fn estimate_index_selectivity(
+    index: &IndexMeta,
+    constraints: &HashMap<String, IndexColumnConstraint>,
+    stats: Option<&TableStats>,
+) -> f64 {
+    let mut selectivity = 1.0;
+    for column in &index.columns {
+        let name = column.name.value.to_ascii_lowercase();
+        let constraint = match constraints.get(&name) {
+            Some(value) => value,
+            None => break,
+        };
+        let column_stats = stats
+            .and_then(|table_stats| table_stats.column_stats.get(&name));
+        if let Some(eq) = &constraint.eq {
+            let total_rows = stats.map(|stats| stats.row_count).unwrap_or(0);
+            selectivity *= estimate_eq_selectivity(eq, column_stats, total_rows);
+        } else if constraint.lower.is_some() || constraint.upper.is_some() {
+            selectivity *= estimate_range_selectivity(constraint);
+            break;
+        } else {
+            break;
+        }
+    }
+    clamp_selectivity(selectivity)
+}
+
+fn estimate_table_scan_cost(row_count: usize, selectivity: f64, needs_sort: bool) -> f64 {
+    let rows = row_count as f64;
+    let filtered = rows * selectivity;
+    let mut cost = rows + filtered;
+    if needs_sort {
+        cost += sort_cost(filtered);
+    }
+    cost
+}
+
+fn estimate_index_scan_cost(row_count: usize, selectivity: f64, needs_sort: bool) -> f64 {
+    let rows = row_count as f64;
+    if rows == 0.0 {
+        return 0.0;
+    }
+    let filtered = rows * selectivity;
+    let mut cost = index_traversal_cost(rows) + filtered * INDEX_ROW_LOOKUP_COST + filtered;
+    if needs_sort {
+        cost += sort_cost(filtered);
+    }
+    cost
+}
+
+fn sort_cost(rows: f64) -> f64 {
+    if rows <= 1.0 {
+        0.0
+    } else {
+        rows * log2(rows + 1.0)
+    }
+}
+
+fn index_traversal_cost(rows: f64) -> f64 {
+    log2(rows + 1.0).max(1.0)
+}
+
+fn log2(value: f64) -> f64 {
+    value.ln() / 2.0_f64.ln()
+}
+
 fn choose_index_scan_plan(
     db: &GongDB,
     table: &TableMeta,
@@ -1464,29 +1723,36 @@ fn choose_index_scan_plan(
         .map(|selection| extract_index_constraints(db, selection, table_scope, &table.columns))
         .unwrap_or_default();
 
-    let mut best_eq: Option<(IndexScanPlan, usize, bool)> = None;
-    let mut best_range: Option<(IndexScanPlan, bool)> = None;
+    let stats = db.get_table_stats(table).ok();
+    let row_count = stats.as_ref().map(|stats| stats.row_count).unwrap_or(0);
+    let selection_selectivity = estimate_selectivity_for_constraints(&constraints, stats.as_ref());
+    let needs_sort = !order_by.is_empty();
+    let table_scan_cost = estimate_table_scan_cost(row_count, selection_selectivity, needs_sort);
+
+    let mut best_plan: Option<(IndexScanPlan, f64)> = None;
 
     for index in &indexes {
         let ordered = order_by_matches_index(order_by, index, table_scope, &table.columns);
+        let ordered_by = !order_by.is_empty() && ordered;
         if let Some(key) = build_eq_key(index, &constraints) {
-            let ordered_by = !order_by.is_empty() && ordered;
             let plan = IndexScanPlan {
                 index_name: index.name.clone(),
                 lower: Some(key.clone()),
                 upper: Some(key),
                 ordered_by,
             };
-            let column_count = index.columns.len();
-            let should_replace = match &best_eq {
-                None => true,
-                Some((_, best_columns, best_ordered)) => {
-                    column_count > *best_columns
-                        || (column_count == *best_columns && ordered_by && !*best_ordered)
-                }
-            };
-            if should_replace {
-                best_eq = Some((plan, column_count, ordered_by));
+            let selectivity = estimate_index_selectivity(index, &constraints, stats.as_ref());
+            let cost = estimate_index_scan_cost(
+                row_count,
+                selectivity,
+                needs_sort && !ordered_by,
+            );
+            if best_plan
+                .as_ref()
+                .map(|(_, best_cost)| cost < *best_cost)
+                .unwrap_or(true)
+            {
+                best_plan = Some((plan, cost));
             }
             continue;
         }
@@ -1494,70 +1760,57 @@ fn choose_index_scan_plan(
         if index.columns.len() == 1 {
             let column_name = index.columns[0].name.value.to_lowercase();
             if let Some(constraint) = constraints.get(&column_name) {
-                if let Some(eq) = &constraint.eq {
-                    let ordered_by = !order_by.is_empty() && ordered;
+                if constraint.lower.is_some() || constraint.upper.is_some() {
                     let plan = IndexScanPlan {
                         index_name: index.name.clone(),
-                        lower: Some(vec![eq.clone()]),
-                        upper: Some(vec![eq.clone()]),
+                        lower: constraint.lower.clone().map(|value| vec![value]),
+                        upper: constraint.upper.clone().map(|value| vec![value]),
                         ordered_by,
                     };
-                    best_eq = Some((plan, 1, ordered_by));
-                    continue;
-                }
-                let lower = constraint.lower.clone().map(|value| vec![value]);
-                let upper = constraint.upper.clone().map(|value| vec![value]);
-                if lower.is_some() || upper.is_some() {
-                    let ordered_by = !order_by.is_empty() && ordered;
-                    let plan = IndexScanPlan {
-                        index_name: index.name.clone(),
-                        lower,
-                        upper,
-                        ordered_by,
-                    };
-                    let should_replace = match &best_range {
-                        None => true,
-                        Some((_, best_ordered)) => ordered_by && !*best_ordered,
-                    };
-                    if should_replace {
-                        best_range = Some((plan, ordered_by));
+                    let selectivity = estimate_index_selectivity(index, &constraints, stats.as_ref());
+                    let cost = estimate_index_scan_cost(
+                        row_count,
+                        selectivity,
+                        needs_sort && !ordered_by,
+                    );
+                    if best_plan
+                        .as_ref()
+                        .map(|(_, best_cost)| cost < *best_cost)
+                        .unwrap_or(true)
+                    {
+                        best_plan = Some((plan, cost));
                     }
                 }
             }
         }
     }
 
-    if let Some((plan, _, _)) = best_eq {
-        return Some(plan);
-    }
-    if let Some((plan, _)) = best_range {
-        return Some(plan);
-    }
-
     if !order_by.is_empty() {
-        let mut best_order: Option<IndexScanPlan> = None;
-        let mut best_extra = usize::MAX;
         for index in &indexes {
             if !order_by_matches_index(order_by, index, table_scope, &table.columns) {
                 continue;
             }
-            let extra = index.columns.len().saturating_sub(order_by.len());
-            if extra < best_extra {
-                best_extra = extra;
-                best_order = Some(IndexScanPlan {
-                    index_name: index.name.clone(),
-                    lower: None,
-                    upper: None,
-                    ordered_by: true,
-                });
+            let plan = IndexScanPlan {
+                index_name: index.name.clone(),
+                lower: None,
+                upper: None,
+                ordered_by: true,
+            };
+            let cost = estimate_index_scan_cost(row_count, 1.0, false);
+            if best_plan
+                .as_ref()
+                .map(|(_, best_cost)| cost < *best_cost)
+                .unwrap_or(true)
+            {
+                best_plan = Some((plan, cost));
             }
-        }
-        if best_order.is_some() {
-            return best_order;
         }
     }
 
-    None
+    match best_plan {
+        Some((plan, cost)) if cost < table_scan_cost => Some(plan),
+        _ => None,
+    }
 }
 
 fn scan_rows_with_index(db: &GongDB, plan: &IndexScanPlan) -> Result<Vec<Vec<Value>>, GongDBError> {
@@ -1861,44 +2114,6 @@ fn split_conjuncts(expr: &Expr) -> Vec<Expr> {
     }
 }
 
-fn choose_initial_table(predicates: &[PredicateInfo], row_counts: &[usize]) -> usize {
-    if row_counts.is_empty() {
-        return 0;
-    }
-    let mut local_counts = vec![0usize; row_counts.len()];
-    for pred in predicates {
-        if let Some(tables) = &pred.tables {
-            if tables.len() == 1 {
-                if let Some(idx) = tables.first() {
-                    if *idx < local_counts.len() {
-                        local_counts[*idx] += 1;
-                    }
-                }
-            }
-        }
-    }
-    let mut best_idx = 0usize;
-    let mut best_local = local_counts[0];
-    let mut best_rows = row_counts[0];
-    for (idx, row_count) in row_counts.iter().enumerate().skip(1) {
-        let local = local_counts[idx];
-        if local > best_local || (local == best_local && *row_count < best_rows) {
-            best_idx = idx;
-            best_local = local;
-            best_rows = *row_count;
-        }
-    }
-    if best_local > 0 {
-        return best_idx;
-    }
-    row_counts
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, rows)| *rows)
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
-}
-
 fn predicate_table_refs(expr: &Expr, tables: &[TableInfo]) -> Option<Vec<usize>> {
     if expr_contains_subquery(expr) {
         return None;
@@ -1910,6 +2125,115 @@ fn predicate_table_refs(expr: &Expr, tables: &[TableInfo]) -> Option<Vec<usize>>
     let mut refs: Vec<usize> = refs.into_iter().collect();
     refs.sort_unstable();
     Some(refs)
+}
+
+fn estimate_predicate_selectivity(
+    db: &GongDB,
+    expr: &Expr,
+    tables_ref: &Option<Vec<usize>>,
+    tables: &[TableInfo],
+    stats: &[TableStats],
+) -> f64 {
+    let Some(table_indices) = tables_ref else {
+        return DEFAULT_EQ_SELECTIVITY;
+    };
+    if table_indices.len() == 1 {
+        let table_idx = table_indices[0];
+        let scope = &tables[table_idx].scope;
+        let columns = &tables[table_idx].source.columns;
+        let constraints = extract_index_constraints(db, expr, scope, columns);
+        if constraints.is_empty() {
+            return DEFAULT_EQ_SELECTIVITY;
+        }
+        return estimate_selectivity_for_constraints(&constraints, stats.get(table_idx));
+    }
+    if table_indices.len() == 2 {
+        if let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = expr
+        {
+            if let (Some((left_idx, left_col)), Some((right_idx, right_col))) = (
+                resolve_column_ref_in_tables(left, tables),
+                resolve_column_ref_in_tables(right, tables),
+            ) {
+                if left_idx != right_idx {
+                    let left_distinct = stats
+                        .get(left_idx)
+                        .and_then(|stats| stats.column_stats.get(&left_col))
+                        .map(|stats| stats.distinct_count)
+                        .unwrap_or(0);
+                    let right_distinct = stats
+                        .get(right_idx)
+                        .and_then(|stats| stats.column_stats.get(&right_col))
+                        .map(|stats| stats.distinct_count)
+                        .unwrap_or(0);
+                    let denom = left_distinct.max(right_distinct);
+                    if denom > 0 {
+                        return clamp_selectivity(1.0 / denom as f64);
+                    }
+                }
+            }
+        }
+    }
+    DEFAULT_EQ_SELECTIVITY
+}
+
+fn estimate_join_selectivity(
+    predicates: &[PredicateInfo],
+    joined: &HashSet<usize>,
+    candidate: usize,
+) -> f64 {
+    let mut selectivity = 1.0;
+    for pred in predicates {
+        if let Some(tables) = &pred.tables {
+            if tables.len() > 1
+                && tables_contains(tables, candidate)
+                && tables_subset(tables, joined, candidate)
+            {
+                selectivity *= pred.selectivity;
+            }
+        }
+    }
+    clamp_selectivity(selectivity)
+}
+
+fn resolve_column_ref_in_tables(expr: &Expr, tables: &[TableInfo]) -> Option<(usize, String)> {
+    match expr {
+        Expr::Identifier(ident) => {
+            let mut matches = Vec::new();
+            for (idx, info) in tables.iter().enumerate() {
+                if resolve_column_index(&ident.value, &info.source.columns).is_some() {
+                    matches.push(idx);
+                }
+            }
+            if matches.len() != 1 {
+                return None;
+            }
+            let idx = matches[0];
+            resolve_column_index(&ident.value, &tables[idx].source.columns)
+                .map(|col_idx| (idx, tables[idx].source.columns[col_idx].name.to_lowercase()))
+        }
+        Expr::CompoundIdentifier(idents) => {
+            let (qualifier, column) = split_qualified_identifier(idents).ok()?;
+            let mut matches = Vec::new();
+            for (idx, info) in tables.iter().enumerate() {
+                if info.scope.matches_qualifier(qualifier)
+                    && resolve_column_index(column, &info.source.columns).is_some()
+                {
+                    matches.push(idx);
+                }
+            }
+            if matches.len() != 1 {
+                return None;
+            }
+            let idx = matches[0];
+            resolve_column_index(column, &tables[idx].source.columns)
+                .map(|col_idx| (idx, tables[idx].source.columns[col_idx].name.to_lowercase()))
+        }
+        _ => None,
+    }
 }
 
 fn collect_predicate_tables(expr: &Expr, tables: &[TableInfo], refs: &mut HashSet<usize>) -> bool {
@@ -2262,6 +2586,7 @@ struct TableInfo {
 struct PredicateInfo {
     expr: Expr,
     tables: Option<Vec<usize>>,
+    selectivity: f64,
 }
 
 #[derive(Clone)]
