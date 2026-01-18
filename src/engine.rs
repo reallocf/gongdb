@@ -227,11 +227,14 @@ impl GongDB {
                     .get_table(&table_name)
                     .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?
                     .clone();
+                let mut inserted = 0u64;
                 match insert.source {
                     InsertSource::Values(values) => {
                         for exprs in values {
-                            let row = build_insert_row(&table, &insert.columns, &exprs)?;
+                            let row =
+                                build_insert_row(self, &table, &insert.columns, &exprs)?;
                             let _ = self.storage.insert_row(&table_name, &row)?;
+                            inserted += 1;
                         }
                     }
                     InsertSource::Select(select) => {
@@ -245,15 +248,17 @@ impl GongDB {
                         }
                         for values in result.rows {
                             let row = build_insert_row_from_values(
+                                self,
                                 &table,
                                 &insert.columns,
                                 &values,
                             )?;
                             let _ = self.storage.insert_row(&table_name, &row)?;
+                            inserted += 1;
                         }
                     }
                 }
-                Ok(DBOutput::StatementComplete(0))
+                Ok(DBOutput::StatementComplete(inserted))
             }
             Statement::Update(update) => {
                 let table_name = object_name(&update.table);
@@ -888,19 +893,21 @@ fn ensure_unique_idents(idents: &[Ident]) -> Result<(), GongDBError> {
 }
 
 fn build_insert_row(
+    db: &GongDB,
     table: &TableMeta,
     columns: &[Ident],
     values: &[Expr],
 ) -> Result<Vec<Value>, GongDBError> {
-    let mut row = vec![Value::Null; table.columns.len()];
+    let mut row = build_default_row(db, table)?;
     if columns.is_empty() {
         if values.len() != table.columns.len() {
             return Err(GongDBError::new("column count mismatch"));
         }
         for (idx, expr) in values.iter().enumerate() {
-            let value = eval_literal(expr)?;
+            let value = eval_insert_expr(db, expr)?;
             row[idx] = apply_affinity(value, &table.columns[idx].data_type);
         }
+        validate_insert_row(db, table, &row)?;
         return Ok(row);
     }
     if values.len() != columns.len() {
@@ -910,23 +917,32 @@ fn build_insert_row(
     for (idx, col) in table.columns.iter().enumerate() {
         index_by_name.insert(col.name.to_lowercase(), idx);
     }
+    let mut seen = HashSet::new();
     for (col_ident, expr) in columns.iter().zip(values.iter()) {
         let key = col_ident.value.to_lowercase();
+        if !seen.insert(key.clone()) {
+            return Err(GongDBError::new(format!(
+                "duplicate column {}",
+                col_ident.value
+            )));
+        }
         let idx = *index_by_name
             .get(&key)
             .ok_or_else(|| GongDBError::new(format!("unknown column {}", col_ident.value)))?;
-        let value = eval_literal(expr)?;
+        let value = eval_insert_expr(db, expr)?;
         row[idx] = apply_affinity(value, &table.columns[idx].data_type);
     }
+    validate_insert_row(db, table, &row)?;
     Ok(row)
 }
 
 fn build_insert_row_from_values(
+    db: &GongDB,
     table: &TableMeta,
     columns: &[Ident],
     values: &[Value],
 ) -> Result<Vec<Value>, GongDBError> {
-    let mut row = vec![Value::Null; table.columns.len()];
+    let mut row = build_default_row(db, table)?;
     if columns.is_empty() {
         if values.len() != table.columns.len() {
             return Err(GongDBError::new("column count mismatch"));
@@ -934,6 +950,7 @@ fn build_insert_row_from_values(
         for (idx, value) in values.iter().enumerate() {
             row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
         }
+        validate_insert_row(db, table, &row)?;
         return Ok(row);
     }
     if values.len() != columns.len() {
@@ -943,14 +960,107 @@ fn build_insert_row_from_values(
     for (idx, col) in table.columns.iter().enumerate() {
         index_by_name.insert(col.name.to_lowercase(), idx);
     }
+    let mut seen = HashSet::new();
     for (col_ident, value) in columns.iter().zip(values.iter()) {
         let key = col_ident.value.to_lowercase();
+        if !seen.insert(key.clone()) {
+            return Err(GongDBError::new(format!(
+                "duplicate column {}",
+                col_ident.value
+            )));
+        }
         let idx = *index_by_name
             .get(&key)
             .ok_or_else(|| GongDBError::new(format!("unknown column {}", col_ident.value)))?;
         row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
     }
+    validate_insert_row(db, table, &row)?;
     Ok(row)
+}
+
+fn build_default_row(db: &GongDB, table: &TableMeta) -> Result<Vec<Value>, GongDBError> {
+    let mut row = Vec::with_capacity(table.columns.len());
+    for column in &table.columns {
+        let mut value = Value::Null;
+        for constraint in &column.constraints {
+            if let ColumnConstraint::Default(expr) = constraint {
+                value = eval_insert_expr(db, expr)?;
+                break;
+            }
+        }
+        row.push(apply_affinity(value, &column.data_type));
+    }
+    Ok(row)
+}
+
+fn eval_insert_expr(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
+    let table_scope = TableScope {
+        table_name: None,
+        table_alias: None,
+    };
+    let scope = EvalScope {
+        columns: &[],
+        row: &[],
+        table_scope: &table_scope,
+    };
+    eval_expr(db, expr, &scope, None)
+}
+
+fn validate_insert_row(
+    db: &GongDB,
+    table: &TableMeta,
+    row: &[Value],
+) -> Result<(), GongDBError> {
+    let mut pk_columns = HashSet::new();
+    for constraint in &table.constraints {
+        if let TableConstraint::PrimaryKey(columns) = constraint {
+            for column in columns {
+                pk_columns.insert(column.value.to_lowercase());
+            }
+        }
+    }
+
+    for (idx, column) in table.columns.iter().enumerate() {
+        let mut not_null = false;
+        for constraint in &column.constraints {
+            match constraint {
+                ColumnConstraint::NotNull | ColumnConstraint::PrimaryKey => {
+                    not_null = true;
+                }
+                _ => {}
+            }
+        }
+        if pk_columns.contains(&column.name.to_lowercase()) {
+            not_null = true;
+        }
+        if not_null && matches!(row[idx], Value::Null) {
+            return Err(GongDBError::new(format!(
+                "NOT NULL constraint failed: {}.{}",
+                table.name, column.name
+            )));
+        }
+    }
+
+    if !table.constraints.is_empty() {
+        let table_scope = TableScope {
+            table_name: Some(table.name.clone()),
+            table_alias: None,
+        };
+        let scope = EvalScope {
+            columns: &table.columns,
+            row,
+            table_scope: &table_scope,
+        };
+        for constraint in &table.constraints {
+            if let TableConstraint::Check(expr) = constraint {
+                let value = eval_expr(db, expr, &scope, None)?;
+                if !value_to_bool(&value) {
+                    return Err(GongDBError::new("CHECK constraint failed"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn eval_literal(expr: &Expr) -> Result<Value, GongDBError> {
