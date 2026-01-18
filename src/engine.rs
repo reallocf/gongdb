@@ -1,11 +1,12 @@
 use crate::ast::{
-    BinaryOperator, ColumnDef, DataType, Expr, Ident, InsertSource, Select, SelectItem, Statement,
+    BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
+    InsertSource, Select, SelectItem, Statement, TableConstraint,
 };
 use crate::parser;
 use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value};
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug)]
 pub struct GongDBError {
@@ -55,28 +56,43 @@ impl GongDB {
         let stmt = parser::parse_statement(sql).map_err(|e| GongDBError::new(e.message))?;
         match stmt {
             Statement::CreateTable(create) => {
-                let columns = create
-                    .columns
-                    .into_iter()
-                    .map(column_from_def)
-                    .collect::<Vec<_>>();
                 let name = object_name(&create.name);
-                if self.storage.get_table(&name).is_some() && !create.if_not_exists {
-                    return Err(GongDBError::new(format!(
-                        "table already exists: {}",
-                        name
-                    )));
+                if self.storage.get_table(&name).is_some() {
+                    if !create.if_not_exists {
+                        return Err(GongDBError::new(format!(
+                            "table already exists: {}",
+                            name
+                        )));
+                    }
+                    return Ok(DBOutput::StatementComplete(0));
                 }
-                if self.storage.get_table(&name).is_none() {
+
+                let plan = build_create_table_plan(create)?;
+                let first_page = self.storage.allocate_data_page()?;
+                let meta = TableMeta {
+                    name: name.clone(),
+                    columns: plan.columns,
+                    constraints: plan.constraints,
+                    first_page,
+                    last_page: first_page,
+                };
+                self.storage.create_table(meta)?;
+
+                let mut counter = 1;
+                let mut used_names = HashSet::new();
+                for spec in plan.auto_indexes {
+                    let index_name =
+                        next_auto_index_name(&self.storage, &name, &mut counter, &mut used_names);
                     let first_page = self.storage.allocate_data_page()?;
-                    let meta = TableMeta {
-                        name: name.clone(),
-                        columns,
-                        constraints: create.constraints,
+                    let meta = IndexMeta {
+                        name: index_name,
+                        table: name.clone(),
+                        columns: spec.columns,
+                        unique: spec.unique,
                         first_page,
                         last_page: first_page,
                     };
-                    self.storage.create_table(meta)?;
+                    self.storage.create_index(meta)?;
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
@@ -284,6 +300,188 @@ fn column_from_def(def: ColumnDef) -> Column {
         name: def.name.value,
         data_type: def.data_type.unwrap_or(DataType::Text),
         constraints: def.constraints,
+    }
+}
+
+struct AutoIndexSpec {
+    columns: Vec<IndexedColumn>,
+    unique: bool,
+}
+
+struct CreateTablePlan {
+    columns: Vec<Column>,
+    constraints: Vec<TableConstraint>,
+    auto_indexes: Vec<AutoIndexSpec>,
+}
+
+fn build_create_table_plan(create: CreateTable) -> Result<CreateTablePlan, GongDBError> {
+    if create.without_rowid {
+        return Err(GongDBError::new("WITHOUT ROWID is not supported"));
+    }
+    if create.columns.is_empty() {
+        return Err(GongDBError::new("table must have at least one column"));
+    }
+
+    let mut column_names = HashSet::new();
+    for column in &create.columns {
+        let key = column.name.value.to_lowercase();
+        if !column_names.insert(key.clone()) {
+            return Err(GongDBError::new(format!(
+                "duplicate column name: {}",
+                column.name.value
+            )));
+        }
+    }
+
+    let mut primary_key: Option<Vec<Ident>> = None;
+    let mut unique_specs: Vec<Vec<Ident>> = Vec::new();
+
+    for column in &create.columns {
+        let mut has_null = false;
+        let mut has_not_null = false;
+        for constraint in &column.constraints {
+            match constraint {
+                ColumnConstraint::NotNull => {
+                    if has_null {
+                        return Err(GongDBError::new(format!(
+                            "conflicting NULL constraints on {}",
+                            column.name.value
+                        )));
+                    }
+                    has_not_null = true;
+                }
+                ColumnConstraint::Null => {
+                    if has_not_null {
+                        return Err(GongDBError::new(format!(
+                            "conflicting NULL constraints on {}",
+                            column.name.value
+                        )));
+                    }
+                    has_null = true;
+                }
+                ColumnConstraint::PrimaryKey => {
+                    if primary_key.is_some() {
+                        return Err(GongDBError::new("multiple primary keys are not allowed"));
+                    }
+                    primary_key = Some(vec![column.name.clone()]);
+                }
+                ColumnConstraint::Unique => {
+                    unique_specs.push(vec![column.name.clone()]);
+                }
+                ColumnConstraint::Default(_) => {}
+            }
+        }
+    }
+
+    for constraint in &create.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey(columns) => {
+                validate_constraint_columns(&column_names, columns)?;
+                if primary_key.is_some() {
+                    return Err(GongDBError::new("multiple primary keys are not allowed"));
+                }
+                primary_key = Some(columns.clone());
+            }
+            TableConstraint::Unique(columns) => {
+                validate_constraint_columns(&column_names, columns)?;
+                unique_specs.push(columns.clone());
+            }
+            TableConstraint::Check(_) => {}
+            TableConstraint::ForeignKey {
+                columns,
+                referred_columns,
+                ..
+            } => {
+                validate_constraint_columns(&column_names, columns)?;
+                if columns.len() != referred_columns.len() {
+                    return Err(GongDBError::new(
+                        "foreign key column count does not match referenced columns",
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut auto_indexes = Vec::new();
+    let mut seen_index_keys = HashSet::new();
+    if let Some(columns) = primary_key {
+        let key = normalized_column_key(&columns);
+        if seen_index_keys.insert(key) {
+            auto_indexes.push(AutoIndexSpec {
+                columns: indexed_columns(&columns),
+                unique: true,
+            });
+        }
+    }
+    for columns in unique_specs {
+        let key = normalized_column_key(&columns);
+        if seen_index_keys.insert(key) {
+            auto_indexes.push(AutoIndexSpec {
+                columns: indexed_columns(&columns),
+                unique: true,
+            });
+        }
+    }
+
+    let columns = create.columns.into_iter().map(column_from_def).collect();
+    Ok(CreateTablePlan {
+        columns,
+        constraints: create.constraints,
+        auto_indexes,
+    })
+}
+
+fn validate_constraint_columns(
+    column_names: &HashSet<String>,
+    columns: &[Ident],
+) -> Result<(), GongDBError> {
+    let mut seen = HashSet::new();
+    for column in columns {
+        let key = column.value.to_lowercase();
+        if !column_names.contains(&key) {
+            return Err(GongDBError::new(format!(
+                "unknown column in constraint: {}",
+                column.value
+            )));
+        }
+        if !seen.insert(key) {
+            return Err(GongDBError::new(format!(
+                "duplicate column in constraint: {}",
+                column.value
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_column_key(columns: &[Ident]) -> String {
+    columns
+        .iter()
+        .map(|col| col.value.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn indexed_columns(columns: &[Ident]) -> Vec<IndexedColumn> {
+    columns
+        .iter()
+        .cloned()
+        .map(|name| IndexedColumn { name, order: None })
+        .collect()
+}
+
+fn next_auto_index_name(
+    storage: &StorageEngine,
+    table_name: &str,
+    counter: &mut usize,
+    used: &mut HashSet<String>,
+) -> String {
+    loop {
+        let name = format!("__gongdb_autoindex_{}_{}", table_name, *counter);
+        *counter += 1;
+        if storage.get_index(&name).is_none() && used.insert(name.clone()) {
+            return name;
+        }
     }
 }
 
