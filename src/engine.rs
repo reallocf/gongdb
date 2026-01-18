@@ -457,7 +457,40 @@ impl GongDB {
         view_stack: &mut Vec<String>,
         outer: Option<&EvalScope<'_>>,
     ) -> Result<QueryResult, GongDBError> {
-        let source = self.resolve_source(select, view_stack)?;
+        let mut selection_applied = false;
+        let source = if select.from.len() == 1 {
+            if let crate::ast::TableRef::Named { name, alias } = &select.from[0] {
+                let table_name = object_name(name);
+                if self.storage.get_table(&table_name).is_some() {
+                    let table_alias = alias.as_ref().map(|ident| ident.value.clone());
+                    let rows = self.scan_table_rows(
+                        &table_name,
+                        table_alias.as_deref(),
+                        select.selection.as_ref(),
+                        outer,
+                    )?;
+                    selection_applied = select.selection.is_some();
+                    let table = self
+                        .storage
+                        .get_table(&table_name)
+                        .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?;
+                    QuerySource {
+                        columns: table.columns.clone(),
+                        rows,
+                        table_scope: TableScope {
+                            table_name: Some(table_name),
+                            table_alias,
+                        },
+                    }
+                } else {
+                    self.resolve_source(select, view_stack)?
+                }
+            } else {
+                self.resolve_source(select, view_stack)?
+            }
+        } else {
+            self.resolve_source(select, view_stack)?
+        };
         let QuerySource {
             columns,
             rows,
@@ -471,6 +504,10 @@ impl GongDB {
                 table_scope: &table_scope,
             };
             if let Some(predicate) = &select.selection {
+                if selection_applied {
+                    filtered.push(row);
+                    continue;
+                }
                 let value = eval_expr(self, predicate, &scope, outer)?;
                 if !value_to_bool(&value) {
                     continue;
@@ -597,6 +634,41 @@ impl GongDB {
                 table_alias: None,
             },
         })
+    }
+
+    fn scan_table_rows(
+        &self,
+        table_name: &str,
+        table_alias: Option<&str>,
+        selection: Option<&Expr>,
+        outer: Option<&EvalScope<'_>>,
+    ) -> Result<Vec<Vec<Value>>, GongDBError> {
+        let table = self
+            .storage
+            .get_table(table_name)
+            .ok_or_else(|| GongDBError::new(format!("table not found: {}", table_name)))?;
+        let table_scope = TableScope {
+            table_name: Some(table_name.to_string()),
+            table_alias: table_alias.map(|alias| alias.to_string()),
+        };
+        let mut rows = Vec::new();
+        let mut scan = self.storage.table_scan(table_name)?;
+        while let Some(result) = scan.next() {
+            let row = result?;
+            if let Some(predicate) = selection {
+                let scope = EvalScope {
+                    columns: &table.columns,
+                    row: &row,
+                    table_scope: &table_scope,
+                };
+                let value = eval_expr(self, predicate, &scope, outer)?;
+                if !value_to_bool(&value) {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     fn resolve_table_ref(

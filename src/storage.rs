@@ -114,6 +114,66 @@ pub struct StorageEngine {
     free_pages: Vec<u32>,
 }
 
+pub struct TableScan<'a> {
+    engine: &'a StorageEngine,
+    page_id: u32,
+    next_page_id: u32,
+    records: Vec<Vec<u8>>,
+    record_index: usize,
+    done: bool,
+}
+
+impl<'a> TableScan<'a> {
+    fn new(engine: &'a StorageEngine, table: &TableMeta) -> Result<Self, StorageError> {
+        let page_id = table.first_page;
+        let page = engine.read_page(page_id)?;
+        let records = read_records(&page);
+        let next_page_id = get_next_page_id(&page);
+        Ok(TableScan {
+            engine,
+            page_id,
+            next_page_id,
+            records,
+            record_index: 0,
+            done: false,
+        })
+    }
+
+    fn load_page(&mut self, page_id: u32) -> Result<(), StorageError> {
+        let page = self.engine.read_page(page_id)?;
+        self.page_id = page_id;
+        self.records = read_records(&page);
+        self.record_index = 0;
+        self.next_page_id = get_next_page_id(&page);
+        Ok(())
+    }
+}
+
+impl<'a> Iterator for TableScan<'a> {
+    type Item = Result<Vec<Value>, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            if self.record_index < self.records.len() {
+                let record = self.records[self.record_index].clone();
+                self.record_index += 1;
+                return Some(decode_row(&record));
+            }
+            if self.next_page_id == 0 {
+                self.done = true;
+                return None;
+            }
+            if let Err(err) = self.load_page(self.next_page_id) {
+                self.done = true;
+                return Some(Err(err));
+            }
+        }
+    }
+}
+
 impl StorageEngine {
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let mut pages = Vec::new();
@@ -420,25 +480,20 @@ impl StorageEngine {
     }
 
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Vec<Value>>, StorageError> {
+        let mut rows = Vec::new();
+        let mut scan = self.table_scan(table_name)?;
+        while let Some(result) = scan.next() {
+            rows.push(result?);
+        }
+        Ok(rows)
+    }
+
+    pub fn table_scan(&self, table_name: &str) -> Result<TableScan<'_>, StorageError> {
         let table = self
             .tables
             .get(table_name)
             .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?;
-        let mut rows = Vec::new();
-        let mut page_id = table.first_page;
-        loop {
-            let page = self.read_page(page_id)?;
-            let records = read_records(&page);
-            for record in records {
-                rows.push(decode_row(&record)?);
-            }
-            let next = get_next_page_id(&page);
-            if next == 0 {
-                break;
-            }
-            page_id = next;
-        }
-        Ok(rows)
+        TableScan::new(self, table)
     }
 
     fn scan_table_with_locations(
