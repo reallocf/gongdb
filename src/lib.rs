@@ -1,7 +1,6 @@
 use sqllogictest::{DBOutput, DefaultColumnType, Normalizer};
 use rusqlite::Connection;
 use async_trait::async_trait;
-use itertools::Itertools;
 use regex::Regex;
 use md5::{Digest, Md5};
 use std::fs;
@@ -98,6 +97,25 @@ fn auto_detect_validator(
     actual: &[Vec<String>],
     expected: &[String],
 ) -> bool {
+    fn values_match(normalizer: Normalizer, actual: &str, expected: &str) -> bool {
+        let actual_norm = normalizer(&actual.to_string());
+        let expected_norm = normalizer(&expected.to_string());
+        if actual_norm == expected_norm {
+            return true;
+        }
+        if expected_norm.eq_ignore_ascii_case("NULL") {
+            return actual_norm.eq_ignore_ascii_case("NULL");
+        }
+        if let Ok(expected_int) = expected_norm.parse::<i64>() {
+            if let Ok(actual_float) = actual_norm.parse::<f64>() {
+                if actual_float.is_finite() {
+                    return expected_int == actual_float.trunc() as i64;
+                }
+            }
+        }
+        false
+    }
+
     // Handle empty results
     if actual.is_empty() {
         return expected.is_empty() || (expected.len() == 1 && expected[0].trim().is_empty());
@@ -150,39 +168,45 @@ fn auto_detect_validator(
     // Calculate total number of values in actual results
     let total_actual_values: usize = actual.iter().map(|row| row.len()).sum();
     let num_columns = actual[0].len();
-    
+
     // If expected has same number of lines as total values AND there are multiple columns,
     // it's valuewise format. For single-column queries, both formats are equivalent.
     let is_valuewise = expected.len() == total_actual_values && num_columns > 1;
-    
+
     if is_valuewise {
-        // Flatten actual results into individual values (valuewise format)
         let flattened_actual: Vec<String> = actual
             .iter()
-            .flat_map(|row| row.iter())
-            .map(|s| normalizer(s))
+            .flat_map(|row| row.iter().cloned())
             .collect();
-        
-        let normalized_expected: Vec<String> = expected
+        return flattened_actual
             .iter()
-            .map(normalizer)
-            .collect();
-        
-        flattened_actual == normalized_expected
-    } else {
-        // Use default rowwise format: join columns with spaces
-        let normalized_rows: Vec<String> = actual
-            .iter()
-            .map(|row| row.iter().map(normalizer).join(" "))
-            .collect();
-        
-        let normalized_expected: Vec<String> = expected
-            .iter()
-            .map(normalizer)
-            .collect();
-        
-        normalized_rows == normalized_expected
+            .zip(expected.iter())
+            .all(|(actual_val, expected_val)| values_match(normalizer, actual_val, expected_val));
     }
+
+    if actual.len() != expected.len() {
+        return false;
+    }
+
+    for (row, expected_line) in actual.iter().zip(expected.iter()) {
+        let joined_actual = row.join(" ");
+        if values_match(normalizer, &joined_actual, expected_line) {
+            continue;
+        }
+        let expected_parts: Vec<&str> = expected_line.split_ascii_whitespace().collect();
+        if expected_parts.len() != row.len() {
+            return false;
+        }
+        if !row
+            .iter()
+            .zip(expected_parts.iter())
+            .all(|(actual_val, expected_val)| values_match(normalizer, actual_val, expected_val))
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Preprocess test file to strip comments from skipif/onlyif lines

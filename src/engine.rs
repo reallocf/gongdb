@@ -929,8 +929,11 @@ fn value_to_bool(value: &Value) -> bool {
         Value::Null => false,
         Value::Integer(v) => *v != 0,
         Value::Real(v) => *v != 0.0,
-        Value::Text(s) => !s.is_empty(),
-        Value::Blob(bytes) => !bytes.is_empty(),
+        Value::Text(text) => match parse_numeric_text(text) {
+            Some(num) => numeric_to_f64(num).0 != 0.0,
+            None => false,
+        },
+        Value::Blob(_) => false,
     }
 }
 
