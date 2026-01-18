@@ -575,6 +575,12 @@ impl GongDB {
             }
             rows
         } else {
+            let order_table_scope = TableScope {
+                table_name: None,
+                table_alias: None,
+            };
+            let order_column_scopes =
+                vec![order_table_scope.clone(); output_columns.len()];
             let mut rows = Vec::with_capacity(filtered.len());
             for row in filtered {
                 let scope = EvalScope {
@@ -590,8 +596,15 @@ impl GongDB {
                     &scope,
                     outer,
                 )?;
-                let order_values =
-                    compute_order_values(self, &order_plans, &projected_row, &scope, outer)?;
+                let order_values = compute_order_values(
+                    self,
+                    &order_plans,
+                    &projected_row,
+                    &output_columns,
+                    &order_column_scopes,
+                    &order_table_scope,
+                    &scope,
+                )?;
                 rows.push(SortedRow {
                     order_values,
                     projected: projected_row,
@@ -2244,13 +2257,21 @@ fn compute_order_values(
     db: &GongDB,
     plans: &[OrderByPlan],
     projected_row: &[Value],
+    output_columns: &[Column],
+    order_column_scopes: &[TableScope],
+    order_table_scope: &TableScope,
     scope: &EvalScope<'_>,
-    outer: Option<&EvalScope<'_>>,
 ) -> Result<Vec<Value>, GongDBError> {
+    let order_scope = EvalScope {
+        columns: output_columns,
+        column_scopes: order_column_scopes,
+        row: projected_row,
+        table_scope: order_table_scope,
+    };
     let mut values = Vec::with_capacity(plans.len());
     for plan in plans {
         let value = match &plan.source {
-            OrderByValueSource::Expr(expr) => eval_expr(db, expr, scope, outer)?,
+            OrderByValueSource::Expr(expr) => eval_expr(db, expr, &order_scope, Some(scope))?,
             OrderByValueSource::ProjectionIndex(idx) => {
                 projected_row.get(*idx).cloned().unwrap_or(Value::Null)
             }

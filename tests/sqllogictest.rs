@@ -203,6 +203,19 @@ async fn test_index_in() {
     run_phase_tests(&test_files, "Index IN").await;
 }
 
+/// ORDER BY test suites
+#[tokio::test]
+async fn test_orderby_suites() {
+    let mut test_files = Vec::new();
+    collect_test_files(Path::new("tests/sqlite/index/orderby"), &mut test_files)
+        .expect("Failed to collect index/orderby test files");
+    collect_test_files(Path::new("tests/sqlite/index/orderby_nosort"), &mut test_files)
+        .expect("Failed to collect index/orderby_nosort test files");
+    test_files.sort();
+    let test_files: Vec<&str> = test_files.iter().map(|s| s.as_str()).collect();
+    run_phase_tests(&test_files, "ORDER BY").await;
+}
+
 /// Phase 6: DML Implementation
 /// Tests INSERT, UPDATE, DELETE, REPLACE
 #[tokio::test]
