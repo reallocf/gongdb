@@ -1,14 +1,20 @@
 use crate::ast::{
-    BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr, Ident, IndexedColumn,
-    InsertConflict, InsertSource, JoinConstraint, JoinOperator, Literal, NullsOrder, OrderByExpr,
-    Select, SelectItem, SortOrder, Statement, TableConstraint, TableRef, With,
+    BeginTransaction, BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr,
+    Ident, IndexedColumn, InsertConflict, InsertSource, IsolationLevel, JoinConstraint,
+    JoinOperator, Literal, NullsOrder, OrderByExpr, Select, SelectItem, SortOrder, Statement,
+    TableConstraint, TableRef, With,
 };
 use crate::parser;
-use crate::storage::{Column, IndexMeta, StorageEngine, StorageError, TableMeta, Value, ViewMeta};
+use crate::storage::{
+    Column, IndexMeta, StorageEngine, StorageError, StorageSnapshot, TableMeta, Value, ViewMeta,
+};
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct GongDBError {
@@ -37,9 +43,24 @@ impl From<StorageError> for GongDBError {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TransactionState {
+    id: u64,
+    isolation: IsolationLevel,
+    snapshot: StorageSnapshot,
+    hold_read_lock: bool,
+    read_lock_acquired: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatementLock {
+    txn_id: u64,
+}
+
 pub struct GongDB {
     storage: StorageEngine,
     stats_cache: RefCell<HashMap<String, TableStats>>,
+    transaction: Option<TransactionState>,
 }
 
 impl GongDB {
@@ -47,6 +68,7 @@ impl GongDB {
         Ok(Self {
             storage: StorageEngine::new_in_memory()?,
             stats_cache: RefCell::new(HashMap::new()),
+            transaction: None,
         })
     }
 
@@ -54,11 +76,126 @@ impl GongDB {
         Ok(Self {
             storage: StorageEngine::new_on_disk(path)?,
             stats_cache: RefCell::new(HashMap::new()),
+            transaction: None,
         })
     }
 
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
         let stmt = parser::parse_statement(sql).map_err(|e| GongDBError::new(e.message))?;
+        match stmt {
+            Statement::BeginTransaction(begin) => self.begin_transaction(begin),
+            Statement::Commit => self.commit_transaction(),
+            Statement::Rollback => self.rollback_transaction(),
+            _ => {
+                let is_write = is_write_statement(&stmt);
+                let lock = self.acquire_statement_lock(is_write)?;
+                let result = self.execute_statement(stmt);
+                match result {
+                    Ok(output) => {
+                        self.release_statement_lock(lock);
+                        Ok(output)
+                    }
+                    Err(err) => {
+                        if self.transaction.is_some() {
+                            if let Err(rollback_err) = self.rollback_internal() {
+                                self.release_statement_lock(lock);
+                                return Err(rollback_err);
+                            }
+                        }
+                        self.release_statement_lock(lock);
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+
+    fn begin_transaction(
+        &mut self,
+        begin: BeginTransaction,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if self.transaction.is_some() {
+            return Err(GongDBError::new("transaction already in progress"));
+        }
+        let isolation = begin.isolation.unwrap_or(IsolationLevel::ReadCommitted);
+        let hold_read_lock = matches!(isolation, IsolationLevel::RepeatableRead | IsolationLevel::Serializable);
+        let txn_id = NEXT_TXN_ID.fetch_add(1, Ordering::SeqCst);
+        if hold_read_lock && isolation != IsolationLevel::ReadUncommitted {
+            self.storage.acquire_read_lock(txn_id)?;
+        }
+        let snapshot = self.storage.snapshot()?;
+        self.transaction = Some(TransactionState {
+            id: txn_id,
+            isolation,
+            snapshot,
+            hold_read_lock,
+            read_lock_acquired: hold_read_lock,
+        });
+        Ok(DBOutput::StatementComplete(0))
+    }
+
+    fn commit_transaction(&mut self) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(txn) = self.transaction.take() {
+            self.storage.release_locks(txn.id);
+        }
+        Ok(DBOutput::StatementComplete(0))
+    }
+
+    fn rollback_transaction(&mut self) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if self.transaction.is_some() {
+            self.rollback_internal()?;
+        }
+        Ok(DBOutput::StatementComplete(0))
+    }
+
+    fn rollback_internal(&mut self) -> Result<(), GongDBError> {
+        if let Some(txn) = self.transaction.take() {
+            self.storage.restore(txn.snapshot)?;
+            self.storage.release_locks(txn.id);
+            self.stats_cache.borrow_mut().clear();
+        }
+        Ok(())
+    }
+
+    fn acquire_statement_lock(&mut self, is_write: bool) -> Result<Option<StatementLock>, GongDBError> {
+        if let Some(txn) = &mut self.transaction {
+            if is_write {
+                self.storage.acquire_write_lock(txn.id)?;
+                return Ok(None);
+            }
+            if txn.isolation == IsolationLevel::ReadUncommitted {
+                return Ok(None);
+            }
+            if txn.hold_read_lock {
+                if !txn.read_lock_acquired {
+                    self.storage.acquire_read_lock(txn.id)?;
+                    txn.read_lock_acquired = true;
+                }
+                return Ok(None);
+            }
+            self.storage.acquire_read_lock(txn.id)?;
+            return Ok(Some(StatementLock { txn_id: txn.id }));
+        }
+
+        let txn_id = NEXT_TXN_ID.fetch_add(1, Ordering::SeqCst);
+        if is_write {
+            self.storage.acquire_write_lock(txn_id)?;
+            return Ok(Some(StatementLock { txn_id }));
+        }
+        self.storage.acquire_read_lock(txn_id)?;
+        Ok(Some(StatementLock { txn_id }))
+    }
+
+    fn release_statement_lock(&mut self, lock: Option<StatementLock>) {
+        if let Some(lock) = lock {
+            self.storage.release_locks(lock.txn_id);
+        }
+    }
+
+    fn execute_statement(
+        &mut self,
+        stmt: Statement,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
         match stmt {
             Statement::CreateTable(create) => {
                 let name = object_name(&create.name);
@@ -452,6 +589,9 @@ impl GongDB {
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::Select(select) => self.run_select(&select),
+            Statement::BeginTransaction(_)
+            | Statement::Commit
+            | Statement::Rollback => Err(GongDBError::new("unexpected transaction statement")),
         }
     }
 
@@ -2831,6 +2971,22 @@ fn next_auto_index_name(
             return name;
         }
     }
+}
+
+fn is_write_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::Reindex(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+    )
 }
 
 fn object_name(name: &crate::ast::ObjectName) -> String {

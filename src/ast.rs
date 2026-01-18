@@ -11,6 +11,22 @@ pub enum Statement {
     Update(Update),
     Delete(Delete),
     Select(Select),
+    BeginTransaction(BeginTransaction),
+    Commit,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeginTransaction {
+    pub isolation: Option<IsolationLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

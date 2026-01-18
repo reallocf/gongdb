@@ -6,6 +6,8 @@ use crate::ast::{
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PAGE_SIZE: usize = 4096;
 const HEADER_PAGE_ID: u32 = 0;
@@ -20,6 +22,9 @@ const HEADER_NEXT_PAGE_ID_OFFSET: usize = 12;
 const HEADER_CATALOG_PAGE_ID_OFFSET: usize = 16;
 const HEADER_SCHEMA_VERSION_OFFSET: usize = 20;
 const HEADER_CATALOG_FORMAT_OFFSET: usize = 24;
+
+static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
+static LOCK_MANAGER: OnceLock<Mutex<LockManager>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -119,8 +124,61 @@ enum StorageMode {
     OnDisk { file: File },
 }
 
+#[derive(Debug, Clone)]
+enum StorageModeSnapshot {
+    InMemory { pages: Vec<Vec<u8>> },
+    OnDisk { data: Vec<u8> },
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageSnapshot {
+    mode: StorageModeSnapshot,
+    next_page_id: u32,
+    schema_version: u32,
+    catalog_format_version: u32,
+    tables: HashMap<String, TableMeta>,
+    indexes: HashMap<String, IndexMeta>,
+    views: HashMap<String, ViewMeta>,
+    free_pages: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct LockState {
+    readers: HashMap<u64, usize>,
+    writer: Option<u64>,
+}
+
+impl LockState {
+    fn new() -> Self {
+        Self {
+            readers: HashMap::new(),
+            writer: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LockManager {
+    locks: HashMap<String, LockState>,
+}
+
+impl LockManager {
+    fn new() -> Self {
+        Self {
+            locks: HashMap::new(),
+        }
+    }
+
+    fn state_for_db_mut(&mut self, db_id: &str) -> &mut LockState {
+        self.locks
+            .entry(db_id.to_string())
+            .or_insert_with(LockState::new)
+    }
+}
+
 pub struct StorageEngine {
     mode: StorageMode,
+    db_id: String,
     next_page_id: u32,
     schema_version: u32,
     catalog_format_version: u32,
@@ -195,8 +253,10 @@ impl StorageEngine {
         let mut pages = Vec::new();
         pages.push(vec![0; PAGE_SIZE]);
         pages.push(init_data_page());
+        let id = NEXT_DB_ID.fetch_add(1, Ordering::SeqCst);
         let mut engine = StorageEngine {
             mode: StorageMode::InMemory { pages },
+            db_id: format!("memory-{}", id),
             next_page_id: CATALOG_PAGE_ID + 1,
             schema_version: 0,
             catalog_format_version: CATALOG_FORMAT_VERSION,
@@ -268,6 +328,7 @@ impl StorageEngine {
 
         let mut engine = StorageEngine {
             mode: StorageMode::OnDisk { file },
+            db_id: format!("disk-{}", path),
             next_page_id,
             schema_version,
             catalog_format_version,
@@ -279,6 +340,104 @@ impl StorageEngine {
         engine.write_header()?;
         engine.write_catalog()?;
         Ok(engine)
+    }
+
+    pub fn snapshot(&self) -> Result<StorageSnapshot, StorageError> {
+        let mode = match &self.mode {
+            StorageMode::InMemory { pages } => StorageModeSnapshot::InMemory { pages: pages.clone() },
+            StorageMode::OnDisk { file } => {
+                let mut clone = file.try_clone()?;
+                clone.seek(SeekFrom::Start(0))?;
+                let mut data = Vec::new();
+                clone.read_to_end(&mut data)?;
+                StorageModeSnapshot::OnDisk { data }
+            }
+        };
+        Ok(StorageSnapshot {
+            mode,
+            next_page_id: self.next_page_id,
+            schema_version: self.schema_version,
+            catalog_format_version: self.catalog_format_version,
+            tables: self.tables.clone(),
+            indexes: self.indexes.clone(),
+            views: self.views.clone(),
+            free_pages: self.free_pages.clone(),
+        })
+    }
+
+    pub fn restore(&mut self, snapshot: StorageSnapshot) -> Result<(), StorageError> {
+        match (&mut self.mode, snapshot.mode) {
+            (StorageMode::InMemory { pages }, StorageModeSnapshot::InMemory { pages: snap }) => {
+                *pages = snap;
+            }
+            (StorageMode::OnDisk { file }, StorageModeSnapshot::OnDisk { data }) => {
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&data)?;
+                file.set_len(data.len() as u64)?;
+                file.flush()?;
+            }
+            _ => return Err(StorageError::Invalid("storage mode mismatch".to_string())),
+        }
+
+        self.next_page_id = snapshot.next_page_id;
+        self.schema_version = snapshot.schema_version;
+        self.catalog_format_version = snapshot.catalog_format_version;
+        self.tables = snapshot.tables;
+        self.indexes = snapshot.indexes;
+        self.views = snapshot.views;
+        self.free_pages = snapshot.free_pages;
+        Ok(())
+    }
+
+    pub fn acquire_read_lock(&self, txn_id: u64) -> Result<(), StorageError> {
+        let manager = LOCK_MANAGER.get_or_init(|| Mutex::new(LockManager::new()));
+        let mut guard = manager
+            .lock()
+            .map_err(|_| StorageError::Invalid("lock manager poisoned".to_string()))?;
+        let state = guard.state_for_db_mut(&self.db_id);
+        if let Some(writer) = state.writer {
+            if writer != txn_id {
+                return Err(StorageError::Invalid("database is locked".to_string()));
+            }
+        }
+        *state.readers.entry(txn_id).or_insert(0) += 1;
+        Ok(())
+    }
+
+    pub fn acquire_write_lock(&self, txn_id: u64) -> Result<(), StorageError> {
+        let manager = LOCK_MANAGER.get_or_init(|| Mutex::new(LockManager::new()));
+        let mut guard = manager
+            .lock()
+            .map_err(|_| StorageError::Invalid("lock manager poisoned".to_string()))?;
+        let state = guard.state_for_db_mut(&self.db_id);
+        if let Some(writer) = state.writer {
+            if writer != txn_id {
+                return Err(StorageError::Invalid("database is locked".to_string()));
+            }
+        }
+        let other_readers = state
+            .readers
+            .iter()
+            .any(|(id, count)| *id != txn_id && *count > 0);
+        if other_readers {
+            return Err(StorageError::Invalid("deadlock detected".to_string()));
+        }
+        state.writer = Some(txn_id);
+        Ok(())
+    }
+
+    pub fn release_locks(&self, txn_id: u64) {
+        let manager = LOCK_MANAGER.get_or_init(|| Mutex::new(LockManager::new()));
+        let mut guard = match manager.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if let Some(state) = guard.locks.get_mut(&self.db_id) {
+            state.readers.remove(&txn_id);
+            if state.writer == Some(txn_id) {
+                state.writer = None;
+            }
+        }
     }
 
     pub fn create_table(&mut self, table: TableMeta) -> Result<(), StorageError> {

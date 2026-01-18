@@ -285,6 +285,20 @@ fn is_keyword(word: &str) -> bool {
             | "NUMERIC"
             | "REPLACE"
             | "REINDEX"
+            | "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "TRANSACTION"
+            | "DEFERRED"
+            | "IMMEDIATE"
+            | "EXCLUSIVE"
+            | "READ"
+            | "UNCOMMITTED"
+            | "COMMITTED"
+            | "REPEATABLE"
+            | "SERIALIZABLE"
+            | "ISOLATION"
+            | "LEVEL"
     )
 }
 
@@ -381,8 +395,69 @@ impl Parser {
             TokenKind::Keyword(k) if k == "CREATE" => self.parse_create(),
             TokenKind::Keyword(k) if k == "DROP" => self.parse_drop(),
             TokenKind::Keyword(k) if k == "REINDEX" => Ok(Statement::Reindex(self.parse_reindex()?)),
+            TokenKind::Keyword(k) if k == "BEGIN" => self.parse_begin(),
+            TokenKind::Keyword(k) if k == "COMMIT" => self.parse_commit(),
+            TokenKind::Keyword(k) if k == "END" => self.parse_commit(),
+            TokenKind::Keyword(k) if k == "ROLLBACK" => self.parse_rollback(),
             _ => Err(ParserError::new("unexpected statement")),
         }
+    }
+
+    fn parse_begin(&mut self) -> Result<Statement, ParserError> {
+        self.expect_keyword("BEGIN")?;
+        self.eat_keyword("TRANSACTION");
+        self.eat_keyword("DEFERRED");
+        self.eat_keyword("IMMEDIATE");
+        self.eat_keyword("EXCLUSIVE");
+        let isolation = if self.current_is_keyword("ISOLATION") {
+            self.expect_keyword("ISOLATION")?;
+            self.expect_keyword("LEVEL")?;
+            Some(self.parse_isolation_level()?)
+        } else if self.current_is_keyword("READ")
+            || self.current_is_keyword("REPEATABLE")
+            || self.current_is_keyword("SERIALIZABLE")
+        {
+            Some(self.parse_isolation_level()?)
+        } else {
+            None
+        };
+        Ok(Statement::BeginTransaction(BeginTransaction { isolation }))
+    }
+
+    fn parse_commit(&mut self) -> Result<Statement, ParserError> {
+        if self.current_is_keyword("COMMIT") {
+            self.expect_keyword("COMMIT")?;
+        } else {
+            self.expect_keyword("END")?;
+        }
+        self.eat_keyword("TRANSACTION");
+        Ok(Statement::Commit)
+    }
+
+    fn parse_rollback(&mut self) -> Result<Statement, ParserError> {
+        self.expect_keyword("ROLLBACK")?;
+        self.eat_keyword("TRANSACTION");
+        Ok(Statement::Rollback)
+    }
+
+    fn parse_isolation_level(&mut self) -> Result<IsolationLevel, ParserError> {
+        if self.eat_keyword("READ") {
+            if self.eat_keyword("UNCOMMITTED") {
+                return Ok(IsolationLevel::ReadUncommitted);
+            }
+            if self.eat_keyword("COMMITTED") {
+                return Ok(IsolationLevel::ReadCommitted);
+            }
+            return Err(ParserError::new("expected UNCOMMITTED or COMMITTED"));
+        }
+        if self.eat_keyword("REPEATABLE") {
+            self.eat_keyword("READ");
+            return Ok(IsolationLevel::RepeatableRead);
+        }
+        if self.eat_keyword("SERIALIZABLE") {
+            return Ok(IsolationLevel::Serializable);
+        }
+        Err(ParserError::new("unsupported isolation level"))
     }
 
     fn parse_create(&mut self) -> Result<Statement, ParserError> {

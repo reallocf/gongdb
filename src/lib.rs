@@ -375,6 +375,9 @@ fn should_use_gongdb(test_file: &str) -> bool {
     if test_file.ends_with("phase11_indexing.test") {
         return true;
     }
+    if test_file.ends_with("phase13_transactions.test") {
+        return true;
+    }
     if test_file.contains("/index/") {
         return true;
     }
