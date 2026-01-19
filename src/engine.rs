@@ -597,6 +597,16 @@ impl GongDB {
                 };
                 let column_scopes = vec![table_scope.clone(); table.columns.len()];
                 let column_lookup = build_column_lookup(&table.columns, &column_scopes);
+                let mut skip_predicate = false;
+                if let Some(predicate) = &update.selection {
+                    if expr_is_constant(predicate) {
+                        let value = eval_constant_expr_checked(self, predicate)?;
+                        if !value_to_bool(&value) {
+                            return Ok(DBOutput::StatementComplete(0));
+                        }
+                        skip_predicate = true;
+                    }
+                }
                 let mut updated_rows = Vec::with_capacity(rows.len());
                 for row in rows {
                     let scope = EvalScope {
@@ -607,11 +617,13 @@ impl GongDB {
                         cte_context: None,
                         column_lookup: Some(&column_lookup),
                     };
-                    if let Some(predicate) = &update.selection {
-                        let value = eval_expr(self, predicate, &scope, None)?;
-                        if !value_to_bool(&value) {
-                            updated_rows.push(row);
-                            continue;
+                    if !skip_predicate {
+                        if let Some(predicate) = &update.selection {
+                            let value = eval_expr(self, predicate, &scope, None)?;
+                            if !value_to_bool(&value) {
+                                updated_rows.push(row);
+                                continue;
+                            }
                         }
                     }
                     let mut new_row = row.clone();
@@ -652,6 +664,16 @@ impl GongDB {
                 };
                 let column_scopes = vec![table_scope.clone(); table.columns.len()];
                 let column_lookup = build_column_lookup(&table.columns, &column_scopes);
+                if let Some(predicate) = &delete.selection {
+                    if expr_is_constant(predicate) {
+                        let value = eval_constant_expr_checked(self, predicate)?;
+                        if value_to_bool(&value) {
+                            self.storage.replace_table_rows(&table_name, &[])?;
+                        }
+                        self.invalidate_table_stats(&table_name);
+                        return Ok(DBOutput::StatementComplete(0));
+                    }
+                }
                 let mut remaining_rows = Vec::with_capacity(rows.len());
                 for row in rows {
                     let scope = EvalScope {
@@ -1650,7 +1672,7 @@ impl GongDB {
                 self,
                 current,
                 right,
-                &join_predicates,
+                join_predicates,
                 outer,
                 cte_context,
             )?;
@@ -2380,6 +2402,10 @@ fn eval_constant_expr(db: &GongDB, expr: &Expr) -> Option<Value> {
     if !expr_is_constant(expr) {
         return None;
     }
+    eval_constant_expr_checked(db, expr).ok()
+}
+
+fn eval_constant_expr_checked(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
     let scope = EvalScope {
         columns: &[],
         column_scopes: &[],
@@ -2391,7 +2417,7 @@ fn eval_constant_expr(db: &GongDB, expr: &Expr) -> Option<Value> {
         cte_context: None,
         column_lookup: None,
     };
-    eval_expr(db, expr, &scope, None).ok()
+    eval_expr(db, expr, &scope, None)
 }
 
 fn expr_is_constant(expr: &Expr) -> bool {
@@ -2828,6 +2854,23 @@ fn apply_predicates_to_source(
     if predicates.is_empty() {
         return Ok(source);
     }
+    let mut remaining = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        if expr_is_constant(&predicate) {
+            let value = eval_constant_expr_checked(db, &predicate)?;
+            if !value_to_bool(&value) {
+                return Ok(QuerySource {
+                    rows: Vec::new(),
+                    ..source
+                });
+            }
+        } else {
+            remaining.push(predicate);
+        }
+    }
+    if remaining.is_empty() {
+        return Ok(source);
+    }
     let table_scope = source.table_scope.clone();
     let column_lookup = build_column_lookup(&source.columns, &source.column_scopes);
     let mut rows = Vec::new();
@@ -2841,7 +2884,7 @@ fn apply_predicates_to_source(
             column_lookup: Some(&column_lookup),
         };
         let mut keep = true;
-        for predicate in &predicates {
+        for predicate in &remaining {
             let value = eval_expr(db, predicate, &scope, outer)?;
             if !value_to_bool(&value) {
                 keep = false;
@@ -2862,13 +2905,13 @@ fn join_sources_with_predicates(
     db: &GongDB,
     left: QuerySource,
     right: QuerySource,
-    predicates: &[Expr],
+    predicates: Vec<Expr>,
     outer: Option<&EvalScope<'_>>,
     cte_context: Option<&CteContext>,
 ) -> Result<QuerySource, GongDBError> {
     let QuerySource {
-        columns: left_columns,
-        column_scopes: left_scopes,
+        columns: mut left_columns,
+        column_scopes: mut left_scopes,
         rows: left_rows,
         ..
     } = left;
@@ -2878,22 +2921,39 @@ fn join_sources_with_predicates(
         rows: right_rows,
         ..
     } = right;
-    let (join_pairs, remaining_predicates) = extract_join_pairs(
-        predicates,
-        &left_columns,
-        &left_scopes,
-        &right_columns,
-        &right_scopes,
-    );
-    let mut columns = left_columns;
-    columns.extend(right_columns);
-    let mut column_scopes = left_scopes;
-    column_scopes.extend(right_scopes);
+    let left_len = left_columns.len();
+    left_columns.extend(right_columns);
+    left_scopes.extend(right_scopes);
+    let columns = left_columns;
+    let column_scopes = left_scopes;
     let table_scope = TableScope {
         table_name: None,
         table_alias: None,
     };
     let column_lookup = build_column_lookup(&columns, &column_scopes);
+    let mut filtered_predicates = Vec::with_capacity(predicates.len());
+    for predicate in predicates {
+        if expr_is_constant(&predicate) {
+            let value = eval_constant_expr_checked(db, &predicate)?;
+            if !value_to_bool(&value) {
+                return Ok(QuerySource {
+                    columns,
+                    column_scopes,
+                    rows: Vec::new(),
+                    table_scope,
+                });
+            }
+        } else {
+            filtered_predicates.push(predicate);
+        }
+    }
+    let (join_pairs, remaining_predicates) = extract_join_pairs(
+        &filtered_predicates,
+        &columns[..left_len],
+        &column_scopes[..left_len],
+        &columns[left_len..],
+        &column_scopes[left_len..],
+    );
     let mut rows = Vec::new();
     if join_pairs.is_empty() {
         for left_row in left_rows {
@@ -2901,7 +2961,7 @@ fn join_sources_with_predicates(
                 let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                 combined.extend(left_row.iter().cloned());
                 combined.extend(right_row.iter().cloned());
-                if !predicates.is_empty() {
+                if !remaining_predicates.is_empty() {
                     let scope = EvalScope {
                         columns: &columns,
                         column_scopes: &column_scopes,
@@ -2911,7 +2971,7 @@ fn join_sources_with_predicates(
                         column_lookup: Some(&column_lookup),
                     };
                     let mut keep = true;
-                    for predicate in predicates {
+                    for predicate in &remaining_predicates {
                         let value = eval_expr(db, predicate, &scope, outer)?;
                         if !value_to_bool(&value) {
                             keep = false;
