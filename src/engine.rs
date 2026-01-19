@@ -1037,9 +1037,11 @@ impl GongDB {
                         let mut right_rows = right.rows;
                         dedup_rows(&mut left_rows);
                         dedup_rows(&mut right_rows);
+                        let right_keys: HashSet<Vec<DistinctKey>> =
+                            right_rows.iter().map(|row| row_distinct_key(row)).collect();
                         let mut merged = Vec::new();
                         for row in left_rows {
-                            if right_rows.iter().any(|candidate| rows_equal(&row, candidate)) {
+                            if right_keys.contains(&row_distinct_key(&row)) {
                                 merged.push(row);
                             }
                         }
@@ -1050,12 +1052,11 @@ impl GongDB {
                         let mut right_rows = right.rows;
                         dedup_rows(&mut left_rows);
                         dedup_rows(&mut right_rows);
+                        let right_keys: HashSet<Vec<DistinctKey>> =
+                            right_rows.iter().map(|row| row_distinct_key(row)).collect();
                         let mut merged = Vec::new();
                         for row in left_rows {
-                            if right_rows
-                                .iter()
-                                .all(|candidate| !rows_equal(&row, candidate))
-                            {
+                            if !right_keys.contains(&row_distinct_key(&row)) {
                                 merged.push(row);
                             }
                         }
@@ -5801,15 +5802,6 @@ struct OrderByPlan {
 struct SortedRow {
     order_values: Vec<Value>,
     projected: Vec<Value>,
-}
-
-fn rows_equal(left: &[Value], right: &[Value]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .all(|(l, r)| values_equal(l, r))
 }
 
 fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
