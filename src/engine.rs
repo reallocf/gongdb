@@ -1612,6 +1612,19 @@ impl GongDB {
         };
         let column_scopes = vec![table_scope.clone(); table.columns.len()];
         let column_lookup = build_column_lookup(&table.columns, &column_scopes);
+        let mut selection = selection;
+        if let Some(predicate) = selection {
+            if expr_is_constant(predicate) {
+                let value = eval_constant_expr_checked(self, predicate)?;
+                if !value_to_bool(&value) {
+                    return Ok((Vec::new(), false));
+                }
+                selection = None;
+            }
+        }
+        let predicate_plan = selection.map(|predicate| {
+            self.build_row_predicate_plan(predicate, &table_scope, &table.columns)
+        });
         let mut ordered_by_index = false;
         let mut rows = if let Some(plan) =
             choose_index_scan_plan(self, table, selection, order_by, &table_scope)
@@ -1619,15 +1632,64 @@ impl GongDB {
             ordered_by_index = plan.ordered_by;
             scan_rows_with_index(self, &plan)?
         } else {
-            let mut rows = Vec::new();
+            let mut rows = Vec::with_capacity(table.row_count as usize);
             let mut scan = self.storage.table_scan(table_name)?;
             while let Some(result) = scan.next() {
-                rows.push(result?);
+                let row = result?;
+                if let Some(plan) = predicate_plan.as_ref() {
+                    if !row_matches_predicate_plan(
+                        self,
+                        plan,
+                        &row,
+                        &table.columns,
+                        &column_scopes,
+                        &table_scope,
+                        cte_context,
+                        outer,
+                        &column_lookup,
+                    )? {
+                        continue;
+                    }
+                } else if let Some(predicate) = selection {
+                    let scope = EvalScope {
+                        columns: &table.columns,
+                        column_scopes: &column_scopes,
+                        row: &row,
+                        table_scope: &table_scope,
+                        cte_context,
+                        column_lookup: Some(&column_lookup),
+                    };
+                    let value = eval_expr(self, predicate, &scope, outer)?;
+                    if !value_to_bool(&value) {
+                        continue;
+                    }
+                }
+                rows.push(row);
             }
             rows
         };
-        if let Some(predicate) = selection {
-            let mut filtered = Vec::new();
+        if let Some(plan) = predicate_plan.as_ref() {
+            if !rows.is_empty() {
+                let mut filtered = Vec::with_capacity(rows.len());
+                for row in rows.drain(..) {
+                    if row_matches_predicate_plan(
+                        self,
+                        plan,
+                        &row,
+                        &table.columns,
+                        &column_scopes,
+                        &table_scope,
+                        cte_context,
+                        outer,
+                        &column_lookup,
+                    )? {
+                        filtered.push(row);
+                    }
+                }
+                rows = filtered;
+            }
+        } else if let Some(predicate) = selection {
+            let mut filtered = Vec::with_capacity(rows.len());
             for row in rows.drain(..) {
                 let scope = EvalScope {
                     columns: &table.columns,
@@ -1646,6 +1708,26 @@ impl GongDB {
             rows = filtered;
         }
         Ok((rows, ordered_by_index))
+    }
+
+    fn build_row_predicate_plan(
+        &self,
+        selection: &Expr,
+        table_scope: &TableScope,
+        columns: &[Column],
+    ) -> RowPredicatePlan {
+        let mut simple = Vec::new();
+        let mut complex = Vec::new();
+        for expr in split_conjuncts(selection) {
+            if let Some(predicate) =
+                simple_predicate_from_expr(self, &expr, table_scope, columns)
+            {
+                simple.push(predicate);
+            } else {
+                complex.push(expr);
+            }
+        }
+        RowPredicatePlan { simple, complex }
     }
 
     fn resolve_table_ref(
@@ -2055,6 +2137,30 @@ struct IndexScanPlan {
     lower: Option<Vec<Value>>,
     upper: Option<Vec<Value>>,
     ordered_by: bool,
+}
+
+#[derive(Clone)]
+struct RowPredicatePlan {
+    simple: Vec<SimpleRowPredicate>,
+    complex: Vec<Expr>,
+}
+
+#[derive(Clone)]
+enum SimpleRowPredicate {
+    Compare {
+        idx: usize,
+        op: BinaryOperator,
+        value: Value,
+    },
+    Between {
+        idx: usize,
+        low: Value,
+        high: Value,
+    },
+    IsNull {
+        idx: usize,
+        negated: bool,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -2670,6 +2776,127 @@ fn expr_is_constant(expr: &Expr) -> bool {
         Expr::Nested(expr) => expr_is_constant(expr),
         Expr::InSubquery { .. } | Expr::Exists(_) | Expr::Subquery(_) => false,
     }
+}
+
+fn simple_predicate_from_expr(
+    db: &GongDB,
+    expr: &Expr,
+    table_scope: &TableScope,
+    columns: &[Column],
+) -> Option<SimpleRowPredicate> {
+    match expr {
+        Expr::IsNull { expr, negated } => {
+            let (idx, _name) = column_ref_for_expr(expr, table_scope, columns)?;
+            Some(SimpleRowPredicate::IsNull {
+                idx,
+                negated: *negated,
+            })
+        }
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } => {
+            let (idx, _name) = column_ref_for_expr(expr, table_scope, columns)?;
+            let low_val = eval_constant_expr(db, low)?;
+            let high_val = eval_constant_expr(db, high)?;
+            Some(SimpleRowPredicate::Between {
+                idx,
+                low: apply_affinity(low_val, &columns[idx].data_type),
+                high: apply_affinity(high_val, &columns[idx].data_type),
+            })
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if !matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+            ) {
+                return None;
+            }
+            if let Some((idx, _name)) = column_ref_for_expr(left, table_scope, columns) {
+                let value = eval_constant_expr(db, right)?;
+                return Some(SimpleRowPredicate::Compare {
+                    idx,
+                    op: op.clone(),
+                    value: apply_affinity(value, &columns[idx].data_type),
+                });
+            }
+            if let Some((idx, _name)) = column_ref_for_expr(right, table_scope, columns) {
+                let value = eval_constant_expr(db, left)?;
+                let op = if *op == BinaryOperator::NotEq {
+                    BinaryOperator::NotEq
+                } else {
+                    invert_comparison_operator(op)?
+                };
+                return Some(SimpleRowPredicate::Compare {
+                    idx,
+                    op,
+                    value: apply_affinity(value, &columns[idx].data_type),
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn row_matches_predicate_plan(
+    db: &GongDB,
+    plan: &RowPredicatePlan,
+    row: &[Value],
+    columns: &[Column],
+    column_scopes: &[TableScope],
+    table_scope: &TableScope,
+    cte_context: Option<&CteContext>,
+    outer: Option<&EvalScope<'_>>,
+    column_lookup: &ColumnLookup,
+) -> Result<bool, GongDBError> {
+    for predicate in &plan.simple {
+        let matches = match predicate {
+            SimpleRowPredicate::Compare { idx, op, value } => {
+                let comparison = compare_values(op, &row[*idx], value);
+                value_to_bool(&comparison)
+            }
+            SimpleRowPredicate::Between { idx, low, high } => {
+                let lower = compare_values(&BinaryOperator::GtEq, &row[*idx], low);
+                let upper = compare_values(&BinaryOperator::LtEq, &row[*idx], high);
+                let between = apply_logical_and(&lower, &upper);
+                value_to_bool(&between)
+            }
+            SimpleRowPredicate::IsNull { idx, negated } => {
+                let is_null = matches!(row[*idx], Value::Null);
+                if *negated { !is_null } else { is_null }
+            }
+        };
+        if !matches {
+            return Ok(false);
+        }
+    }
+
+    if plan.complex.is_empty() {
+        return Ok(true);
+    }
+    let scope = EvalScope {
+        columns,
+        column_scopes,
+        row,
+        table_scope,
+        cte_context,
+        column_lookup: Some(column_lookup),
+    };
+    for predicate in &plan.complex {
+        let value = eval_expr(db, predicate, &scope, outer)?;
+        if !value_to_bool(&value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn split_conjuncts(expr: &Expr) -> Vec<Expr> {
