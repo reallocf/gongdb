@@ -1815,9 +1815,7 @@ impl GongDB {
                 selection = None;
             }
         }
-        let predicate_plan = selection.map(|predicate| {
-            self.build_row_predicate_plan(predicate, &table_scope, &table.columns)
-        });
+        let predicate_plan: Option<RowPredicatePlan> = None;
         let mut ordered_by_index = false;
         let mut rows = if let Some(plan) =
             choose_index_scan_plan(self, table, selection, order_by, &table_scope)
@@ -1825,7 +1823,7 @@ impl GongDB {
             ordered_by_index = plan.ordered_by;
             scan_rows_with_index(self, &plan)?
         } else {
-            let mut rows = Vec::with_capacity(table.row_count as usize);
+            let mut fresh_rows = Vec::with_capacity(table.row_count as usize);
             let mut scan = self.storage.table_scan(table_name)?;
             while let Some(result) = scan.next() {
                 let row = result?;
@@ -1857,9 +1855,9 @@ impl GongDB {
                         continue;
                     }
                 }
-                rows.push(row);
+                fresh_rows.push(row);
             }
-            rows
+            fresh_rows
         };
         if let Some(plan) = predicate_plan.as_ref() {
             if !rows.is_empty() {
