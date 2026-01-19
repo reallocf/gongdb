@@ -32,10 +32,17 @@ A database project built with Rust, including comprehensive SQL test coverage us
 
 ## Dependencies
 
+### Runtime Dependencies
+
 - `sqllogictest`: SQL logic test framework for testing database implementations (v0.29)
 - `rusqlite`: SQLite database driver for running tests
 - `tokio`: Async runtime
 - `async-trait`: Async trait support
+
+### Development Dependencies
+
+- `dhat`: Heap profiling tool for memory analysis
+- `criterion`: Statistical benchmarking framework with HTML reports
 
 ## SQL Logic Testing
 
@@ -71,6 +78,47 @@ All test files are located in `tests/sqlite/` with the same directory structure 
 
 See `tests/sqlite/README.md` for more details about the test files.
 
+## Performance Profiling
+
+gongdb includes comprehensive profiling tools for performance analysis and optimization.
+
+### Available Tools
+
+1. **CPU Profiling**: Flamegraphs using `cargo-flamegraph`
+2. **macOS Instruments**: Native profiling via `cargo-instruments` (macOS only)
+3. **Heap Profiling**: Memory allocation tracking with `dhat-rs`
+4. **Benchmarking**: Statistical benchmarks with `criterion`
+
+### Quick Start
+
+```bash
+# Install profiling tools (one-time setup)
+cargo install flamegraph
+cargo install cargo-instruments  # macOS only
+
+# Generate CPU flamegraph
+cargo flamegraph --release --bin gongdb
+
+# Run benchmarks
+cargo bench --bench performance
+
+# Profile performance tests
+cargo flamegraph --test performance
+```
+
+### Documentation
+
+For detailed profiling instructions, examples, and best practices, see [`docs/PROFILING.md`](docs/PROFILING.md).
+
+The profiling guide covers:
+- Setting up profiling tools
+- CPU profiling with flamegraphs
+- macOS Instruments integration
+- Heap profiling with dhat-rs
+- Structured benchmarking with criterion
+- Performance analysis workflows
+- Troubleshooting common issues
+
 ## Project Structure
 
 ```
@@ -81,7 +129,8 @@ gongdb/
 │   └── bin/
 │       └── run_tests.rs   # SQL logic test runner
 ├── docs/
-│   └── ARCHITECTURE.md    # Architecture and design documentation
+│   ├── ARCHITECTURE.md    # Architecture and design documentation
+│   └── PROFILING.md       # Performance profiling guide
 ├── tests/
 │   └── sqlite/            # SQLite test suite (408 files)
 │       ├── *.test         # Main test files

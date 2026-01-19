@@ -329,6 +329,7 @@ impl GongDB {
                     constraints: plan.constraints,
                     first_page,
                     last_page: first_page,
+                    row_count: 0,
                 };
                 self.storage.create_table(meta)?;
                 self.invalidate_table_stats(&name);
@@ -888,6 +889,32 @@ impl GongDB {
     ) -> Result<QueryResult, GongDBError> {
         let mut selection_applied = false;
         let mut preordered_by_index = false;
+        if select.from.len() == 1
+            && select.selection.is_none()
+            && select.group_by.is_empty()
+            && select.having.is_none()
+            && select.order_by.is_empty()
+            && is_count_star(select)
+        {
+            if let crate::ast::TableRef::Named { name, alias } = &select.from[0] {
+                let table_name = object_name(name);
+                if let Some(table) = self.storage.get_table(&table_name) {
+                    let table_alias = alias.as_ref().map(|ident| ident.value.clone());
+                    let table_scope = TableScope {
+                        table_name: Some(table_name),
+                        table_alias,
+                    };
+                    let column_scopes = vec![table_scope.clone(); table.columns.len()];
+                    let output_columns =
+                        projection_columns(&select.projection, &table.columns, &column_scopes)?;
+                    let count = table.row_count as i64;
+                    return Ok(QueryResult {
+                        columns: output_columns,
+                        rows: vec![vec![Value::Integer(count)]],
+                    });
+                }
+            }
+        }
         let source = if select.from.len() == 1 {
             if let crate::ast::TableRef::Named { name, alias } = &select.from[0] {
                 let table_name = object_name(name);

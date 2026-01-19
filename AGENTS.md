@@ -106,6 +106,42 @@ The project includes:
 - Running all 408 test files will take significant time
 - The project uses `sqllogictest` v0.29 for test execution
 
+## Performance Profiling
+
+gongdb includes comprehensive profiling tools for performance analysis. See `docs/PROFILING.md` for detailed documentation.
+
+### Quick Profiling Commands
+
+```bash
+# Install profiling tools (one-time setup)
+cargo install flamegraph
+cargo install cargo-instruments  # macOS only
+
+# CPU profiling with flamegraphs
+cargo flamegraph --release --bin gongdb
+
+# macOS Instruments profiling
+cargo instruments -t "Time Profiler" --release --bin gongdb
+
+# Heap profiling (add dhat to test code)
+cargo test --test performance -- --nocapture
+
+# Structured benchmarking
+cargo bench --bench performance
+```
+
+### Profiling Performance Tests
+
+```bash
+# Profile performance tests
+cargo flamegraph --test performance
+
+# Profile with Instruments
+cargo instruments -t "Time Profiler" --test performance
+```
+
+For detailed profiling instructions, see `docs/PROFILING.md`.
+
 ## Quick Reference
 
 ```bash
@@ -120,6 +156,10 @@ cargo test --test sqllogictest -- --ignored --no-capture
 
 # Run via binary
 cargo run --bin run_tests
+
+# Performance profiling
+cargo flamegraph --release --bin gongdb
+cargo bench --bench performance
 ```
 
 ## Landing the Plane (Session Completion)

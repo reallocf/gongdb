@@ -29,7 +29,7 @@ const PAGE_SIZE: usize = 65535;
 const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
-const CATALOG_FORMAT_VERSION: u32 = 4;
+const CATALOG_FORMAT_VERSION: u32 = 5;
 const PAGE_TYPE_DATA: u8 = 1;
 const PAGE_TYPE_BTREE_LEAF: u8 = 2;
 const PAGE_TYPE_BTREE_INTERNAL: u8 = 3;
@@ -110,6 +110,8 @@ pub struct TableMeta {
     pub first_page: u32,
     /// Last data page ID.
     pub last_page: u32,
+    /// Cached row count for fast COUNT(*) queries.
+    pub row_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -535,7 +537,15 @@ impl StorageEngine {
         let mut header = vec![0; PAGE_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header)?;
-        let (next_page_id, schema_version, catalog_format_version, tables, indexes, views) =
+        let (
+            next_page_id,
+            schema_version,
+            catalog_format_version,
+            tables,
+            indexes,
+            views,
+            needs_row_count_rebuild,
+        ) =
             if header.starts_with(&FILE_MAGIC) {
                 let next_page_id = read_u32(&header, HEADER_NEXT_PAGE_ID_OFFSET);
                 let schema_version = read_u32(&header, HEADER_SCHEMA_VERSION_OFFSET);
@@ -550,6 +560,7 @@ impl StorageEngine {
                 if catalog_format_version < CATALOG_FORMAT_VERSION {
                     catalog_format_version = CATALOG_FORMAT_VERSION;
                 }
+                let needs_row_count_rebuild = loaded_format_version < 5;
                 (
                     next_page_id,
                     schema_version,
@@ -557,6 +568,7 @@ impl StorageEngine {
                     tables,
                     indexes,
                     views,
+                    needs_row_count_rebuild,
                 )
         } else {
             let tables = HashMap::new();
@@ -569,6 +581,7 @@ impl StorageEngine {
                 tables,
                 indexes,
                 views,
+                false,
             )
         };
 
@@ -590,6 +603,9 @@ impl StorageEngine {
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
             pending_sync_writes: 0,
         };
+        if needs_row_count_rebuild {
+            engine.recompute_table_row_counts()?;
+        }
         engine.ensure_reserved_pages(engine.next_page_id)?;
         engine.write_header()?;
         engine.write_catalog()?;
@@ -785,6 +801,14 @@ impl StorageEngine {
         self.tables.get(name)
     }
 
+    /// Return the cached row count for a table.
+    pub fn table_row_count(&self, name: &str) -> Result<u64, StorageError> {
+        self.tables
+            .get(name)
+            .map(|table| table.row_count)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", name)))
+    }
+
     /// Create a view and persist it to the catalog.
     pub fn create_view(&mut self, view: ViewMeta) -> Result<(), StorageError> {
         if self.views.contains_key(&view.name) {
@@ -929,6 +953,9 @@ impl StorageEngine {
             self.insert_index_record(&index_name, &entry)?;
         }
 
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.row_count = table.row_count.saturating_add(1);
+        }
         self.write_catalog()?;
         Ok(location)
     }
@@ -1043,6 +1070,27 @@ impl StorageEngine {
         TableScan::new(self, table)
     }
 
+    fn count_table_rows(&self, table_name: &str) -> Result<u64, StorageError> {
+        let mut count = 0u64;
+        let mut scan = self.table_scan(table_name)?;
+        while let Some(result) = scan.next() {
+            result?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
+    fn recompute_table_row_counts(&mut self) -> Result<(), StorageError> {
+        let table_names: Vec<String> = self.tables.keys().cloned().collect();
+        for name in table_names {
+            let count = self.count_table_rows(&name)?;
+            if let Some(table) = self.tables.get_mut(&name) {
+                table.row_count = count;
+            }
+        }
+        Ok(())
+    }
+
     fn scan_table_with_locations(
         &self,
         table_name: &str,
@@ -1092,6 +1140,7 @@ impl StorageEngine {
         if let Some(table) = self.tables.get_mut(table_name) {
             table.first_page = new_first_page;
             table.last_page = new_first_page;
+            table.row_count = 0;
         }
 
         let index_names: Vec<String> = self
@@ -1865,7 +1914,7 @@ fn load_catalog_from_file(
                 }
                 match record[0] {
                     1 => {
-                        let table = decode_table_meta(&record[1..])?;
+                        let table = decode_table_meta(&record[1..], format_version)?;
                         tables.insert(table.name.clone(), table);
                     }
                     2 => {
@@ -1892,7 +1941,7 @@ fn load_catalog_from_file(
                 let table = if format_version == 0 {
                     decode_table_meta_v0(&record)?
                 } else {
-                    decode_table_meta(&record)?
+                    decode_table_meta(&record, format_version)?
                 };
                 tables.insert(table.name.clone(), table);
             }
@@ -3224,10 +3273,11 @@ fn encode_table_meta(table: &TableMeta) -> Result<Vec<u8>, StorageError> {
     }
     buf.extend_from_slice(&table.first_page.to_le_bytes());
     buf.extend_from_slice(&table.last_page.to_le_bytes());
+    buf.extend_from_slice(&table.row_count.to_le_bytes());
     Ok(buf)
 }
 
-fn decode_table_meta(record: &[u8]) -> Result<TableMeta, StorageError> {
+fn decode_table_meta(record: &[u8], format_version: u32) -> Result<TableMeta, StorageError> {
     let mut pos = 0;
     if record.len() < 2 {
         return Err(StorageError::Corrupt("invalid table meta".to_string()));
@@ -3287,13 +3337,23 @@ fn decode_table_meta(record: &[u8]) -> Result<TableMeta, StorageError> {
         return Err(StorageError::Corrupt("invalid table meta".to_string()));
     }
     let first_page = read_u32(record, pos);
-    let last_page = read_u32(record, pos + 4);
+    pos += 4;
+    let last_page = read_u32(record, pos);
+    pos += 4;
+    let row_count = if pos + 8 <= record.len() {
+        read_u64(record, pos)
+    } else if format_version >= 5 {
+        return Err(StorageError::Corrupt("invalid table row count".to_string()));
+    } else {
+        0
+    };
     Ok(TableMeta {
         name,
         columns,
         constraints,
         first_page,
         last_page,
+        row_count,
     })
 }
 
@@ -3345,6 +3405,7 @@ fn decode_table_meta_v0(record: &[u8]) -> Result<TableMeta, StorageError> {
         constraints: Vec::new(),
         first_page,
         last_page,
+        row_count: 0,
     })
 }
 
@@ -4001,6 +4062,12 @@ fn read_u32(buf: &[u8], offset: usize) -> u32 {
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&buf[offset..offset + 4]);
     u32::from_le_bytes(bytes)
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(bytes)
 }
 
 fn write_u16(buf: &mut [u8], offset: usize, value: u16) {

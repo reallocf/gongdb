@@ -13,3 +13,9 @@ md-5 = "0.10"
 regex = "1.10"
 
 [dev-dependencies]
+dhat = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "performance"
+harness = false
