@@ -531,12 +531,17 @@ impl GongDB {
                     if unique_indexes.is_empty() {
                         match &insert.source {
                             InsertSource::Values(values) => {
+                                let mut rows = Vec::with_capacity(values.len());
                                 for exprs in values {
-                                    let row =
-                                        build_insert_row(self, &table, &insert.columns, exprs)?;
-                                    let _ = self.storage.insert_row(&table_name, &row)?;
-                                    inserted += 1;
+                                    rows.push(build_insert_row(
+                                        self,
+                                        &table,
+                                        &insert.columns,
+                                        exprs,
+                                    )?);
                                 }
+                                self.storage.insert_rows(&table_name, &rows)?;
+                                inserted += rows.len() as u64;
                             }
                             InsertSource::Select(select) => {
                                 let result = self.evaluate_select_values(select)?;
@@ -547,16 +552,17 @@ impl GongDB {
                                 } else if result.columns.len() != insert.columns.len() {
                                     return Err(GongDBError::new("column count mismatch"));
                                 }
+                                let mut rows = Vec::with_capacity(result.rows.len());
                                 for values in result.rows {
-                                    let row = build_insert_row_from_values(
+                                    rows.push(build_insert_row_from_values(
                                         self,
                                         &table,
                                         &insert.columns,
                                         &values,
-                                    )?;
-                                    let _ = self.storage.insert_row(&table_name, &row)?;
-                                    inserted += 1;
+                                    )?);
                                 }
+                                self.storage.insert_rows(&table_name, &rows)?;
+                                inserted += rows.len() as u64;
                             }
                         }
                     } else {
@@ -607,12 +613,17 @@ impl GongDB {
                 } else {
                     match &insert.source {
                         InsertSource::Values(values) => {
+                            let mut rows = Vec::with_capacity(values.len());
                             for exprs in values {
-                                let row =
-                                    build_insert_row(self, &table, &insert.columns, exprs)?;
-                                let _ = self.storage.insert_row(&table_name, &row)?;
-                                inserted += 1;
+                                rows.push(build_insert_row(
+                                    self,
+                                    &table,
+                                    &insert.columns,
+                                    exprs,
+                                )?);
                             }
+                            self.storage.insert_rows(&table_name, &rows)?;
+                            inserted += rows.len() as u64;
                         }
                         InsertSource::Select(select) => {
                             let result = self.evaluate_select_values(select)?;
@@ -623,16 +634,17 @@ impl GongDB {
                             } else if result.columns.len() != insert.columns.len() {
                                 return Err(GongDBError::new("column count mismatch"));
                             }
+                            let mut rows = Vec::with_capacity(result.rows.len());
                             for values in result.rows {
-                                let row = build_insert_row_from_values(
+                                rows.push(build_insert_row_from_values(
                                     self,
                                     &table,
                                     &insert.columns,
                                     &values,
-                                )?;
-                                let _ = self.storage.insert_row(&table_name, &row)?;
-                                inserted += 1;
+                                )?);
                             }
+                            self.storage.insert_rows(&table_name, &rows)?;
+                            inserted += rows.len() as u64;
                         }
                     }
                 }

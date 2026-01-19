@@ -893,14 +893,30 @@ impl StorageEngine {
 
     /// Insert a row into a table.
     pub fn insert_row(&mut self, table_name: &str, row: &[Value]) -> Result<(), StorageError> {
-        let _ = self.insert_row_with_location(table_name, row)?;
+        let _ = self.insert_row_with_location_internal(table_name, row, true)?;
         Ok(())
     }
 
-    fn insert_row_with_location(
+    pub fn insert_rows(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<(), StorageError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in rows {
+            let _ = self.insert_row_with_location_internal(table_name, row, false)?;
+        }
+        self.write_catalog()?;
+        Ok(())
+    }
+
+    fn insert_row_with_location_internal(
         &mut self,
         table_name: &str,
         row: &[Value],
+        write_catalog: bool,
     ) -> Result<RowLocation, StorageError> {
         let table = self
             .tables
@@ -956,7 +972,9 @@ impl StorageEngine {
         if let Some(table) = self.tables.get_mut(table_name) {
             table.row_count = table.row_count.saturating_add(1);
         }
-        self.write_catalog()?;
+        if write_catalog {
+            self.write_catalog()?;
+        }
         Ok(location)
     }
 
@@ -1162,11 +1180,9 @@ impl StorageEngine {
         }
 
         for row in rows {
-            self.insert_row_with_location(table_name, row)?;
+            let _ = self.insert_row_with_location_internal(table_name, row, false)?;
         }
-        if rows.is_empty() {
-            self.write_catalog()?;
-        }
+        self.write_catalog()?;
         Ok(())
     }
 

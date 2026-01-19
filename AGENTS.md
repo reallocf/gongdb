@@ -18,6 +18,35 @@ Use 'bd' for task tracking
 - Rust toolchain must be installed (via rustup)
 - Cargo must be available in the PATH (may need to source `~/.cargo/env`)
 
+### Network and Dependency Issues
+
+If you encounter network errors when fetching dependencies from crates.io:
+
+1. **Verify network connectivity**:
+   ```bash
+   ping -c 1 index.crates.io
+   ```
+
+2. **Fetch dependencies explicitly**:
+   ```bash
+   source ~/.cargo/env
+   cargo fetch
+   ```
+
+3. **Use offline mode** (if dependencies are already cached):
+   ```bash
+   cargo build --offline
+   cargo test --offline
+   ```
+
+4. **Clear and rebuild** (if dependency resolution is stuck):
+   ```bash
+   cargo clean
+   cargo build
+   ```
+
+The `Cargo.lock` file ensures reproducible builds. If network access is intermittent, run `cargo fetch` when online to cache all dependencies for offline use.
+
 ## Compiling the Project
 
 To compile the project:
