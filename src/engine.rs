@@ -975,13 +975,12 @@ impl GongDB {
                 }
                 if select.distinct {
                     let mut unique: Vec<Vec<Value>> = Vec::new();
-                    'row: for row in rows {
-                        for existing in &unique {
-                            if rows_equal(existing, &row) {
-                                continue 'row;
-                            }
+                    let mut seen: HashSet<Vec<DistinctKey>> = HashSet::new();
+                    for row in rows {
+                        let key = row_distinct_key(&row);
+                        if seen.insert(key) {
+                            unique.push(row);
                         }
-                        unique.push(row);
                     }
                     unique
                 } else {
@@ -1045,13 +1044,12 @@ impl GongDB {
                 }
                 let mut sorted_rows = if select.distinct {
                     let mut unique: Vec<SortedRow> = Vec::new();
-                    'row: for row in rows {
-                        for existing in &unique {
-                            if rows_equal(&existing.projected, &row.projected) {
-                                continue 'row;
-                            }
+                    let mut seen: HashSet<Vec<DistinctKey>> = HashSet::new();
+                    for row in rows {
+                        let key = row_distinct_key(&row.projected);
+                        if seen.insert(key) {
+                            unique.push(row);
                         }
-                        unique.push(row);
                     }
                     unique
                 } else {
@@ -4329,6 +4327,34 @@ fn value_to_text(value: &Value) -> String {
     }
 }
 
+#[derive(Clone, Hash, Eq, PartialEq)]
+enum DistinctKey {
+    Null,
+    Numeric(u64),
+    Text(String),
+}
+
+fn distinct_key(value: &Value) -> DistinctKey {
+    match value {
+        Value::Null => DistinctKey::Null,
+        _ => {
+            if let Some(num) = numeric_value(value) {
+                let (mut num, _) = numeric_to_f64(num);
+                if num == 0.0 {
+                    num = 0.0;
+                }
+                DistinctKey::Numeric(num.to_bits())
+            } else {
+                DistinctKey::Text(value_to_text(value))
+            }
+        }
+    }
+}
+
+fn row_distinct_key(row: &[Value]) -> Vec<DistinctKey> {
+    row.iter().map(distinct_key).collect()
+}
+
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Null, Value::Null) => true,
@@ -5488,7 +5514,11 @@ fn compute_aggregates(
             AggregateKind::Count => {
                 let count = if let Some(expr) = &agg.expr {
                     let mut tally = 0i64;
-                    let mut seen = Vec::new();
+                    let mut seen = if agg.distinct {
+                        Some(HashSet::new())
+                    } else {
+                        None
+                    };
                     for row in rows {
                         let scope = EvalScope {
                             columns,
@@ -5500,14 +5530,11 @@ fn compute_aggregates(
                         let value = eval_expr(db, expr, &scope, outer)?;
                         if !matches!(value, Value::Null) {
                             if agg.distinct {
-                                if seen.iter().any(|v| values_equal(v, &value)) {
+                                if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                                     continue;
                                 }
-                                seen.push(value);
-                                tally += 1;
-                            } else {
-                                tally += 1;
                             }
+                            tally += 1;
                         }
                     }
                     tally
@@ -5524,7 +5551,11 @@ fn compute_aggregates(
                 let mut sum_real = 0.0;
                 let mut any_real = false;
                 let mut has_value = false;
-                let mut seen = Vec::new();
+                let mut seen = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     let scope = EvalScope {
                         columns,
@@ -5538,10 +5569,9 @@ fn compute_aggregates(
                         continue;
                     }
                     if agg.distinct {
-                        if seen.iter().any(|v| values_equal(v, &value)) {
+                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                             continue;
                         }
-                        seen.push(value.clone());
                     }
                     if let Some(num) = numeric_value_or_zero(&value) {
                         has_value = true;
@@ -5577,7 +5607,11 @@ fn compute_aggregates(
                 };
                 let mut sum = 0.0;
                 let mut count = 0i64;
-                let mut seen = Vec::new();
+                let mut seen = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     let scope = EvalScope {
                         columns,
@@ -5591,10 +5625,9 @@ fn compute_aggregates(
                         continue;
                     }
                     if agg.distinct {
-                        if seen.iter().any(|v| values_equal(v, &value)) {
+                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                             continue;
                         }
-                        seen.push(value.clone());
                     }
                     if let Some(num) = numeric_value_or_zero(&value) {
                         sum += numeric_to_f64(num).0;
@@ -5612,7 +5645,11 @@ fn compute_aggregates(
                     return Err(GongDBError::new("MIN requires an expression"));
                 };
                 let mut current: Option<NumericValue> = None;
-                let mut seen = Vec::new();
+                let mut seen = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     let scope = EvalScope {
                         columns,
@@ -5626,10 +5663,9 @@ fn compute_aggregates(
                         continue;
                     }
                     if agg.distinct {
-                        if seen.iter().any(|v| values_equal(v, &value)) {
+                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                             continue;
                         }
-                        seen.push(value.clone());
                     }
                     let Some(num) = numeric_value_or_zero(&value) else {
                         continue;
@@ -5656,7 +5692,11 @@ fn compute_aggregates(
                     return Err(GongDBError::new("MAX requires an expression"));
                 };
                 let mut current: Option<NumericValue> = None;
-                let mut seen = Vec::new();
+                let mut seen = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     let scope = EvalScope {
                         columns,
@@ -5670,10 +5710,9 @@ fn compute_aggregates(
                         continue;
                     }
                     if agg.distinct {
-                        if seen.iter().any(|v| values_equal(v, &value)) {
+                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                             continue;
                         }
-                        seen.push(value.clone());
                     }
                     let Some(num) = numeric_value_or_zero(&value) else {
                         continue;
@@ -5700,7 +5739,11 @@ fn compute_aggregates(
                     return Err(GongDBError::new("TOTAL requires an expression"));
                 };
                 let mut sum = 0.0;
-                let mut seen = Vec::new();
+                let mut seen = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 let mut saw_value = false;
                 for row in rows {
                     let scope = EvalScope {
@@ -5715,10 +5758,9 @@ fn compute_aggregates(
                         continue;
                     }
                     if agg.distinct {
-                        if seen.iter().any(|v| values_equal(v, &value)) {
+                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                             continue;
                         }
-                        seen.push(value.clone());
                     }
                     if let Some(num) = numeric_value_or_zero(&value) {
                         sum += numeric_to_f64(num).0;
@@ -5737,7 +5779,11 @@ fn compute_aggregates(
                 };
                 let mut result = String::new();
                 let mut first = true;
-                let mut seen = Vec::new();
+                let mut seen = if agg.distinct {
+                    Some(HashSet::new())
+                } else {
+                    None
+                };
                 for row in rows {
                     let scope = EvalScope {
                         columns,
@@ -5751,10 +5797,9 @@ fn compute_aggregates(
                         continue;
                     }
                     if agg.distinct {
-                        if seen.iter().any(|v| values_equal(v, &value)) {
+                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
                             continue;
                         }
-                        seen.push(value.clone());
                     }
                     let separator = if let Some(separator_expr) = &agg.separator {
                         let sep_value = eval_expr(db, separator_expr, &scope, outer)?;
