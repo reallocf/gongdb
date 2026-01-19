@@ -6541,6 +6541,36 @@ fn aggregate_projections(
     }
 }
 
+fn resolve_expr_column_index(
+    expr: &Expr,
+    column_lookup: &ColumnLookup,
+    columns: &[Column],
+    column_scopes: &[TableScope],
+) -> Option<usize> {
+    match expr {
+        Expr::Identifier(ident) => {
+            let key = maybe_lowercase(&ident.value);
+            if let Some(idx) = column_lookup.unqualified.get(key.as_ref()) {
+                return Some(*idx);
+            }
+            resolve_column_index(&ident.value, columns)
+        }
+        Expr::CompoundIdentifier(idents) => {
+            let (qualifier, column) = split_qualified_identifier(idents).ok()?;
+            let qual_key = maybe_lowercase(qualifier);
+            let name_key = maybe_lowercase(column);
+            if let Some(by_qualifier) = column_lookup.qualified.get(qual_key.as_ref()) {
+                if let Some(idx) = by_qualifier.get(name_key.as_ref()) {
+                    return Some(*idx);
+                }
+            }
+            resolve_qualified_column_index(qualifier, column, columns, column_scopes)
+        }
+        Expr::Nested(inner) => resolve_expr_column_index(inner, column_lookup, columns, column_scopes),
+        _ => None,
+    }
+}
+
 fn compute_aggregates(
     db: &GongDB,
     aggregates: &[AggregateExpr],
@@ -6601,25 +6631,17 @@ fn compute_aggregates(
                 } else {
                     None
                 };
-                for row in rows {
-                    let scope = EvalScope {
-                        columns,
-                        column_scopes,
-                        row,
-                        table_scope,
-                        cte_context,
-                        column_lookup: Some(&column_lookup),
-                    };
-                    let value = eval_expr(db, expr, &scope, outer)?;
+                let sum_column = resolve_expr_column_index(expr, &column_lookup, columns, column_scopes);
+                let mut apply_value = |value: &Value| {
                     if matches!(value, Value::Null) {
-                        continue;
+                        return;
                     }
-                    if agg.distinct {
-                        if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
-                            continue;
+                    if let Some(ref mut seen) = seen {
+                        if !seen.insert(distinct_key(value)) {
+                            return;
                         }
                     }
-                    if let Some(num) = numeric_value_or_zero(&value) {
+                    if let Some(num) = numeric_value_or_zero(value) {
                         has_value = true;
                         match num {
                             NumericValue::Integer(v) => {
@@ -6637,6 +6659,24 @@ fn compute_aggregates(
                                 sum_real += v;
                             }
                         }
+                    }
+                };
+                if let Some(idx) = sum_column {
+                    for row in rows {
+                        apply_value(&row[idx]);
+                    }
+                } else {
+                    for row in rows {
+                        let scope = EvalScope {
+                            columns,
+                            column_scopes,
+                            row,
+                            table_scope,
+                            cte_context,
+                            column_lookup: Some(&column_lookup),
+                        };
+                        let value = eval_expr(db, expr, &scope, outer)?;
+                        apply_value(&value);
                     }
                 }
                 if !has_value {
