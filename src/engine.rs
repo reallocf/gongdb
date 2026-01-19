@@ -902,7 +902,6 @@ impl GongDB {
         let mut selection_applied = false;
         let mut preordered_by_index = false;
         if select.from.len() == 1
-            && select.selection.is_none()
             && select.group_by.is_empty()
             && select.having.is_none()
             && select.order_by.is_empty()
@@ -919,11 +918,24 @@ impl GongDB {
                     let column_scopes = vec![table_scope.clone(); table.columns.len()];
                     let output_columns =
                         projection_columns(&select.projection, &table.columns, &column_scopes)?;
-                    let count = table.row_count as i64;
-                    return Ok(QueryResult {
-                        columns: output_columns,
-                        rows: vec![vec![Value::Integer(count)]],
-                    });
+                    let fast_count = match select.selection.as_ref() {
+                        None => Some(table.row_count as i64),
+                        Some(predicate) if expr_is_constant(predicate) => {
+                            let value = eval_constant_expr_checked(self, predicate)?;
+                            if value_to_bool(&value) {
+                                Some(table.row_count as i64)
+                            } else {
+                                Some(0)
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(count) = fast_count {
+                        return Ok(QueryResult {
+                            columns: output_columns,
+                            rows: vec![vec![Value::Integer(count)]],
+                        });
+                    }
                 }
             }
         }
