@@ -88,6 +88,7 @@ pub struct GongDB {
     transaction: Option<TransactionState>,
     triggers: HashMap<String, TriggerMeta>,
     in_list_cache: RefCell<InListCache>,
+    in_subquery_cache: RefCell<InSubqueryCache>,
     subquery_cache: RefCell<SubqueryCache>,
 }
 
@@ -104,6 +105,7 @@ impl GongDB {
             transaction: None,
             triggers: HashMap::new(),
             in_list_cache: RefCell::new(InListCache::new()),
+            in_subquery_cache: RefCell::new(InSubqueryCache::new()),
             subquery_cache: RefCell::new(SubqueryCache::new()),
         })
     }
@@ -115,12 +117,14 @@ impl GongDB {
             transaction: None,
             triggers: HashMap::new(),
             in_list_cache: RefCell::new(InListCache::new()),
+            in_subquery_cache: RefCell::new(InSubqueryCache::new()),
             subquery_cache: RefCell::new(SubqueryCache::new()),
         })
     }
 
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
         self.in_list_cache.replace(InListCache::new());
+        self.in_subquery_cache.replace(InSubqueryCache::new());
         self.subquery_cache.replace(SubqueryCache::new());
         let stmt = parser::parse_statement(sql)
             .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
@@ -3229,10 +3233,28 @@ impl InListCache {
     }
 }
 
+#[derive(Default)]
+struct InSubqueryCache {
+    entries: HashMap<usize, Arc<PreparedInSubquery>>,
+}
+
+impl InSubqueryCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
 struct PreparedInList {
     literal_keys: HashSet<DistinctKey>,
     non_literal_indices: Vec<usize>,
     saw_null_literal: bool,
+}
+
+struct PreparedInSubquery {
+    keys: HashSet<DistinctKey>,
+    saw_null: bool,
 }
 
 #[derive(Clone, Default)]
@@ -4352,11 +4374,37 @@ fn eval_in_subquery<'a>(
     subquery: &Select,
     scope: &EvalScope<'a>,
 ) -> Result<Value, GongDBError> {
+    if matches!(expr_val, Value::Null) {
+        return Ok(Value::Null);
+    }
     let result = eval_subquery_cached(db, subquery, Some(scope))?;
     if result.columns.len() != 1 {
         return Err(GongDBError::new(
             "subquery returned more than one column",
         ));
+    }
+    let key = subquery as *const Select as usize;
+    let use_cache = matches!(
+        db.subquery_cache.borrow().entries.get(&key),
+        Some(SubqueryCacheEntry::Uncorrelated(_))
+    );
+    if use_cache {
+        let prepared = {
+            let mut cache = db.in_subquery_cache.borrow_mut();
+            cache
+                .entries
+                .entry(key)
+                .or_insert_with(|| Arc::new(prepare_in_subquery(&result)))
+                .clone()
+        };
+        if prepared.keys.contains(&distinct_key(expr_val)) {
+            return Ok(Value::Integer(1));
+        }
+        return Ok(if prepared.saw_null {
+            Value::Null
+        } else {
+            Value::Integer(0)
+        });
     }
     if result.rows.is_empty() {
         return Ok(Value::Integer(0));
@@ -4370,11 +4418,11 @@ fn eval_in_subquery<'a>(
             _ => {}
         }
     }
-    if saw_null {
-        Ok(Value::Null)
+    Ok(if saw_null {
+        Value::Null
     } else {
-        Ok(Value::Integer(0))
-    }
+        Value::Integer(0)
+    })
 }
 
 fn is_missing_column_error(err: &GongDBError) -> bool {
@@ -4438,6 +4486,20 @@ fn eval_subquery_cached<'a>(
             .insert(key, SubqueryCacheEntry::Uncorrelated(Arc::clone(&result)));
         Ok(result)
     }
+}
+
+fn prepare_in_subquery(result: &QueryResult) -> PreparedInSubquery {
+    let mut keys = HashSet::new();
+    let mut saw_null = false;
+    for row in result.rows.iter() {
+        let item_val = row.get(0).cloned().unwrap_or(Value::Null);
+        if matches!(item_val, Value::Null) {
+            saw_null = true;
+        } else {
+            keys.insert(distinct_key(&item_val));
+        }
+    }
+    PreparedInSubquery { keys, saw_null }
 }
 
 fn apply_binary_op(
