@@ -3310,12 +3310,13 @@ impl TableScope {
 #[derive(Debug)]
 struct ColumnLookup {
     unqualified: HashMap<String, usize>,
-    qualified: HashMap<(String, String), usize>,
+    qualified: HashMap<String, HashMap<String, usize>>,
 }
 
 fn build_column_lookup(columns: &[Column], column_scopes: &[TableScope]) -> ColumnLookup {
     let mut unqualified = HashMap::with_capacity(columns.len());
-    let mut qualified = HashMap::with_capacity(columns.len());
+    let mut qualified: HashMap<String, HashMap<String, usize>> =
+        HashMap::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         let name_lower = col.name.to_ascii_lowercase();
         unqualified.entry(name_lower.clone()).or_insert(idx);
@@ -3329,7 +3330,9 @@ fn build_column_lookup(columns: &[Column], column_scopes: &[TableScope]) -> Colu
         if let Some(qualifier) = qualifier {
             let qual_lower = qualifier.to_ascii_lowercase();
             qualified
-                .entry((qual_lower, name_lower))
+                .entry(qual_lower)
+                .or_insert_with(HashMap::new)
+                .entry(name_lower)
                 .or_insert(idx);
         }
     }
@@ -3960,8 +3963,8 @@ fn resolve_column_index(name: &str, columns: &[Column]) -> Option<usize> {
 
 fn resolve_column_index_in_scope(scope: &EvalScope<'_>, name: &str) -> Option<usize> {
     if let Some(lookup) = scope.column_lookup {
-        let key = name.to_ascii_lowercase();
-        if let Some(idx) = lookup.unqualified.get(&key) {
+        let key = maybe_lowercase(name);
+        if let Some(idx) = lookup.unqualified.get(key.as_ref()) {
             return Some(*idx);
         }
     }
@@ -3993,13 +3996,23 @@ fn resolve_qualified_column_index_in_scope(
     name: &str,
 ) -> Option<usize> {
     if let Some(lookup) = scope.column_lookup {
-        let qual_key = qualifier.to_ascii_lowercase();
-        let name_key = name.to_ascii_lowercase();
-        if let Some(idx) = lookup.qualified.get(&(qual_key, name_key)) {
-            return Some(*idx);
+        let qual_key = maybe_lowercase(qualifier);
+        let name_key = maybe_lowercase(name);
+        if let Some(by_qualifier) = lookup.qualified.get(qual_key.as_ref()) {
+            if let Some(idx) = by_qualifier.get(name_key.as_ref()) {
+                return Some(*idx);
+            }
         }
     }
     resolve_qualified_column_index(qualifier, name, scope.columns, scope.column_scopes)
+}
+
+fn maybe_lowercase(input: &str) -> std::borrow::Cow<'_, str> {
+    if input.bytes().all(|byte| !byte.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(input)
+    } else {
+        std::borrow::Cow::Owned(input.to_ascii_lowercase())
+    }
 }
 
 fn split_qualified_identifier(idents: &[Ident]) -> Result<(&str, &str), GongDBError> {
