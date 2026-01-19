@@ -2925,6 +2925,55 @@ fn join_sources_with_predicates(
                 rows.push(combined);
             }
         }
+    } else if join_pairs.len() == 1 {
+        let (left_idx, right_idx) = join_pairs[0];
+        let mut right_map: HashMap<DistinctKey, Vec<usize>> =
+            HashMap::with_capacity(right_rows.len());
+        for (idx, row) in right_rows.iter().enumerate() {
+            let value = &row[right_idx];
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            right_map.entry(distinct_key(value)).or_default().push(idx);
+        }
+
+        for left_row in left_rows {
+            let value = &left_row[left_idx];
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let Some(matches) = right_map.get(&distinct_key(value)) else {
+                continue;
+            };
+            for right_idx in matches {
+                let right_row = &right_rows[*right_idx];
+                let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                combined.extend(left_row.iter().cloned());
+                combined.extend(right_row.iter().cloned());
+                if !remaining_predicates.is_empty() {
+                    let scope = EvalScope {
+                        columns: &columns,
+                        column_scopes: &column_scopes,
+                        row: &combined,
+                        table_scope: &table_scope,
+                        cte_context,
+                        column_lookup: Some(&column_lookup),
+                    };
+                    let mut keep = true;
+                    for predicate in &remaining_predicates {
+                        let value = eval_expr(db, predicate, &scope, outer)?;
+                        if !value_to_bool(&value) {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    if !keep {
+                        continue;
+                    }
+                }
+                rows.push(combined);
+            }
+        }
     } else {
         let left_key_indices: Vec<usize> = join_pairs.iter().map(|(l, _)| *l).collect();
         let right_key_indices: Vec<usize> = join_pairs.iter().map(|(_, r)| *r).collect();
