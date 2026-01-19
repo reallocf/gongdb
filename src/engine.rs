@@ -88,6 +88,7 @@ pub struct GongDB {
     transaction: Option<TransactionState>,
     triggers: HashMap<String, TriggerMeta>,
     in_list_cache: RefCell<InListCache>,
+    subquery_cache: RefCell<SubqueryCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +104,7 @@ impl GongDB {
             transaction: None,
             triggers: HashMap::new(),
             in_list_cache: RefCell::new(InListCache::new()),
+            subquery_cache: RefCell::new(SubqueryCache::new()),
         })
     }
 
@@ -113,11 +115,13 @@ impl GongDB {
             transaction: None,
             triggers: HashMap::new(),
             in_list_cache: RefCell::new(InListCache::new()),
+            subquery_cache: RefCell::new(SubqueryCache::new()),
         })
     }
 
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
         self.in_list_cache.replace(InListCache::new());
+        self.subquery_cache.replace(SubqueryCache::new());
         let stmt = parser::parse_statement(sql)
             .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
         match stmt {
@@ -3077,6 +3081,23 @@ struct QueryResult {
     rows: Vec<Vec<Value>>,
 }
 
+enum SubqueryCacheEntry {
+    Uncorrelated(Arc<QueryResult>),
+    Correlated,
+}
+
+struct SubqueryCache {
+    entries: HashMap<usize, SubqueryCacheEntry>,
+}
+
+impl SubqueryCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct InListCache {
     entries: HashMap<(usize, usize), Arc<PreparedInList>>,
@@ -4116,8 +4137,7 @@ fn eval_expr<'a, 'b>(
             }
         }
         Expr::Subquery(subquery) => {
-            let result =
-                db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
+            let result = eval_subquery_cached(db, subquery, Some(scope))?;
             if result.columns.len() != 1 {
                 return Err(GongDBError::new(
                     "subquery returned more than one column",
@@ -4130,8 +4150,7 @@ fn eval_expr<'a, 'b>(
             }
         }
         Expr::Exists(subquery) => {
-            let result =
-                db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
+            let result = eval_subquery_cached(db, subquery, Some(scope))?;
             Ok(Value::Integer((!result.rows.is_empty()) as i64))
         }
         Expr::Nested(expr) => eval_expr(db, expr, scope, outer),
@@ -4215,8 +4234,7 @@ fn eval_in_subquery<'a>(
     subquery: &Select,
     scope: &EvalScope<'a>,
 ) -> Result<Value, GongDBError> {
-    let result =
-        db.evaluate_select_values_with_outer(subquery, Some(scope), scope.cte_context)?;
+    let result = eval_subquery_cached(db, subquery, Some(scope))?;
     if result.columns.len() != 1 {
         return Err(GongDBError::new(
             "subquery returned more than one column",
@@ -4226,11 +4244,8 @@ fn eval_in_subquery<'a>(
         return Ok(Value::Integer(0));
     }
     let mut saw_null = false;
-    for row in result.rows {
-        let item_val = row
-            .get(0)
-            .cloned()
-            .unwrap_or(Value::Null);
+    for row in result.rows.iter() {
+        let item_val = row.get(0).cloned().unwrap_or(Value::Null);
         match compare_values(&BinaryOperator::Eq, expr_val, &item_val) {
             Value::Integer(1) => return Ok(Value::Integer(1)),
             Value::Null => saw_null = true,
@@ -4241,6 +4256,69 @@ fn eval_in_subquery<'a>(
         Ok(Value::Null)
     } else {
         Ok(Value::Integer(0))
+    }
+}
+
+fn is_missing_column_error(err: &GongDBError) -> bool {
+    matches!(
+        err,
+        GongDBError::Execution(message) if message.starts_with("no such column: ")
+    )
+}
+
+fn eval_subquery_cached<'a>(
+    db: &GongDB,
+    subquery: &Select,
+    outer: Option<&EvalScope<'a>>,
+) -> Result<Arc<QueryResult>, GongDBError> {
+    let key = subquery as *const Select as usize;
+    if let Some(entry) = db.subquery_cache.borrow().entries.get(&key) {
+        match entry {
+            SubqueryCacheEntry::Uncorrelated(result) => return Ok(Arc::clone(result)),
+            SubqueryCacheEntry::Correlated => {
+                let cte_context = outer.and_then(|scope| scope.cte_context);
+                let result =
+                    db.evaluate_select_values_with_outer(subquery, outer, cte_context)?;
+                return Ok(Arc::new(result));
+            }
+        }
+    }
+    let cte_context = outer.and_then(|scope| scope.cte_context);
+    if outer.is_some() {
+        match db.evaluate_select_values_with_outer(subquery, None, cte_context) {
+            Ok(result) => {
+                let result = Arc::new(result);
+                db.subquery_cache
+                    .borrow_mut()
+                    .entries
+                    .insert(key, SubqueryCacheEntry::Uncorrelated(Arc::clone(&result)));
+                Ok(result)
+            }
+            Err(err) => {
+                if is_missing_column_error(&err) {
+                    db.subquery_cache
+                        .borrow_mut()
+                        .entries
+                        .insert(key, SubqueryCacheEntry::Correlated);
+                    let result =
+                        db.evaluate_select_values_with_outer(subquery, outer, cte_context)?;
+                    Ok(Arc::new(result))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    } else {
+        let result = Arc::new(db.evaluate_select_values_with_outer(
+            subquery,
+            None,
+            cte_context,
+        )?);
+        db.subquery_cache
+            .borrow_mut()
+            .entries
+            .insert(key, SubqueryCacheEntry::Uncorrelated(Arc::clone(&result)));
+        Ok(result)
     }
 }
 
