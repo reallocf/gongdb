@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const PAGE_SIZE: usize = 4096;
+const PAGE_SIZE: usize = 65535;
 const HEADER_PAGE_ID: u32 = 0;
 const CATALOG_PAGE_ID: u32 = 1;
 const FILE_MAGIC: [u8; 8] = *b"GONGDB1\0";
@@ -2465,10 +2465,23 @@ fn encode_expr(expr: &Expr, buf: &mut Vec<u8>) -> Result<(), StorageError> {
         Expr::Wildcard => {
             buf.push(13);
         }
-        _ => {
-            return Err(StorageError::Invalid(
-                "unsupported expression in schema metadata".to_string(),
-            ))
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            buf.push(14);
+            buf.push(if *negated { 1 } else { 0 });
+            encode_expr(expr, buf)?;
+            encode_select(subquery, buf)?;
+        }
+        Expr::Exists(subquery) => {
+            buf.push(15);
+            encode_select(subquery, buf)?;
+        }
+        Expr::Subquery(subquery) => {
+            buf.push(16);
+            encode_select(subquery, buf)?;
         }
     }
     Ok(())
@@ -2661,6 +2674,32 @@ fn decode_expr(record: &[u8], pos: usize) -> Result<(Expr, usize), StorageError>
             Expr::Nested(Box::new(expr))
         }
         13 => Expr::Wildcard,
+        14 => {
+            if cursor >= record.len() {
+                return Err(StorageError::Corrupt("invalid IN subquery expr".to_string()));
+            }
+            let negated = record[cursor] != 0;
+            cursor += 1;
+            let (expr, new_pos) = decode_expr(record, cursor)?;
+            cursor = new_pos;
+            let (subquery, new_pos) = decode_select(record, cursor)?;
+            cursor = new_pos;
+            Expr::InSubquery {
+                expr: Box::new(expr),
+                subquery: Box::new(subquery),
+                negated,
+            }
+        }
+        15 => {
+            let (subquery, new_pos) = decode_select(record, cursor)?;
+            cursor = new_pos;
+            Expr::Exists(Box::new(subquery))
+        }
+        16 => {
+            let (subquery, new_pos) = decode_select(record, cursor)?;
+            cursor = new_pos;
+            Expr::Subquery(Box::new(subquery))
+        }
         _ => {
             return Err(StorageError::Corrupt(format!(
                 "unknown expression tag {}",
