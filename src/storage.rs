@@ -28,6 +28,7 @@ const JOURNAL_MAGIC: [u8; 8] = *b"GONGJNL1";
 const JOURNAL_HEADER_SIZE: usize = 16;
 const PAGE_CACHE_CAPACITY: usize = 256;
 const PAGE_ALLOC_BATCH: u32 = 64;
+const WRITE_BATCH_PAGES: usize = 32;
 
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 static LOCK_MANAGER: OnceLock<Mutex<LockManager>> = OnceLock::new();
@@ -357,6 +358,7 @@ pub struct StorageEngine {
     txn_active: bool,
     journal: Option<Journal>,
     page_cache: RefCell<PageCache>,
+    pending_sync_writes: usize,
 }
 
 pub struct TableScan<'a> {
@@ -442,6 +444,7 @@ impl StorageEngine {
             txn_active: false,
             journal: None,
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
+            pending_sync_writes: 0,
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -523,6 +526,7 @@ impl StorageEngine {
             txn_active: false,
             journal: None,
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
+            pending_sync_writes: 0,
         };
         engine.ensure_reserved_pages(engine.next_page_id)?;
         engine.write_header()?;
@@ -1367,8 +1371,20 @@ impl StorageEngine {
             return Ok(page_id);
         }
         let page_id = self.next_page_id;
-        self.next_page_id = self.next_page_id.saturating_add(1);
+        if page_id == u32::MAX {
+            return Err(StorageError::Invalid("database is full".to_string()));
+        }
+        let mut next_id = page_id.saturating_add(PAGE_ALLOC_BATCH);
+        if next_id == page_id {
+            next_id = page_id.saturating_add(1);
+        }
+        self.next_page_id = next_id;
         self.ensure_reserved_pages(self.next_page_id)?;
+        for id in (page_id + 1)..next_id {
+            if self.free_pages_set.insert(id) {
+                self.free_pages.push(id);
+            }
+        }
         Ok(page_id)
     }
 
@@ -1559,7 +1575,7 @@ impl StorageEngine {
                 pages[idx] = data.to_vec();
                 Ok(())
             }
-            StorageMode::OnDisk { file } => {
+            StorageMode::OnDisk { file: _ } => {
                 if self.txn_active {
                     let evicted = self
                         .page_cache
@@ -1570,9 +1586,11 @@ impl StorageEngine {
                     }
                     Ok(())
                 } else {
-                    file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
-                    file.write_all(data)?;
-                    file.sync_all()?;
+                    self.write_page_to_disk(page_id, data)?;
+                    self.pending_sync_writes = self.pending_sync_writes.saturating_add(1);
+                    if self.pending_sync_writes >= WRITE_BATCH_PAGES {
+                        self.sync_disk()?;
+                    }
                     let _ = self
                         .page_cache
                         .borrow_mut()
@@ -1645,6 +1663,7 @@ impl StorageEngine {
         if let StorageMode::OnDisk { file } = &mut self.mode {
             file.sync_all()?;
         }
+        self.pending_sync_writes = 0;
         Ok(())
     }
 
