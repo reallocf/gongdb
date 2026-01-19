@@ -2278,55 +2278,210 @@ impl GongDB {
         let null_left = vec![Value::Null; left_len];
         let null_right = vec![Value::Null; right_len];
 
-        let using_pairs = if let Some(JoinConstraint::Using(cols)) = constraint {
-            Some(resolve_using_pairs(cols, &columns, &column_scopes)?)
-        } else {
-            None
-        };
+        let mut join_pairs: Vec<(usize, usize)> = Vec::new();
+        let mut remaining_predicates: Vec<Expr> = Vec::new();
 
-        let on_expr = constraint.and_then(|c| match c {
-            JoinConstraint::On(expr) => Some(expr),
-            _ => None,
-        });
-        let column_lookup = on_expr
-            .as_ref()
-            .map(|_| build_column_lookup(&columns, &column_scopes));
+        if let Some(JoinConstraint::Using(cols)) = constraint {
+            let pairs = resolve_using_pairs(cols, &columns, &column_scopes)?;
+            for (left_idx, right_idx) in pairs {
+                if left_idx >= left_len || right_idx < left_len {
+                    return Err(GongDBError::new(
+                        "USING clause does not reference both join sources",
+                    ));
+                }
+                join_pairs.push((left_idx, right_idx - left_len));
+            }
+        } else if let Some(JoinConstraint::On(expr)) = constraint {
+            let predicates = split_conjuncts(expr);
+            let (pairs, remaining) = extract_join_pairs(
+                &predicates,
+                &columns[..left_len],
+                &column_scopes[..left_len],
+                &columns[left_len..],
+                &column_scopes[left_len..],
+            );
+            join_pairs = pairs;
+            remaining_predicates = remaining;
+        }
+
+        let column_lookup = if remaining_predicates.is_empty() {
+            None
+        } else {
+            Some(build_column_lookup(&columns, &column_scopes))
+        };
         let mut right_matched = vec![false; right_rows.len()];
 
-        for left_row in &left_rows {
-            let mut matched = false;
-            for (right_idx, right_row) in right_rows.iter().enumerate() {
-                let mut combined = Vec::with_capacity(left_len + right_len);
-                combined.extend(left_row.iter().cloned());
-                combined.extend(right_row.iter().cloned());
-                if let Some(expr) = on_expr {
-                    let scope = EvalScope {
-                        columns: &columns,
-                        column_scopes: &column_scopes,
-                        row: &combined,
-                        table_scope: &table_scope,
-                        cte_context,
-                        column_lookup: column_lookup.as_ref(),
-                    };
-                    let value = eval_expr(self, expr, &scope, outer)?;
-                    if !value_to_bool(&value) {
-                        continue;
+        if join_pairs.is_empty() {
+            let on_expr = constraint.and_then(|c| match c {
+                JoinConstraint::On(expr) => Some(expr),
+                _ => None,
+            });
+            let column_lookup = on_expr
+                .as_ref()
+                .map(|_| build_column_lookup(&columns, &column_scopes));
+
+            for left_row in &left_rows {
+                let mut matched = false;
+                for (right_idx, right_row) in right_rows.iter().enumerate() {
+                    let mut combined = Vec::with_capacity(left_len + right_len);
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(right_row.iter().cloned());
+                    if let Some(expr) = on_expr {
+                        let scope = EvalScope {
+                            columns: &columns,
+                            column_scopes: &column_scopes,
+                            row: &combined,
+                            table_scope: &table_scope,
+                            cte_context,
+                            column_lookup: column_lookup.as_ref(),
+                        };
+                        let value = eval_expr(self, expr, &scope, outer)?;
+                        if !value_to_bool(&value) {
+                            continue;
+                        }
                     }
+                    matched = true;
+                    right_matched[right_idx] = true;
+                    rows.push(combined);
                 }
-                if let Some(pairs) = &using_pairs {
-                    if !using_pairs_match(&combined, pairs)? {
-                        continue;
-                    }
+                if !matched && matches!(operator, JoinOperator::Left | JoinOperator::Full) {
+                    let mut combined = Vec::with_capacity(left_len + right_len);
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(null_right.iter().cloned());
+                    rows.push(combined);
                 }
-                matched = true;
-                right_matched[right_idx] = true;
-                rows.push(combined);
             }
-            if !matched && matches!(operator, JoinOperator::Left | JoinOperator::Full) {
-                let mut combined = Vec::with_capacity(left_len + right_len);
-                combined.extend(left_row.iter().cloned());
-                combined.extend(null_right.iter().cloned());
-                rows.push(combined);
+        } else if join_pairs.len() == 1 {
+            let (left_idx, right_idx) = join_pairs[0];
+            let mut right_map: HashMap<DistinctKey, Vec<usize>> =
+                HashMap::with_capacity(right_rows.len());
+            for (idx, row) in right_rows.iter().enumerate() {
+                let value = &row[right_idx];
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                right_map.entry(distinct_key(value)).or_default().push(idx);
+            }
+
+            for left_row in &left_rows {
+                let value = &left_row[left_idx];
+                let mut matched = false;
+                if !matches!(value, Value::Null) {
+                    if let Some(matches) = right_map.get(&distinct_key(value)) {
+                        for right_idx in matches {
+                            let right_row = &right_rows[*right_idx];
+                            let mut combined = Vec::with_capacity(left_len + right_len);
+                            combined.extend(left_row.iter().cloned());
+                            combined.extend(right_row.iter().cloned());
+                            if !remaining_predicates.is_empty() {
+                                let scope = EvalScope {
+                                    columns: &columns,
+                                    column_scopes: &column_scopes,
+                                    row: &combined,
+                                    table_scope: &table_scope,
+                                    cte_context,
+                                    column_lookup: column_lookup.as_ref(),
+                                };
+                                let mut keep = true;
+                                for predicate in &remaining_predicates {
+                                    let value = eval_expr(self, predicate, &scope, outer)?;
+                                    if !value_to_bool(&value) {
+                                        keep = false;
+                                        break;
+                                    }
+                                }
+                                if !keep {
+                                    continue;
+                                }
+                            }
+                            matched = true;
+                            right_matched[*right_idx] = true;
+                            rows.push(combined);
+                        }
+                    }
+                }
+                if !matched && matches!(operator, JoinOperator::Left | JoinOperator::Full) {
+                    let mut combined = Vec::with_capacity(left_len + right_len);
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(null_right.iter().cloned());
+                    rows.push(combined);
+                }
+            }
+        } else {
+            let left_key_indices: Vec<usize> = join_pairs.iter().map(|(l, _)| *l).collect();
+            let right_key_indices: Vec<usize> = join_pairs.iter().map(|(_, r)| *r).collect();
+            let mut right_map: HashMap<Vec<DistinctKey>, Vec<usize>> =
+                HashMap::with_capacity(right_rows.len());
+            for (idx, row) in right_rows.iter().enumerate() {
+                let mut key = Vec::with_capacity(right_key_indices.len());
+                let mut has_null = false;
+                for col_idx in &right_key_indices {
+                    let value = &row[*col_idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    key.push(distinct_key(value));
+                }
+                if has_null {
+                    continue;
+                }
+                right_map.entry(key).or_default().push(idx);
+            }
+
+            let mut left_key = Vec::with_capacity(left_key_indices.len());
+            for left_row in &left_rows {
+                left_key.clear();
+                let mut matched = false;
+                let mut has_null = false;
+                for col_idx in &left_key_indices {
+                    let value = &left_row[*col_idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    left_key.push(distinct_key(value));
+                }
+                if !has_null {
+                    if let Some(matches) = right_map.get(&left_key) {
+                        for right_idx in matches {
+                            let right_row = &right_rows[*right_idx];
+                            let mut combined = Vec::with_capacity(left_len + right_len);
+                            combined.extend(left_row.iter().cloned());
+                            combined.extend(right_row.iter().cloned());
+                            if !remaining_predicates.is_empty() {
+                                let scope = EvalScope {
+                                    columns: &columns,
+                                    column_scopes: &column_scopes,
+                                    row: &combined,
+                                    table_scope: &table_scope,
+                                    cte_context,
+                                    column_lookup: column_lookup.as_ref(),
+                                };
+                                let mut keep = true;
+                                for predicate in &remaining_predicates {
+                                    let value = eval_expr(self, predicate, &scope, outer)?;
+                                    if !value_to_bool(&value) {
+                                        keep = false;
+                                        break;
+                                    }
+                                }
+                                if !keep {
+                                    continue;
+                                }
+                            }
+                            matched = true;
+                            right_matched[*right_idx] = true;
+                            rows.push(combined);
+                        }
+                    }
+                }
+                if !matched && matches!(operator, JoinOperator::Left | JoinOperator::Full) {
+                    let mut combined = Vec::with_capacity(left_len + right_len);
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(null_right.iter().cloned());
+                    rows.push(combined);
+                }
             }
         }
 
@@ -3838,18 +3993,6 @@ fn resolve_using_pairs(
         pairs.push((left_idx, right_idx));
     }
     Ok(pairs)
-}
-
-fn using_pairs_match(row: &[Value], pairs: &[(usize, usize)]) -> Result<bool, GongDBError> {
-    for (left_idx, right_idx) in pairs {
-        let left = &row[*left_idx];
-        let right = &row[*right_idx];
-        let value = compare_values(&BinaryOperator::Eq, left, right);
-        if !value_to_bool(&value) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 #[async_trait]
