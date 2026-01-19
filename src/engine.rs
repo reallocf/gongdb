@@ -2784,8 +2784,9 @@ fn join_sources_with_predicates(
     let mut rows = Vec::new();
     for left_row in left.rows {
         for right_row in &right.rows {
-            let mut combined = left_row.clone();
-            combined.extend(right_row.clone());
+            let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+            combined.extend(left_row.iter().cloned());
+            combined.extend(right_row.iter().cloned());
             if !predicates.is_empty() {
                 let scope = EvalScope {
                     columns: &columns,
@@ -4399,9 +4400,11 @@ fn rows_equal(left: &[Value], right: &[Value]) -> bool {
 }
 
 fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen: HashSet<Vec<DistinctKey>> = HashSet::with_capacity(rows.len());
     let mut unique: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        if unique.iter().all(|existing| !rows_equal(existing, &row)) {
+        let key = row_distinct_key(&row);
+        if seen.insert(key) {
             unique.push(row);
         }
     }
