@@ -1058,11 +1058,11 @@ impl GongDB {
 
         if !select.group_by.is_empty() {
             struct Group {
-                key: Vec<Value>,
                 rows: Vec<Vec<Value>>,
             }
 
             let mut groups: Vec<Group> = Vec::new();
+            let mut group_lookup: HashMap<Vec<DistinctKey>, usize> = HashMap::new();
             for row in filtered {
                 let scope = EvalScope {
                     columns: &columns,
@@ -1074,18 +1074,20 @@ impl GongDB {
                 };
                 let mut key = Vec::with_capacity(select.group_by.len());
                 for expr in &select.group_by {
-                    key.push(eval_expr(self, expr, &scope, outer)?);
+                    let value = eval_expr(self, expr, &scope, outer)?;
+                    key.push(distinct_key(&value));
                 }
-                if let Some(group) = groups
-                    .iter_mut()
-                    .find(|group| group_keys_equal(&group.key, &key))
-                {
-                    group.rows.push(row);
-                } else {
-                    groups.push(Group {
-                        key,
-                        rows: vec![row],
-                    });
+                match group_lookup.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        if let Some(group) = groups.get_mut(*entry.get()) {
+                            group.rows.push(row);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let index = groups.len();
+                        groups.push(Group { rows: vec![row] });
+                        entry.insert(index);
+                    }
                 }
             }
 
@@ -5738,23 +5740,6 @@ fn projection_has_aggregate(projection: &[SelectItem]) -> bool {
         SelectItem::Expr { expr, .. } => expr_contains_aggregate(expr),
         _ => false,
     })
-}
-
-fn group_values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Null, Value::Null) => true,
-        (Value::Null, _) | (_, Value::Null) => false,
-        _ => values_equal(left, right),
-    }
-}
-
-fn group_keys_equal(left: &[Value], right: &[Value]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .all(|(l, r)| group_values_equal(l, r))
 }
 
 #[derive(Clone)]
