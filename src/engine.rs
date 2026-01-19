@@ -592,6 +592,7 @@ impl GongDB {
                     table_alias: None,
                 };
                 let column_scopes = vec![table_scope.clone(); table.columns.len()];
+                let column_lookup = build_column_lookup(&table.columns, &column_scopes);
                 let mut updated_rows = Vec::with_capacity(rows.len());
                 for row in rows {
                     let scope = EvalScope {
@@ -600,6 +601,7 @@ impl GongDB {
                         row: &row,
                         table_scope: &table_scope,
                         cte_context: None,
+                        column_lookup: Some(&column_lookup),
                     };
                     if let Some(predicate) = &update.selection {
                         let value = eval_expr(self, predicate, &scope, None)?;
@@ -645,6 +647,7 @@ impl GongDB {
                     table_alias: None,
                 };
                 let column_scopes = vec![table_scope.clone(); table.columns.len()];
+                let column_lookup = build_column_lookup(&table.columns, &column_scopes);
                 let mut remaining_rows = Vec::with_capacity(rows.len());
                 for row in rows {
                     let scope = EvalScope {
@@ -653,6 +656,7 @@ impl GongDB {
                         row: &row,
                         table_scope: &table_scope,
                         cte_context: None,
+                        column_lookup: Some(&column_lookup),
                     };
                     if let Some(predicate) = &delete.selection {
                         let value = eval_expr(self, predicate, &scope, None)?;
@@ -859,6 +863,7 @@ impl GongDB {
             rows,
             table_scope,
         } = source;
+        let column_lookup = build_column_lookup(&columns, &column_scopes);
         let mut filtered = Vec::new();
         for row in rows {
             let scope = EvalScope {
@@ -867,6 +872,7 @@ impl GongDB {
                 row: &row,
                 table_scope: &table_scope,
                 cte_context,
+                column_lookup: Some(&column_lookup),
             };
             if let Some(predicate) = &select.selection {
                 if selection_applied {
@@ -926,6 +932,7 @@ impl GongDB {
                     row: &row,
                     table_scope: &table_scope,
                     cte_context,
+                    column_lookup: Some(&column_lookup),
                 };
                 let mut key = Vec::with_capacity(select.group_by.len());
                 for expr in &select.group_by {
@@ -1030,6 +1037,7 @@ impl GongDB {
                         row: group.rows.first().unwrap(),
                         table_scope: &table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let order_values = compute_group_order_values(
                         self,
@@ -1126,6 +1134,7 @@ impl GongDB {
                     row: &row,
                     table_scope: &table_scope,
                     cte_context,
+                    column_lookup: Some(&column_lookup),
                 };
                 rows.push(project_row(
                     self,
@@ -1164,6 +1173,7 @@ impl GongDB {
                     row: &row,
                     table_scope: &table_scope,
                     cte_context,
+                    column_lookup: Some(&column_lookup),
                 };
                 let projected_row = project_row(
                     self,
@@ -1362,6 +1372,7 @@ impl GongDB {
             table_alias: table_alias.map(|alias| alias.to_string()),
         };
         let column_scopes = vec![table_scope.clone(); table.columns.len()];
+        let column_lookup = build_column_lookup(&table.columns, &column_scopes);
         let mut ordered_by_index = false;
         let mut rows = if let Some(plan) =
             choose_index_scan_plan(self, table, selection, order_by, &table_scope)
@@ -1385,6 +1396,7 @@ impl GongDB {
                     row: &row,
                     table_scope: &table_scope,
                     cte_context,
+                    column_lookup: Some(&column_lookup),
                 };
                 let value = eval_expr(self, predicate, &scope, outer)?;
                 if !value_to_bool(&value) {
@@ -1721,6 +1733,7 @@ impl GongDB {
             table_name: None,
             table_alias: None,
         };
+        let column_lookup = build_column_lookup(&columns, &column_scopes);
         let mut rows = Vec::new();
         let null_left = vec![Value::Null; left_len];
         let null_right = vec![Value::Null; right_len];
@@ -1749,6 +1762,7 @@ impl GongDB {
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(self, expr, &scope, outer)?;
                     if !value_to_bool(&value) {
@@ -2366,6 +2380,7 @@ fn eval_constant_expr(db: &GongDB, expr: &Expr) -> Option<Value> {
             table_alias: None,
         },
         cte_context: None,
+        column_lookup: None,
     };
     eval_expr(db, expr, &scope, None).ok()
 }
@@ -2805,6 +2820,7 @@ fn apply_predicates_to_source(
         return Ok(source);
     }
     let table_scope = source.table_scope.clone();
+    let column_lookup = build_column_lookup(&source.columns, &source.column_scopes);
     let mut rows = Vec::new();
     for row in source.rows {
         let scope = EvalScope {
@@ -2813,6 +2829,7 @@ fn apply_predicates_to_source(
             row: &row,
             table_scope: &table_scope,
             cte_context,
+            column_lookup: Some(&column_lookup),
         };
         let mut keep = true;
         for predicate in &predicates {
@@ -2867,6 +2884,7 @@ fn join_sources_with_predicates(
         table_name: None,
         table_alias: None,
     };
+    let column_lookup = build_column_lookup(&columns, &column_scopes);
     let mut rows = Vec::new();
     if join_pairs.is_empty() {
         for left_row in left_rows {
@@ -2881,6 +2899,7 @@ fn join_sources_with_predicates(
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let mut keep = true;
                     for predicate in predicates {
@@ -2948,6 +2967,7 @@ fn join_sources_with_predicates(
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let mut keep = true;
                     for predicate in &remaining_predicates {
@@ -3121,6 +3141,38 @@ impl TableScope {
     }
 }
 
+#[derive(Debug)]
+struct ColumnLookup {
+    unqualified: HashMap<String, usize>,
+    qualified: HashMap<(String, String), usize>,
+}
+
+fn build_column_lookup(columns: &[Column], column_scopes: &[TableScope]) -> ColumnLookup {
+    let mut unqualified = HashMap::with_capacity(columns.len());
+    let mut qualified = HashMap::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        let name_lower = col.name.to_ascii_lowercase();
+        unqualified.entry(name_lower.clone()).or_insert(idx);
+        let qualifier = column_scopes.get(idx).and_then(|scope| {
+            if scope.table_alias.is_some() {
+                scope.table_alias.as_ref()
+            } else {
+                scope.table_name.as_ref()
+            }
+        });
+        if let Some(qualifier) = qualifier {
+            let qual_lower = qualifier.to_ascii_lowercase();
+            qualified
+                .entry((qual_lower, name_lower))
+                .or_insert(idx);
+        }
+    }
+    ColumnLookup {
+        unqualified,
+        qualified,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EvalScope<'a> {
     columns: &'a [Column],
@@ -3128,6 +3180,7 @@ struct EvalScope<'a> {
     row: &'a [Value],
     table_scope: &'a TableScope,
     cte_context: Option<&'a CteContext>,
+    column_lookup: Option<&'a ColumnLookup>,
 }
 
 fn column_from_def(def: ColumnDef) -> Column {
@@ -3634,6 +3687,7 @@ fn eval_insert_expr(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
         row: &[],
         table_scope: &table_scope,
         cte_context: None,
+        column_lookup: None,
     };
     eval_expr(db, expr, &scope, None)
 }
@@ -3679,12 +3733,14 @@ fn validate_insert_row(
             table_alias: None,
         };
         let column_scopes = vec![table_scope.clone(); table.columns.len()];
+        let column_lookup = build_column_lookup(&table.columns, &column_scopes);
         let scope = EvalScope {
             columns: &table.columns,
             column_scopes: &column_scopes,
             row,
             table_scope: &table_scope,
             cte_context: None,
+            column_lookup: Some(&column_lookup),
         };
         for constraint in &table.constraints {
             if let TableConstraint::Check(expr) = constraint {
@@ -3736,6 +3792,16 @@ fn resolve_column_index(name: &str, columns: &[Column]) -> Option<usize> {
         .position(|col| col.name.eq_ignore_ascii_case(name))
 }
 
+fn resolve_column_index_in_scope(scope: &EvalScope<'_>, name: &str) -> Option<usize> {
+    if let Some(lookup) = scope.column_lookup {
+        let key = name.to_ascii_lowercase();
+        if let Some(idx) = lookup.unqualified.get(&key) {
+            return Some(*idx);
+        }
+    }
+    resolve_column_index(name, scope.columns)
+}
+
 fn resolve_qualified_column_index(
     qualifier: &str,
     name: &str,
@@ -3753,6 +3819,21 @@ fn resolve_qualified_column_index(
             None
         }
     })
+}
+
+fn resolve_qualified_column_index_in_scope(
+    scope: &EvalScope<'_>,
+    qualifier: &str,
+    name: &str,
+) -> Option<usize> {
+    if let Some(lookup) = scope.column_lookup {
+        let qual_key = qualifier.to_ascii_lowercase();
+        let name_key = name.to_ascii_lowercase();
+        if let Some(idx) = lookup.qualified.get(&(qual_key, name_key)) {
+            return Some(*idx);
+        }
+    }
+    resolve_qualified_column_index(qualifier, name, scope.columns, scope.column_scopes)
 }
 
 fn split_qualified_identifier(idents: &[Ident]) -> Result<(&str, &str), GongDBError> {
@@ -3781,11 +3862,11 @@ fn eval_expr<'a, 'b>(
     match expr {
         Expr::Literal(_) => eval_literal(expr),
         Expr::Identifier(ident) => {
-            if let Some(idx) = resolve_column_index(&ident.value, scope.columns) {
+            if let Some(idx) = resolve_column_index_in_scope(scope, &ident.value) {
                 return Ok(scope.row[idx].clone());
             }
             if let Some(outer_scope) = outer {
-                if let Some(idx) = resolve_column_index(&ident.value, outer_scope.columns) {
+                if let Some(idx) = resolve_column_index_in_scope(outer_scope, &ident.value) {
                     return Ok(outer_scope.row[idx].clone());
                 }
             }
@@ -3796,21 +3877,15 @@ fn eval_expr<'a, 'b>(
         }
         Expr::CompoundIdentifier(idents) => {
             let (qualifier, column) = split_qualified_identifier(idents)?;
-            if let Some(idx) = resolve_qualified_column_index(
-                qualifier,
-                column,
-                scope.columns,
-                scope.column_scopes,
-            ) {
+            if let Some(idx) =
+                resolve_qualified_column_index_in_scope(scope, qualifier, column)
+            {
                 return Ok(scope.row[idx].clone());
             }
             if let Some(outer_scope) = outer {
-                if let Some(idx) = resolve_qualified_column_index(
-                    qualifier,
-                    column,
-                    outer_scope.columns,
-                    outer_scope.column_scopes,
-                ) {
+                if let Some(idx) =
+                    resolve_qualified_column_index_in_scope(outer_scope, qualifier, column)
+                {
                     return Ok(outer_scope.row[idx].clone());
                 }
             }
@@ -4704,12 +4779,14 @@ fn compute_order_values(
     order_table_scope: &TableScope,
     scope: &EvalScope<'_>,
 ) -> Result<Vec<Value>, GongDBError> {
+    let order_lookup = build_column_lookup(output_columns, order_column_scopes);
     let order_scope = EvalScope {
         columns: output_columns,
         column_scopes: order_column_scopes,
         row: projected_row,
         table_scope: order_table_scope,
         cte_context: scope.cte_context,
+        column_lookup: Some(&order_lookup),
     };
     let mut values = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -4735,12 +4812,14 @@ fn compute_group_order_values(
     group_rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
 ) -> Result<Vec<Value>, GongDBError> {
+    let order_lookup = build_column_lookup(output_columns, order_column_scopes);
     let order_scope = EvalScope {
         columns: output_columns,
         column_scopes: order_column_scopes,
         row: projected_row,
         table_scope: order_table_scope,
         cte_context: scope.cte_context,
+        column_lookup: Some(&order_lookup),
     };
     let mut values = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -4987,6 +5066,7 @@ fn eval_having_clause(
             table_alias: None,
         },
         cte_context,
+        column_lookup: None,
     };
     let value = eval_expr(db, &rewritten, &empty_scope, outer)?;
     Ok(value_to_bool(&value))
@@ -5440,12 +5520,14 @@ fn evaluate_group_projection(
 ) -> Result<Vec<Value>, GongDBError> {
     let null_row = vec![Value::Null; columns.len()];
     let row = group_rows.first().unwrap_or(&null_row);
+    let column_lookup = build_column_lookup(columns, column_scopes);
     let scope = EvalScope {
         columns,
         column_scopes,
         row,
         table_scope,
         cte_context,
+        column_lookup: Some(&column_lookup),
     };
     let mut output = Vec::new();
     for item in projection {
@@ -5498,12 +5580,14 @@ fn evaluate_group_having(
 ) -> Result<bool, GongDBError> {
     let null_row = vec![Value::Null; columns.len()];
     let row = group_rows.first().unwrap_or(&null_row);
+    let column_lookup = build_column_lookup(columns, column_scopes);
     let scope = EvalScope {
         columns,
         column_scopes,
         row,
         table_scope,
         cte_context,
+        column_lookup: Some(&column_lookup),
     };
     let rewritten = if expr_contains_aggregate(having) {
         replace_aggregate_calls(
@@ -5728,6 +5812,7 @@ fn compute_aggregates(
     cte_context: Option<&CteContext>,
 ) -> Result<Vec<Value>, GongDBError> {
     let mut results = Vec::with_capacity(aggregates.len());
+    let column_lookup = build_column_lookup(columns, column_scopes);
     for agg in aggregates {
         match agg.kind {
             AggregateKind::Count => {
@@ -5745,6 +5830,7 @@ fn compute_aggregates(
                             row,
                             table_scope,
                             cte_context,
+                            column_lookup: Some(&column_lookup),
                         };
                         let value = eval_expr(db, expr, &scope, outer)?;
                         if !matches!(value, Value::Null) {
@@ -5782,6 +5868,7 @@ fn compute_aggregates(
                         row,
                         table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -5838,6 +5925,7 @@ fn compute_aggregates(
                         row,
                         table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -5876,6 +5964,7 @@ fn compute_aggregates(
                         row,
                         table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -5923,6 +6012,7 @@ fn compute_aggregates(
                         row,
                         table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -5971,6 +6061,7 @@ fn compute_aggregates(
                         row,
                         table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
@@ -6010,6 +6101,7 @@ fn compute_aggregates(
                         row,
                         table_scope,
                         cte_context,
+                        column_lookup: Some(&column_lookup),
                     };
                     let value = eval_expr(db, expr, &scope, outer)?;
                     if matches!(value, Value::Null) {
