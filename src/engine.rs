@@ -1764,7 +1764,6 @@ impl GongDB {
             table_name: None,
             table_alias: None,
         };
-        let column_lookup = build_column_lookup(&columns, &column_scopes);
         let mut rows = Vec::new();
         let null_left = vec![Value::Null; left_len];
         let null_right = vec![Value::Null; right_len];
@@ -1779,13 +1778,17 @@ impl GongDB {
             JoinConstraint::On(expr) => Some(expr),
             _ => None,
         });
+        let column_lookup = on_expr
+            .as_ref()
+            .map(|_| build_column_lookup(&columns, &column_scopes));
         let mut right_matched = vec![false; right_rows.len()];
 
-        for left_row in left_rows {
+        for left_row in &left_rows {
             let mut matched = false;
             for (right_idx, right_row) in right_rows.iter().enumerate() {
-                let mut combined = left_row.clone();
-                combined.extend(right_row.clone());
+                let mut combined = Vec::with_capacity(left_len + right_len);
+                combined.extend(left_row.iter().cloned());
+                combined.extend(right_row.iter().cloned());
                 if let Some(expr) = on_expr {
                     let scope = EvalScope {
                         columns: &columns,
@@ -1793,7 +1796,7 @@ impl GongDB {
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
-                        column_lookup: Some(&column_lookup),
+                        column_lookup: column_lookup.as_ref(),
                     };
                     let value = eval_expr(self, expr, &scope, outer)?;
                     if !value_to_bool(&value) {
@@ -1810,8 +1813,9 @@ impl GongDB {
                 rows.push(combined);
             }
             if !matched && matches!(operator, JoinOperator::Left | JoinOperator::Full) {
-                let mut combined = left_row;
-                combined.extend(null_right.clone());
+                let mut combined = Vec::with_capacity(left_len + right_len);
+                combined.extend(left_row.iter().cloned());
+                combined.extend(null_right.iter().cloned());
                 rows.push(combined);
             }
         }
@@ -1821,7 +1825,8 @@ impl GongDB {
                 if right_matched[right_idx] {
                     continue;
                 }
-                let mut combined = null_left.clone();
+                let mut combined = Vec::with_capacity(left_len + right_len);
+                combined.extend(null_left.iter().cloned());
                 combined.extend(right_row);
                 rows.push(combined);
             }
@@ -2930,7 +2935,6 @@ fn join_sources_with_predicates(
         table_name: None,
         table_alias: None,
     };
-    let column_lookup = build_column_lookup(&columns, &column_scopes);
     let mut filtered_predicates = Vec::with_capacity(predicates.len());
     for predicate in predicates {
         if expr_is_constant(&predicate) {
@@ -2954,6 +2958,11 @@ fn join_sources_with_predicates(
         &columns[left_len..],
         &column_scopes[left_len..],
     );
+    let column_lookup = if remaining_predicates.is_empty() {
+        None
+    } else {
+        Some(build_column_lookup(&columns, &column_scopes))
+    };
     let mut rows = Vec::new();
     if join_pairs.is_empty() {
         for left_row in left_rows {
@@ -2968,7 +2977,7 @@ fn join_sources_with_predicates(
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
-                        column_lookup: Some(&column_lookup),
+                        column_lookup: column_lookup.as_ref(),
                     };
                     let mut keep = true;
                     for predicate in &remaining_predicates {
@@ -3017,7 +3026,7 @@ fn join_sources_with_predicates(
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
-                        column_lookup: Some(&column_lookup),
+                        column_lookup: column_lookup.as_ref(),
                     };
                     let mut keep = true;
                     for predicate in &remaining_predicates {
@@ -3085,7 +3094,7 @@ fn join_sources_with_predicates(
                         row: &combined,
                         table_scope: &table_scope,
                         cte_context,
-                        column_lookup: Some(&column_lookup),
+                        column_lookup: column_lookup.as_ref(),
                     };
                     let mut keep = true;
                     for predicate in &remaining_predicates {
