@@ -612,10 +612,6 @@ fn run_new_order(
     // Get and increment next order ID from district (TPC-C spec requirement)
     // Read current d_next_o_id, use it, then increment
     // Note: In a real implementation, this should be atomic
-    let o_id_result = db.run_statement(&format!(
-        "SELECT d_next_o_id FROM district WHERE d_w_id = {} AND d_id = {}",
-        w_id, d_id
-    ))?;
     // For simplicity, we'll use a deterministic approach based on txn_id
     // In a real implementation, this would read the actual value and update it
     let o_id = 3001 + (txn_id % 1000); // Simulated order ID
