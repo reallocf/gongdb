@@ -3,6 +3,7 @@ use crate::ast::{
     IndexedColumn, Literal, NullsOrder, ObjectName, OrderByExpr, Select, SelectItem, SortOrder,
     TableConstraint, TableRef, UnaryOperator, With,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -25,6 +26,8 @@ const HEADER_SCHEMA_VERSION_OFFSET: usize = 20;
 const HEADER_CATALOG_FORMAT_OFFSET: usize = 24;
 const JOURNAL_MAGIC: [u8; 8] = *b"GONGJNL1";
 const JOURNAL_HEADER_SIZE: usize = 16;
+const PAGE_CACHE_CAPACITY: usize = 256;
+const PAGE_ALLOC_BATCH: u32 = 64;
 
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 static LOCK_MANAGER: OnceLock<Mutex<LockManager>> = OnceLock::new();
@@ -174,6 +177,136 @@ struct Journal {
     base_len: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedPage {
+    data: Vec<u8>,
+    dirty: bool,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct PageCache {
+    pages: HashMap<u32, CachedPage>,
+    counter: u64,
+    capacity: usize,
+}
+
+impl PageCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pages: HashMap::new(),
+            counter: 0,
+            capacity,
+        }
+    }
+
+    fn get(&mut self, page_id: u32) -> Option<Vec<u8>> {
+        let entry = self.pages.get_mut(&page_id)?;
+        self.counter = self.counter.wrapping_add(1);
+        entry.last_used = self.counter;
+        Some(entry.data.clone())
+    }
+
+    fn insert_clean(&mut self, page_id: u32, data: Vec<u8>) -> Option<(u32, CachedPage)> {
+        if self.capacity == 0 {
+            return None;
+        }
+        if self.pages.contains_key(&page_id) {
+            return None;
+        }
+        let mut evicted = None;
+        if self.pages.len() >= self.capacity {
+            evicted = self.evict_lru(|entry| !entry.dirty);
+            if evicted.is_none() {
+                return None;
+            }
+        }
+        self.counter = self.counter.wrapping_add(1);
+        self.pages.insert(
+            page_id,
+            CachedPage {
+                data,
+                dirty: false,
+                last_used: self.counter,
+            },
+        );
+        evicted
+    }
+
+    fn insert_dirty(&mut self, page_id: u32, data: Vec<u8>) -> Option<(u32, CachedPage)> {
+        if self.capacity == 0 {
+            return None;
+        }
+        if let Some(entry) = self.pages.get_mut(&page_id) {
+            entry.data = data;
+            entry.dirty = true;
+            self.counter = self.counter.wrapping_add(1);
+            entry.last_used = self.counter;
+            return None;
+        }
+        let mut evicted = None;
+        if self.pages.len() >= self.capacity {
+            evicted = self.evict_lru(|_| true);
+        }
+        self.counter = self.counter.wrapping_add(1);
+        self.pages.insert(
+            page_id,
+            CachedPage {
+                data,
+                dirty: true,
+                last_used: self.counter,
+            },
+        );
+        evicted
+    }
+
+    fn put_clean(&mut self, page_id: u32, data: Vec<u8>) -> Option<(u32, CachedPage)> {
+        if let Some(entry) = self.pages.get_mut(&page_id) {
+            entry.data = data;
+            entry.dirty = false;
+            self.counter = self.counter.wrapping_add(1);
+            entry.last_used = self.counter;
+            return None;
+        }
+        self.insert_clean(page_id, data)
+    }
+
+    fn evict_lru<F>(&mut self, mut predicate: F) -> Option<(u32, CachedPage)>
+    where
+        F: FnMut(&CachedPage) -> bool,
+    {
+        let mut lru_id = None;
+        let mut lru_used = u64::MAX;
+        for (page_id, entry) in self.pages.iter() {
+            if !predicate(entry) {
+                continue;
+            }
+            if entry.last_used < lru_used {
+                lru_used = entry.last_used;
+                lru_id = Some(*page_id);
+            }
+        }
+        let page_id = lru_id?;
+        let entry = self.pages.remove(&page_id)?;
+        Some((page_id, entry))
+    }
+
+    fn drain_dirty_pages(&mut self) -> Vec<(u32, Vec<u8>)> {
+        let mut dirty = Vec::new();
+        for (page_id, entry) in self.pages.iter_mut() {
+            if entry.dirty {
+                dirty.push((*page_id, entry.data.clone()));
+                entry.dirty = false;
+            }
+        }
+        dirty
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+    }
+}
+
 #[derive(Debug)]
 struct LockState {
     readers: HashMap<u64, usize>,
@@ -213,14 +346,17 @@ pub struct StorageEngine {
     db_id: String,
     disk_path: Option<String>,
     next_page_id: u32,
+    reserved_pages: u32,
     schema_version: u32,
     catalog_format_version: u32,
     tables: HashMap<String, TableMeta>,
     indexes: HashMap<String, IndexMeta>,
     views: HashMap<String, ViewMeta>,
     free_pages: Vec<u32>,
+    free_pages_set: HashSet<u32>,
     txn_active: bool,
     journal: Option<Journal>,
+    page_cache: RefCell<PageCache>,
 }
 
 pub struct TableScan<'a> {
@@ -288,20 +424,24 @@ impl StorageEngine {
         let mut pages = Vec::new();
         pages.push(vec![0; PAGE_SIZE]);
         pages.push(init_data_page());
+        let reserved_pages = pages.len() as u32;
         let id = NEXT_DB_ID.fetch_add(1, Ordering::SeqCst);
         let mut engine = StorageEngine {
             mode: StorageMode::InMemory { pages },
             db_id: format!("memory-{}", id),
             disk_path: None,
             next_page_id: CATALOG_PAGE_ID + 1,
+            reserved_pages,
             schema_version: 0,
             catalog_format_version: CATALOG_FORMAT_VERSION,
             tables: HashMap::new(),
             indexes: HashMap::new(),
             views: HashMap::new(),
             free_pages: Vec::new(),
+            free_pages_set: HashSet::new(),
             txn_active: false,
             journal: None,
+            page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -326,6 +466,7 @@ impl StorageEngine {
             file.sync_all()?;
         }
 
+        let reserved_pages = (file.metadata()?.len() / PAGE_SIZE as u64) as u32;
         let mut header = vec![0; PAGE_SIZE];
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut header)?;
@@ -371,15 +512,19 @@ impl StorageEngine {
             db_id: format!("disk-{}", path),
             disk_path: Some(path.to_string()),
             next_page_id,
+            reserved_pages,
             schema_version,
             catalog_format_version,
             tables,
             indexes,
             views,
             free_pages: Vec::new(),
+            free_pages_set: HashSet::new(),
             txn_active: false,
             journal: None,
+            page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
         };
+        engine.ensure_reserved_pages(engine.next_page_id)?;
         engine.write_header()?;
         engine.write_catalog()?;
         Ok(engine)
@@ -429,6 +574,12 @@ impl StorageEngine {
         self.indexes = snapshot.indexes;
         self.views = snapshot.views;
         self.free_pages = snapshot.free_pages;
+        self.free_pages_set = self.free_pages.iter().copied().collect();
+        self.reserved_pages = match &self.mode {
+            StorageMode::InMemory { pages } => pages.len() as u32,
+            StorageMode::OnDisk { file } => (file.metadata()?.len() / PAGE_SIZE as u64) as u32,
+        };
+        self.page_cache.borrow_mut().clear();
         Ok(())
     }
 
@@ -438,6 +589,7 @@ impl StorageEngine {
 
     pub fn commit_transaction(&mut self) -> Result<(), StorageError> {
         self.txn_active = false;
+        self.flush_dirty_pages(true)?;
         if let Some(journal) = self.journal.take() {
             if let StorageMode::OnDisk { file } = &mut self.mode {
                 file.sync_all()?;
@@ -452,6 +604,7 @@ impl StorageEngine {
         if let Some(journal) = self.journal.take() {
             let _ = std::fs::remove_file(&journal.path);
         }
+        self.page_cache.borrow_mut().clear();
     }
 
     pub fn acquire_read_lock(&self, txn_id: u64) -> Result<(), StorageError> {
@@ -1208,14 +1361,19 @@ impl StorageEngine {
         Ok(pages)
     }
 
-    pub fn allocate_data_page(&mut self) -> Result<u32, StorageError> {
+    fn allocate_page_id(&mut self) -> Result<u32, StorageError> {
         if let Some(page_id) = self.free_pages.pop() {
-            let page = init_data_page();
-            self.write_page(page_id, &page)?;
+            self.free_pages_set.remove(&page_id);
             return Ok(page_id);
         }
         let page_id = self.next_page_id;
-        self.next_page_id += 1;
+        self.next_page_id = self.next_page_id.saturating_add(1);
+        self.ensure_reserved_pages(self.next_page_id)?;
+        Ok(page_id)
+    }
+
+    pub fn allocate_data_page(&mut self) -> Result<u32, StorageError> {
+        let page_id = self.allocate_page_id()?;
         let page = init_data_page();
         self.write_page(page_id, &page)?;
         self.write_header()?;
@@ -1229,13 +1387,7 @@ impl StorageEngine {
                 page_type
             )));
         }
-        if let Some(page_id) = self.free_pages.pop() {
-            let page = init_btree_page(page_type);
-            self.write_page(page_id, &page)?;
-            return Ok(page_id);
-        }
-        let page_id = self.next_page_id;
-        self.next_page_id += 1;
+        let page_id = self.allocate_page_id()?;
         let page = init_btree_page(page_type);
         self.write_page(page_id, &page)?;
         self.write_header()?;
@@ -1280,7 +1432,7 @@ impl StorageEngine {
         }
         let page = init_data_page();
         self.write_page(page_id, &page)?;
-        if !self.free_pages.contains(&page_id) {
+        if self.free_pages_set.insert(page_id) {
             self.free_pages.push(page_id);
         }
         Ok(())
@@ -1318,10 +1470,17 @@ impl StorageEngine {
                 .cloned()
                 .ok_or_else(|| StorageError::Invalid(format!("missing page {}", page_id))),
             StorageMode::OnDisk { file } => {
+                if let Some(page) = self.page_cache.borrow_mut().get(page_id) {
+                    return Ok(page);
+                }
                 let mut buf = vec![0; PAGE_SIZE];
                 let mut file = file.try_clone()?;
                 file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
                 file.read_exact(&mut buf)?;
+                let _ = self
+                    .page_cache
+                    .borrow_mut()
+                    .insert_clean(page_id, buf.clone());
                 Ok(buf)
             }
         }
@@ -1389,22 +1548,104 @@ impl StorageEngine {
 
     fn write_page(&mut self, page_id: u32, data: &[u8]) -> Result<(), StorageError> {
         self.log_page_before_write(page_id)?;
+        self.ensure_reserved_pages(page_id.saturating_add(1))?;
         match &mut self.mode {
             StorageMode::InMemory { pages } => {
                 let idx = page_id as usize;
                 if idx >= pages.len() {
                     pages.resize(idx + 1, vec![0; PAGE_SIZE]);
+                    self.reserved_pages = pages.len() as u32;
                 }
                 pages[idx] = data.to_vec();
                 Ok(())
             }
             StorageMode::OnDisk { file } => {
-                file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
-                file.write_all(data)?;
-                file.sync_all()?;
+                if self.txn_active {
+                    let evicted = self
+                        .page_cache
+                        .borrow_mut()
+                        .insert_dirty(page_id, data.to_vec());
+                    if let Some((evicted_id, entry)) = evicted {
+                        self.flush_evicted_page(evicted_id, entry)?;
+                    }
+                    Ok(())
+                } else {
+                    file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
+                    file.write_all(data)?;
+                    file.sync_all()?;
+                    let _ = self
+                        .page_cache
+                        .borrow_mut()
+                        .put_clean(page_id, data.to_vec());
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn ensure_reserved_pages(&mut self, min_pages: u32) -> Result<(), StorageError> {
+        match &mut self.mode {
+            StorageMode::InMemory { pages } => {
+                if min_pages as usize > pages.len() {
+                    pages.resize(min_pages as usize, vec![0; PAGE_SIZE]);
+                }
+                self.reserved_pages = pages.len() as u32;
+                Ok(())
+            }
+            StorageMode::OnDisk { file } => {
+                if min_pages <= self.reserved_pages {
+                    return Ok(());
+                }
+                let mut target = self.reserved_pages.max(1);
+                while target < min_pages {
+                    target = target.saturating_add(PAGE_ALLOC_BATCH);
+                }
+                file.set_len(target as u64 * PAGE_SIZE as u64)?;
+                self.reserved_pages = target;
                 Ok(())
             }
         }
+    }
+
+    fn flush_evicted_page(&mut self, page_id: u32, entry: CachedPage) -> Result<(), StorageError> {
+        if !entry.dirty {
+            return Ok(());
+        }
+        self.write_page_to_disk(page_id, &entry.data)?;
+        if !self.txn_active {
+            self.sync_disk()?;
+        }
+        Ok(())
+    }
+
+    fn flush_dirty_pages(&mut self, sync: bool) -> Result<(), StorageError> {
+        if !matches!(&self.mode, StorageMode::OnDisk { .. }) {
+            return Ok(());
+        }
+        let dirty_pages = self.page_cache.borrow_mut().drain_dirty_pages();
+        for (page_id, data) in dirty_pages {
+            self.write_page_to_disk(page_id, &data)?;
+        }
+        if sync {
+            self.sync_disk()?;
+        }
+        Ok(())
+    }
+
+    fn write_page_to_disk(&mut self, page_id: u32, data: &[u8]) -> Result<(), StorageError> {
+        self.ensure_reserved_pages(page_id.saturating_add(1))?;
+        if let StorageMode::OnDisk { file } = &mut self.mode {
+            file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
+            file.write_all(data)?;
+        }
+        Ok(())
+    }
+
+    fn sync_disk(&mut self) -> Result<(), StorageError> {
+        if let StorageMode::OnDisk { file } = &mut self.mode {
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     fn write_header(&mut self) -> Result<(), StorageError> {
