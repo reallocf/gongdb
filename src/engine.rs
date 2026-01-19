@@ -1005,6 +1005,8 @@ impl GongDB {
                 };
                 let order_column_scopes =
                     vec![order_table_scope.clone(); output_columns.len()];
+                let order_lookup =
+                    build_column_lookup(&output_columns, &order_column_scopes);
                 let mut rows = Vec::with_capacity(groups.len());
                 for group in &groups {
                     if let Some(having) = &select.having {
@@ -1046,6 +1048,7 @@ impl GongDB {
                         &output_columns,
                         &order_column_scopes,
                         &order_table_scope,
+                        &order_lookup,
                         &scope,
                         &group.rows,
                         outer,
@@ -1165,6 +1168,7 @@ impl GongDB {
             };
             let order_column_scopes =
                 vec![order_table_scope.clone(); output_columns.len()];
+            let order_lookup = build_column_lookup(&output_columns, &order_column_scopes);
             let mut rows = Vec::with_capacity(filtered.len());
             for row in filtered {
                 let scope = EvalScope {
@@ -1189,6 +1193,7 @@ impl GongDB {
                     &output_columns,
                     &order_column_scopes,
                     &order_table_scope,
+                    &order_lookup,
                     &scope,
                 )?;
                 rows.push(SortedRow {
@@ -4777,9 +4782,9 @@ fn compute_order_values(
     output_columns: &[Column],
     order_column_scopes: &[TableScope],
     order_table_scope: &TableScope,
+    order_lookup: &ColumnLookup,
     scope: &EvalScope<'_>,
 ) -> Result<Vec<Value>, GongDBError> {
-    let order_lookup = build_column_lookup(output_columns, order_column_scopes);
     let order_scope = EvalScope {
         columns: output_columns,
         column_scopes: order_column_scopes,
@@ -4808,11 +4813,11 @@ fn compute_group_order_values(
     output_columns: &[Column],
     order_column_scopes: &[TableScope],
     order_table_scope: &TableScope,
+    order_lookup: &ColumnLookup,
     scope: &EvalScope<'_>,
     group_rows: &[Vec<Value>],
     outer: Option<&EvalScope<'_>>,
 ) -> Result<Vec<Value>, GongDBError> {
-    let order_lookup = build_column_lookup(output_columns, order_column_scopes);
     let order_scope = EvalScope {
         columns: output_columns,
         column_scopes: order_column_scopes,
