@@ -3069,8 +3069,9 @@ fn join_sources_with_predicates(
             right_map.entry(key).or_default().push(idx);
         }
 
+        let mut left_key = Vec::with_capacity(left_key_indices.len());
         for left_row in left_rows {
-            let mut key = Vec::with_capacity(left_key_indices.len());
+            left_key.clear();
             let mut has_null = false;
             for col_idx in &left_key_indices {
                 let value = &left_row[*col_idx];
@@ -3078,12 +3079,12 @@ fn join_sources_with_predicates(
                     has_null = true;
                     break;
                 }
-                key.push(distinct_key(value));
+                left_key.push(distinct_key(value));
             }
             if has_null {
                 continue;
             }
-            let Some(matches) = right_map.get(&key) else {
+            let Some(matches) = right_map.get(&left_key) else {
                 continue;
             };
             for right_idx in matches {
@@ -5043,6 +5044,7 @@ fn project_row(
     for item in projection {
         match item {
             SelectItem::Wildcard => {
+                output.reserve(row.len());
                 output.extend(row.iter().cloned());
             }
             SelectItem::Expr { expr, .. } => {
@@ -5055,6 +5057,7 @@ fn project_row(
                 if indices.is_empty() {
                     return Err(GongDBError::new(format!("no such table: {}", qualifier)));
                 }
+                output.reserve(indices.len());
                 for idx in indices {
                     output.push(row[idx].clone());
                 }
