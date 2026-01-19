@@ -337,6 +337,8 @@ fn is_keyword(word: &str) -> bool {
             | "WITHOUT"
             | "ROWID"
             | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
             | "ALL"
             | "CAST"
             | "INTEGER"
@@ -773,16 +775,40 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Select, ParserError> {
+        let mut select = self.parse_select_intersect()?;
+        loop {
+            if self.eat_keyword("UNION") {
+                let operator = if self.eat_keyword("ALL") {
+                    CompoundOperator::UnionAll
+                } else {
+                    CompoundOperator::Union
+                };
+                let right = self.parse_select_intersect()?;
+                select.compounds.push(CompoundSelect {
+                    operator,
+                    select: Box::new(right),
+                });
+                continue;
+            }
+            if self.eat_keyword("EXCEPT") {
+                let right = self.parse_select_intersect()?;
+                select.compounds.push(CompoundSelect {
+                    operator: CompoundOperator::Except,
+                    select: Box::new(right),
+                });
+                continue;
+            }
+            break;
+        }
+        Ok(select)
+    }
+
+    fn parse_select_intersect(&mut self) -> Result<Select, ParserError> {
         let mut select = self.parse_select_base()?;
-        while self.eat_keyword("UNION") {
-            let operator = if self.eat_keyword("ALL") {
-                CompoundOperator::UnionAll
-            } else {
-                CompoundOperator::Union
-            };
+        while self.eat_keyword("INTERSECT") {
             let right = self.parse_select_base()?;
             select.compounds.push(CompoundSelect {
-                operator,
+                operator: CompoundOperator::Intersect,
                 select: Box::new(right),
             });
         }

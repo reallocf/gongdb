@@ -156,6 +156,8 @@ pub enum SelectItem {
 pub enum CompoundOperator {
     Union,
     UnionAll,
+    Intersect,
+    Except,
 }
 
 #[derive(Debug, Clone, PartialEq)]

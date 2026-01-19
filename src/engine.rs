@@ -699,6 +699,35 @@ impl GongDB {
                         result.rows.extend(right.rows);
                         dedup_rows(&mut result.rows);
                     }
+                    crate::ast::CompoundOperator::Intersect => {
+                        let mut left_rows = result.rows;
+                        let mut right_rows = right.rows;
+                        dedup_rows(&mut left_rows);
+                        dedup_rows(&mut right_rows);
+                        let mut merged = Vec::new();
+                        for row in left_rows {
+                            if right_rows.iter().any(|candidate| rows_equal(&row, candidate)) {
+                                merged.push(row);
+                            }
+                        }
+                        result.rows = merged;
+                    }
+                    crate::ast::CompoundOperator::Except => {
+                        let mut left_rows = result.rows;
+                        let mut right_rows = right.rows;
+                        dedup_rows(&mut left_rows);
+                        dedup_rows(&mut right_rows);
+                        let mut merged = Vec::new();
+                        for row in left_rows {
+                            if right_rows
+                                .iter()
+                                .all(|candidate| !rows_equal(&row, candidate))
+                            {
+                                merged.push(row);
+                            }
+                        }
+                        result.rows = merged;
+                    }
                 }
             }
             return Ok(result);

@@ -1423,16 +1423,16 @@ impl StorageEngine {
     }
 
     fn write_catalog(&mut self) -> Result<(), StorageError> {
-        let mut page = init_data_page();
+        let mut records = Vec::new();
         for table in self.tables.values() {
             if self.catalog_format_version >= 2 {
                 let mut encoded = Vec::new();
                 encoded.push(1);
                 encoded.extend_from_slice(&encode_table_meta(table)?);
-                let _ = insert_record(&mut page, &encoded)?;
+                records.push(encoded);
             } else {
                 let encoded = encode_table_meta(table)?;
-                let _ = insert_record(&mut page, &encoded)?;
+                records.push(encoded);
             }
         }
         if self.catalog_format_version >= 2 {
@@ -1440,7 +1440,7 @@ impl StorageEngine {
                 let mut encoded = Vec::new();
                 encoded.push(2);
                 encoded.extend_from_slice(&encode_index_meta(index)?);
-                let _ = insert_record(&mut page, &encoded)?;
+                records.push(encoded);
             }
         }
         if self.catalog_format_version >= 3 {
@@ -1448,15 +1448,33 @@ impl StorageEngine {
                 let mut encoded = Vec::new();
                 encoded.push(3);
                 encoded.extend_from_slice(&encode_view_meta(view)?);
-                let _ = insert_record(&mut page, &encoded)?;
+                records.push(encoded);
             }
         }
-        self.write_page(CATALOG_PAGE_ID, &page)
+        self.write_catalog_pages(&records)
     }
 
     fn bump_schema_version(&mut self) -> Result<(), StorageError> {
         self.schema_version = self.schema_version.saturating_add(1);
         self.write_header()
+    }
+
+    fn write_catalog_pages(&mut self, records: &[Vec<u8>]) -> Result<(), StorageError> {
+        let mut page_id = CATALOG_PAGE_ID;
+        let mut page = init_data_page();
+        for record in records {
+            if !has_space_for_record(&page, record.len()) {
+                let new_page_id = self.allocate_data_page()?;
+                set_next_page_id(&mut page, new_page_id);
+                self.write_page(page_id, &page)?;
+                page_id = new_page_id;
+                page = init_data_page();
+            }
+            insert_record(&mut page, record)?;
+        }
+        set_next_page_id(&mut page, 0);
+        self.write_page(page_id, &page)?;
+        Ok(())
     }
 }
 
@@ -1472,50 +1490,64 @@ fn load_catalog_from_file(
     ),
     StorageError,
 > {
-    let mut page = vec![0; PAGE_SIZE];
-    file.seek(SeekFrom::Start(CATALOG_PAGE_ID as u64 * PAGE_SIZE as u64))?;
-    file.read_exact(&mut page)?;
     let mut tables = HashMap::new();
     let mut indexes = HashMap::new();
     let mut views = HashMap::new();
-    for record in read_records(&page) {
-        if format_version >= 2 {
-            if record.is_empty() {
-                return Err(StorageError::Corrupt("empty catalog record".to_string()));
-            }
-            match record[0] {
-                1 => {
-                    let table = decode_table_meta(&record[1..])?;
-                    tables.insert(table.name.clone(), table);
-                }
-                2 => {
-                    let index = decode_index_meta(&record[1..])?;
-                    indexes.insert(index.name.clone(), index);
-                }
-                3 => {
-                    if format_version < 3 {
-                        return Err(StorageError::Corrupt(
-                            "unexpected view record in catalog".to_string(),
-                        ));
-                    }
-                    let view = decode_view_meta(&record[1..])?;
-                    views.insert(view.name.clone(), view);
-                }
-                tag => {
-                    return Err(StorageError::Corrupt(format!(
-                        "unknown catalog record tag {}",
-                        tag
-                    )))
-                }
-            }
-        } else {
-            let table = if format_version == 0 {
-                decode_table_meta_v0(&record)?
-            } else {
-                decode_table_meta(&record)?
-            };
-            tables.insert(table.name.clone(), table);
+    let mut page_id = CATALOG_PAGE_ID;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(page_id) {
+            return Err(StorageError::Corrupt(
+                "catalog page loop detected".to_string(),
+            ));
         }
+        let mut page = vec![0; PAGE_SIZE];
+        file.seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
+        file.read_exact(&mut page)?;
+        for record in read_records(&page) {
+            if format_version >= 2 {
+                if record.is_empty() {
+                    return Err(StorageError::Corrupt("empty catalog record".to_string()));
+                }
+                match record[0] {
+                    1 => {
+                        let table = decode_table_meta(&record[1..])?;
+                        tables.insert(table.name.clone(), table);
+                    }
+                    2 => {
+                        let index = decode_index_meta(&record[1..])?;
+                        indexes.insert(index.name.clone(), index);
+                    }
+                    3 => {
+                        if format_version < 3 {
+                            return Err(StorageError::Corrupt(
+                                "unexpected view record in catalog".to_string(),
+                            ));
+                        }
+                        let view = decode_view_meta(&record[1..])?;
+                        views.insert(view.name.clone(), view);
+                    }
+                    tag => {
+                        return Err(StorageError::Corrupt(format!(
+                            "unknown catalog record tag {}",
+                            tag
+                        )))
+                    }
+                }
+            } else {
+                let table = if format_version == 0 {
+                    decode_table_meta_v0(&record)?
+                } else {
+                    decode_table_meta(&record)?
+                };
+                tables.insert(table.name.clone(), table);
+            }
+        }
+        let next_page = get_next_page_id(&page);
+        if next_page == 0 {
+            break;
+        }
+        page_id = next_page;
     }
     if next_page_id == 0 {
         return Err(StorageError::Corrupt("invalid next page id".to_string()));
@@ -3179,6 +3211,8 @@ fn encode_compound_operator(op: &CompoundOperator, buf: &mut Vec<u8>) -> Result<
     let value = match op {
         CompoundOperator::Union => 0u8,
         CompoundOperator::UnionAll => 1u8,
+        CompoundOperator::Intersect => 2u8,
+        CompoundOperator::Except => 3u8,
     };
     buf.push(value);
     Ok(())
@@ -3194,6 +3228,8 @@ fn decode_compound_operator(
     let op = match record[pos] {
         0 => CompoundOperator::Union,
         1 => CompoundOperator::UnionAll,
+        2 => CompoundOperator::Intersect,
+        3 => CompoundOperator::Except,
         _ => {
             return Err(StorageError::Corrupt(
                 "invalid compound operator".to_string(),

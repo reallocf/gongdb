@@ -1,4 +1,5 @@
 use gongdb::run_test_file;
+use std::io::{self, Write};
 
 /// Helper function to collect all test files recursively
 fn collect_test_files(dir: &std::path::Path, test_files: &mut Vec<String>) -> std::io::Result<()> {
@@ -32,15 +33,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     test_files.sort();
     
     println!("Found {} test files (SQLite + custom)", test_files.len());
+    io::stdout().flush()?;
     
     let mut failed = Vec::new();
     for test_file in &test_files {
         print!("Running {}... ", test_file);
+        io::stdout().flush()?;
         match run_test_file(test_file).await {
-            Ok(()) => println!("✓"),
+            Ok(()) => {
+                println!("✓");
+                io::stdout().flush()?;
+            }
             Err(e) => {
                 println!("✗");
+                io::stdout().flush()?;
                 eprintln!("  Error: {}", e);
+                io::stderr().flush()?;
                 failed.push((test_file.clone(), e));
             }
         }
@@ -48,11 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     if failed.is_empty() {
         println!("\nAll {} tests passed!", test_files.len());
+        io::stdout().flush()?;
         Ok(())
     } else {
         eprintln!("\n{} out of {} tests failed:", failed.len(), test_files.len());
+        io::stderr().flush()?;
         for (file, _) in &failed {
             eprintln!("  - {}", file);
+            io::stderr().flush()?;
         }
         std::process::exit(1);
     }

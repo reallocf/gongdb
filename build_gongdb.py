@@ -282,6 +282,38 @@ def update_task_status(task_id: str, status: str) -> bool:
     return exit_code == 0
 
 
+def get_task_comments(task_id: str) -> list:
+    """Get list of comments for a task. Returns list of comment dictionaries."""
+    # Try with --json flag first
+    exit_code, stdout, stderr = run_command(['bd', 'comments', task_id, '--json'])
+    if exit_code == 0 and stdout.strip():
+        try:
+            data = json.loads(stdout)
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict) and 'comments' in data:
+                return data['comments']
+            elif isinstance(data, dict):
+                return [data]  # Single comment as dict
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    
+    # Try without --json flag (plain text output)
+    exit_code, stdout, stderr = run_command(['bd', 'comments', task_id])
+    if exit_code == 0 and stdout.strip():
+        # Check if output indicates no comments
+        if 'No comments' in stdout or stdout.strip() == '':
+            return []
+        # If not JSON, return as plain text comments
+        comments = []
+        for line in stdout.strip().split('\n'):
+            if line.strip() and 'No comments' not in line:
+                comments.append({'text': line.strip()})
+        return comments
+    
+    return []
+
+
 def add_task_note(task_id: str, note: str) -> bool:
     """Add a note to a task"""
     logger.log(f"Adding note to task {task_id}: {note}")
@@ -362,11 +394,30 @@ def commit_changes(task_id: str, task_title: str, task_completed: bool = False) 
         return None
 
 
-def run_codex_session(task_id: str, task_title: str, task_description: str) -> int:
+def run_codex_session(task_id: str, task_title: str, task_description: str, comments: list = None) -> int:
     """Run codex session for a task"""
     logger.log(f"Starting codex session for task: {task_id}")
     logger.log(f"Task title: {task_title}")
     logger.log(f"Task description: {task_description}")
+    
+    # Format comments for prompt
+    comments_text = ""
+    if comments:
+        comments_text = "\nComments:\n"
+        for i, comment in enumerate(comments, 1):
+            if isinstance(comment, dict):
+                comment_text = comment.get('text', comment.get('body', comment.get('content', str(comment))))
+                comment_author = comment.get('author', comment.get('user', ''))
+                comment_time = comment.get('created_at', comment.get('timestamp', comment.get('time', '')))
+                
+                comment_line = f"  {i}. {comment_text}"
+                if comment_author:
+                    comment_line += f" (by {comment_author})"
+                if comment_time:
+                    comment_line += f" [{comment_time}]"
+                comments_text += comment_line + "\n"
+            else:
+                comments_text += f"  {i}. {str(comment)}\n"
     
     # Create prompt for codex
     prompt = f"""You are working on a database implementation project (gongdb - building SQLite from scratch in Rust).
@@ -374,7 +425,7 @@ def run_codex_session(task_id: str, task_title: str, task_description: str) -> i
 CURRENT TASK (BEAD):
 ID: {task_id}
 Title: {task_title}
-Description: {task_description}
+Description: {task_description}{comments_text}
 
 CRITICAL INSTRUCTIONS - READ CAREFULLY:
 1. ⚠️ THIS IS THE LAST MESSAGE YOU WILL RECEIVE IN THIS SESSION. You must complete as much work as possible.
@@ -409,6 +460,12 @@ Please work on this task now. Remember: this is your only chance to work on it i
     with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.txt') as codex_output_file:
         codex_output_path = codex_output_file.name
     
+    # Create a stream file that can be tailed externally for real-time monitoring
+    # This allows you to run: tail -f codex_stream.log in another terminal
+    stream_file_path = os.path.join(SCRIPT_DIR, 'codex_stream.log')
+    logger.log(f"Codex stream file: {stream_file_path}")
+    logger.log(f"  To follow in real-time, run: tail -f {stream_file_path}")
+    
     try:
         # Run codex exec
         codex_cmd = [
@@ -440,16 +497,29 @@ Please work on this task now. Remember: this is your only chance to work on it i
         logger.log("--- Codex Output Start (streaming) ---")
         stdout_lines = []
         
-        # Read output line by line as it comes in
+        # Open stream file for writing (for external tailing)
+        stream_file = open(stream_file_path, 'w', encoding='utf-8')
+        
         try:
+            # Read output line by line as it comes in
+            # Write each line to both logger and stream file
             for line in process.stdout:
                 line = line.rstrip('\n\r')
                 if line:  # Only log non-empty lines
+                    # Write to stream file for external tailing
+                    stream_file.write(line + '\n')
+                    stream_file.flush()
                     # Log immediately to both file and stdout
                     logger.log(line)
                     stdout_lines.append(line)
         except Exception as e:
             logger.error(f"Error reading codex output: {e}")
+        finally:
+            # Close stream file
+            try:
+                stream_file.close()
+            except Exception:
+                pass
         
         # Wait for process to complete
         codex_exit_code = process.wait()
@@ -500,7 +570,7 @@ def log_iteration_start(iteration: int, remaining_tasks: int, total_tasks: int):
     logger.log("=" * 42)
 
 
-def log_task_details(task_id: str, task_title: str, task_description: str, task_status: str):
+def log_task_details(task_id: str, task_title: str, task_description: str, task_status: str, comments: list = None):
     """Log task details"""
     logger.log(f"Found task: {task_id}")
     logger.log("Task details:")
@@ -508,6 +578,27 @@ def log_task_details(task_id: str, task_title: str, task_description: str, task_
     logger.log(f"  Title: {task_title}")
     logger.log(f"  Status: {task_status}")
     logger.log(f"  Description: {task_description[:100]}...")
+    
+    # Log comments if available
+    if comments:
+        logger.log(f"  Comments ({len(comments)}):")
+        for i, comment in enumerate(comments, 1):
+            # Handle both dict format (with 'text' or 'body' key) and string format
+            if isinstance(comment, dict):
+                comment_text = comment.get('text', comment.get('body', comment.get('content', str(comment))))
+                comment_author = comment.get('author', comment.get('user', ''))
+                comment_time = comment.get('created_at', comment.get('timestamp', comment.get('time', '')))
+                
+                comment_line = f"    {i}. {comment_text}"
+                if comment_author:
+                    comment_line += f" (by {comment_author})"
+                if comment_time:
+                    comment_line += f" [{comment_time}]"
+                logger.log(comment_line)
+            else:
+                logger.log(f"    {i}. {str(comment)}")
+    else:
+        logger.log("  Comments: None")
 
 
 def log_codex_session_complete(duration: int, exit_code: int):
@@ -569,7 +660,14 @@ def main():
             break
         
         task_id_verify, task_title, task_description, task_status = task_details
-        log_task_details(task_id_verify, task_title, task_description, task_status)
+        
+        # Get task comments
+        logger.log("Fetching task comments...")
+        comments = get_task_comments(task_id)
+        if comments:
+            logger.log(f"Found {len(comments)} comment(s) for task")
+        
+        log_task_details(task_id_verify, task_title, task_description, task_status, comments)
         
         # Check if task is already done
         if is_task_completed(task_id):
@@ -584,7 +682,7 @@ def main():
         # Run codex session
         logger.log("Starting codex session...")
         codex_start_time = time.time()
-        codex_exit_code = run_codex_session(task_id, task_title, task_description)
+        codex_exit_code = run_codex_session(task_id, task_title, task_description, comments)
         codex_end_time = time.time()
         codex_duration = int(codex_end_time - codex_start_time)
         log_codex_session_complete(codex_duration, codex_exit_code)
