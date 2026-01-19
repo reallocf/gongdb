@@ -976,9 +976,10 @@ impl StorageEngine {
                 current_page = self.read_page(location.page_id)?;
                 current_page_id = Some(location.page_id);
             }
-            let record = record_slice_at_slot(&current_page, location.slot)
-                .ok_or_else(|| StorageError::Corrupt("invalid row location".to_string()))?;
-            rows.push(decode_row(record)?);
+            match record_slice_at_slot(&current_page, location.slot)? {
+                Some(record) => rows.push(decode_row(record)?),
+                None => continue,
+            }
         }
         if let Some(key) = row_cache_key {
             self.index_eq_row_cache.borrow_mut().insert(key, rows.clone());
@@ -1240,10 +1241,10 @@ impl StorageEngine {
 
     pub(crate) fn read_row_at(&self, location: &RowLocation) -> Result<Vec<Value>, StorageError> {
         let page = self.read_page(location.page_id)?;
-        let record = record_slice_at_slot(&page, location.slot).ok_or_else(|| {
-            StorageError::Corrupt("invalid row location".to_string())
-        })?;
-        decode_row(record)
+        match record_slice_at_slot(&page, location.slot)? {
+            Some(record) => decode_row(record),
+            None => Err(StorageError::NotFound("row deleted".to_string())),
+        }
     }
 
     pub(crate) fn update_rows_at(
@@ -1316,6 +1317,58 @@ impl StorageEngine {
             self.write_page(page_id, &page)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn delete_rows_at(
+        &mut self,
+        table_name: &str,
+        locations: &[RowLocation],
+    ) -> Result<u64, StorageError> {
+        if locations.is_empty() {
+            return Ok(0);
+        }
+        self.clear_index_eq_cache();
+        let mut deletes_by_page: HashMap<u32, Vec<u16>> = HashMap::new();
+        for location in locations {
+            deletes_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push(location.slot);
+        }
+
+        let mut deleted = 0u64;
+        for (page_id, slots) in deletes_by_page.iter() {
+            let mut page = self.read_page(*page_id)?;
+            let slot_count = read_u16(&page, 1) as usize;
+            for slot in slots {
+                let slot = *slot as usize;
+                if slot >= slot_count {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_len = read_u16(&page, slot_offset + 2);
+                if record_len == 0 {
+                    continue;
+                }
+                write_u16(&mut page, slot_offset, 0);
+                write_u16(&mut page, slot_offset + 2, 0);
+                deleted = deleted.saturating_add(1);
+            }
+            self.write_page(*page_id, &page)?;
+        }
+
+        if deleted > 0 {
+            if let Some(table) = self.tables.get_mut(table_name) {
+                table.row_count = table.row_count.saturating_sub(deleted);
+            } else {
+                return Err(StorageError::NotFound(format!(
+                    "table not found: {}",
+                    table_name
+                )));
+            }
+            self.write_catalog()?;
+        }
+        Ok(deleted)
     }
 
     /// Replace all rows in a table with the provided rows.
@@ -1434,7 +1487,27 @@ impl StorageEngine {
     }
 
     fn index_contains_key(&self, index: &IndexMeta, key: &[Value]) -> Result<bool, StorageError> {
-        self.btree_contains_key(index.first_page, key)
+        let mut locations = self.scan_index_range(&index.name, Some(key), Some(key))?;
+        if locations.is_empty() {
+            return Ok(false);
+        }
+        locations.sort_by(|a, b| {
+            a.page_id
+                .cmp(&b.page_id)
+                .then_with(|| a.slot.cmp(&b.slot))
+        });
+        let mut current_page_id = None;
+        let mut current_page = Vec::new();
+        for location in locations {
+            if current_page_id != Some(location.page_id) {
+                current_page = self.read_page(location.page_id)?;
+                current_page_id = Some(location.page_id);
+            }
+            if record_slice_at_slot(&current_page, location.slot)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn insert_index_record_btree(
@@ -1457,37 +1530,6 @@ impl StorageEngine {
             index.first_page = new_root;
         }
         Ok(())
-    }
-
-    fn btree_contains_key(&self, root: u32, key: &[Value]) -> Result<bool, StorageError> {
-        let mut page_id = root;
-        loop {
-            let page = self.read_page(page_id)?;
-            match page_type(&page) {
-                PAGE_TYPE_BTREE_LEAF => {
-                    let entries = read_leaf_entries(&page)?;
-                    for entry in entries {
-                        match compare_index_keys(&entry.key, key) {
-                            std::cmp::Ordering::Less => continue,
-                            std::cmp::Ordering::Equal => return Ok(true),
-                            std::cmp::Ordering::Greater => break,
-                        }
-                    }
-                    return Ok(false);
-                }
-                PAGE_TYPE_BTREE_INTERNAL => {
-                    let leftmost = get_next_page_id(&page);
-                    let cells = read_internal_cells(&page)?;
-                    let (child, _) = btree_choose_child(key, leftmost, &cells);
-                    page_id = child;
-                }
-                _ => {
-                    return Err(StorageError::Corrupt(
-                        "invalid btree page type".to_string(),
-                    ))
-                }
-            }
-        }
     }
 
     #[allow(dead_code)]
@@ -2307,6 +2349,9 @@ fn read_records(page: &[u8]) -> Vec<Vec<u8>> {
         let slot_offset = PAGE_SIZE - (idx + 1) * 4;
         let record_offset = read_u16(page, slot_offset) as usize;
         let record_len = read_u16(page, slot_offset + 2) as usize;
+        if record_len == 0 {
+            continue;
+        }
         if record_offset + record_len <= PAGE_SIZE {
             records.push(page[record_offset..record_offset + record_len].to_vec());
         }
@@ -2321,6 +2366,9 @@ fn read_record_slices<'a>(page: &'a [u8]) -> Vec<&'a [u8]> {
         let slot_offset = PAGE_SIZE - (idx + 1) * 4;
         let record_offset = read_u16(page, slot_offset) as usize;
         let record_len = read_u16(page, slot_offset + 2) as usize;
+        if record_len == 0 {
+            continue;
+        }
         if record_offset + record_len <= PAGE_SIZE {
             records.push(&page[record_offset..record_offset + record_len]);
         }
@@ -2335,6 +2383,9 @@ fn read_records_with_slots(page: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let slot_offset = PAGE_SIZE - (idx + 1) * 4;
         let record_offset = read_u16(page, slot_offset) as usize;
         let record_len = read_u16(page, slot_offset + 2) as usize;
+        if record_len == 0 {
+            continue;
+        }
         if record_offset + record_len <= PAGE_SIZE {
             records.push((idx as u16, page[record_offset..record_offset + record_len].to_vec()));
         }
@@ -2342,23 +2393,22 @@ fn read_records_with_slots(page: &[u8]) -> Vec<(u16, Vec<u8>)> {
     records
 }
 
-fn read_record_at_slot(page: &[u8], slot: u16) -> Option<Vec<u8>> {
-    record_slice_at_slot(page, slot).map(|record| record.to_vec())
-}
-
-fn record_slice_at_slot(page: &[u8], slot: u16) -> Option<&[u8]> {
+fn record_slice_at_slot(page: &[u8], slot: u16) -> Result<Option<&[u8]>, StorageError> {
     let slot_count = read_u16(page, 1) as usize;
     let slot = slot as usize;
     if slot >= slot_count {
-        return None;
+        return Err(StorageError::Corrupt("invalid row location".to_string()));
     }
     let slot_offset = PAGE_SIZE - (slot + 1) * 4;
     let record_offset = read_u16(page, slot_offset) as usize;
     let record_len = read_u16(page, slot_offset + 2) as usize;
-    if record_offset + record_len > PAGE_SIZE {
-        return None;
+    if record_len == 0 {
+        return Ok(None);
     }
-    Some(&page[record_offset..record_offset + record_len])
+    if record_offset + record_len > PAGE_SIZE {
+        return Err(StorageError::Corrupt("invalid row location".to_string()));
+    }
+    Ok(Some(&page[record_offset..record_offset + record_len]))
 }
 
 fn encode_row(row: &[Value]) -> Result<Vec<u8>, StorageError> {

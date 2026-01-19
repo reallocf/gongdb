@@ -736,7 +736,11 @@ impl GongDB {
                         plan.upper.as_deref(),
                     )?;
                     for location in locations {
-                        let row = self.storage.read_row_at(&location)?;
+                        let row = match self.storage.read_row_at(&location) {
+                            Ok(row) => row,
+                            Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+                            Err(err) => return Err(err.into()),
+                        };
                         if let Some(plan) = predicate_plan.as_ref() {
                             if !row_matches_predicate_plan(
                                 self,
@@ -862,45 +866,86 @@ impl GongDB {
                     .get_table(&table_name)
                     .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
                     .clone();
-                let rows = self.storage.scan_table(&table_name)?;
                 let table_scope = TableScope {
                     table_name: Some(table_name.clone()),
                     table_alias: None,
                 };
                 let column_scopes = vec![table_scope.clone(); table.columns.len()];
                 let column_lookup = build_column_lookup(&table.columns, &column_scopes);
-                if let Some(predicate) = &delete.selection {
+                let mut selection = delete.selection.as_ref();
+                if let Some(predicate) = selection {
                     if expr_is_constant(predicate) {
                         let value = eval_constant_expr_checked(self, predicate)?;
-                        if value_to_bool(&value) {
-                            self.storage.replace_table_rows(&table_name, &[])?;
+                        if !value_to_bool(&value) {
+                            return Ok(DBOutput::StatementComplete(0));
                         }
-                        self.invalidate_table_stats(&table_name);
-                        return Ok(DBOutput::StatementComplete(0));
+                        selection = None;
                     }
                 }
-                let mut remaining_rows = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let scope = EvalScope {
-                        columns: &table.columns,
-                        column_scopes: &column_scopes,
-                        row: &row,
-                        table_scope: &table_scope,
-                        cte_context: None,
-                        column_lookup: Some(&column_lookup),
-                    };
-                    if let Some(predicate) = &delete.selection {
-                        let value = eval_expr(self, predicate, &scope, None)?;
-                        if value_to_bool(&value) {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    }
-                    remaining_rows.push(row);
+                if selection.is_none() {
+                    self.storage.replace_table_rows(&table_name, &[])?;
+                    self.invalidate_table_stats(&table_name);
+                    return Ok(DBOutput::StatementComplete(0));
                 }
-                self.storage
-                    .replace_table_rows(&table_name, &remaining_rows)?;
+                let predicate_plan = selection.map(|predicate| {
+                    self.build_row_predicate_plan(predicate, &table_scope, &table.columns)
+                });
+                let index_plan =
+                    choose_index_scan_plan_no_stats(self, &table, selection, &[], &table_scope);
+                let mut deletions = Vec::new();
+                if let Some(plan) = index_plan {
+                    let locations = self.storage.scan_index_range(
+                        &plan.index_name,
+                        plan.lower.as_deref(),
+                        plan.upper.as_deref(),
+                    )?;
+                    for location in locations {
+                        let row = match self.storage.read_row_at(&location) {
+                            Ok(row) => row,
+                            Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+                            Err(err) => return Err(err.into()),
+                        };
+                        if let Some(plan) = predicate_plan.as_ref() {
+                            if !row_matches_predicate_plan(
+                                self,
+                                plan,
+                                &row,
+                                &table.columns,
+                                &column_scopes,
+                                &table_scope,
+                                None,
+                                None,
+                                &column_lookup,
+                            )? {
+                                continue;
+                            }
+                        }
+                        deletions.push(location);
+                    }
+                } else {
+                    let rows = self.storage.scan_table_with_locations(&table_name)?;
+                    for (location, row) in rows {
+                        if let Some(plan) = predicate_plan.as_ref() {
+                            if !row_matches_predicate_plan(
+                                self,
+                                plan,
+                                &row,
+                                &table.columns,
+                                &column_scopes,
+                                &table_scope,
+                                None,
+                                None,
+                                &column_lookup,
+                            )? {
+                                continue;
+                            }
+                        }
+                        deletions.push(location);
+                    }
+                }
+                if !deletions.is_empty() {
+                    let _ = self.storage.delete_rows_at(&table_name, &deletions)?;
+                }
                 self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(0))
             }
@@ -2554,6 +2599,35 @@ fn choose_index_scan_plan(
     order_by: &[OrderByExpr],
     table_scope: &TableScope,
 ) -> Option<IndexScanPlan> {
+    let stats = db.get_table_stats(table).ok();
+    choose_index_scan_plan_with_stats(
+        db,
+        table,
+        selection,
+        order_by,
+        table_scope,
+        stats.as_ref(),
+    )
+}
+
+fn choose_index_scan_plan_no_stats(
+    db: &GongDB,
+    table: &TableMeta,
+    selection: Option<&Expr>,
+    order_by: &[OrderByExpr],
+    table_scope: &TableScope,
+) -> Option<IndexScanPlan> {
+    choose_index_scan_plan_with_stats(db, table, selection, order_by, table_scope, None)
+}
+
+fn choose_index_scan_plan_with_stats(
+    db: &GongDB,
+    table: &TableMeta,
+    selection: Option<&Expr>,
+    order_by: &[OrderByExpr],
+    table_scope: &TableScope,
+    stats: Option<&TableStats>,
+) -> Option<IndexScanPlan> {
     let indexes: Vec<IndexMeta> = db
         .storage
         .list_indexes()
@@ -2568,9 +2642,10 @@ fn choose_index_scan_plan(
         .map(|selection| extract_index_constraints(db, selection, table_scope, &table.columns))
         .unwrap_or_default();
 
-    let stats = db.get_table_stats(table).ok();
-    let row_count = stats.as_ref().map(|stats| stats.row_count).unwrap_or(0);
-    let selection_selectivity = estimate_selectivity_for_constraints(&constraints, stats.as_ref());
+    let row_count = stats
+        .map(|stats| stats.row_count)
+        .unwrap_or_else(|| table.row_count as usize);
+    let selection_selectivity = estimate_selectivity_for_constraints(&constraints, stats);
     let needs_sort = !order_by.is_empty();
     let table_scan_cost = estimate_table_scan_cost(row_count, selection_selectivity, needs_sort);
 
@@ -2586,7 +2661,7 @@ fn choose_index_scan_plan(
                 upper: Some(key),
                 ordered_by,
             };
-            let selectivity = estimate_index_selectivity(index, &constraints, stats.as_ref());
+            let selectivity = estimate_index_selectivity(index, &constraints, stats);
             let cost = estimate_index_scan_cost(
                 row_count,
                 selectivity,
@@ -2612,7 +2687,7 @@ fn choose_index_scan_plan(
                         upper: constraint.upper.clone().map(|value| vec![value]),
                         ordered_by,
                     };
-                    let selectivity = estimate_index_selectivity(index, &constraints, stats.as_ref());
+                    let selectivity = estimate_index_selectivity(index, &constraints, stats);
                     let cost = estimate_index_scan_cost(
                         row_count,
                         selectivity,
