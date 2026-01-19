@@ -80,6 +80,8 @@ gongdb/
 │   ├── main.rs            # Main entry point
 │   └── bin/
 │       └── run_tests.rs   # SQL logic test runner
+├── docs/
+│   └── ARCHITECTURE.md    # Architecture and design documentation
 ├── tests/
 │   └── sqlite/            # SQLite test suite (408 files)
 │       ├── *.test         # Main test files
