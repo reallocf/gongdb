@@ -1213,7 +1213,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn scan_table_with_locations(
+    pub(crate) fn scan_table_with_locations(
         &self,
         table_name: &str,
     ) -> Result<Vec<(RowLocation, Vec<Value>)>, StorageError> {
@@ -1244,6 +1244,78 @@ impl StorageEngine {
             StorageError::Corrupt("invalid row location".to_string())
         })?;
         decode_row(record)
+    }
+
+    pub(crate) fn update_rows_at(
+        &mut self,
+        updates: &[(RowLocation, Vec<Value>)],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.clear_index_eq_cache();
+        let mut updates_by_page: HashMap<u32, Vec<(u16, Vec<u8>)>> = HashMap::new();
+        for (location, row) in updates {
+            let encoded = encode_row(row)?;
+            updates_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push((location.slot, encoded));
+        }
+
+        let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (page_id, updates) in updates_by_page.iter() {
+            let page = self.read_page(*page_id)?;
+            let slot_count = read_u16(&page, 1) as usize;
+            let free_start = read_u16(&page, 3) as usize;
+            let free_end = read_u16(&page, 5) as usize;
+            let mut extra_needed = 0usize;
+            for (slot, encoded) in updates {
+                let slot = *slot as usize;
+                if slot >= slot_count {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                if encoded.len() > record_len {
+                    extra_needed = extra_needed.saturating_add(encoded.len());
+                }
+            }
+            if free_start + extra_needed > free_end {
+                return Err(StorageError::Invalid("page full".to_string()));
+            }
+            pages.insert(*page_id, page);
+        }
+
+        for (page_id, updates) in updates_by_page {
+            let mut page = pages
+                .remove(&page_id)
+                .ok_or_else(|| StorageError::Corrupt("missing page buffer".to_string()))?;
+            let mut next_free_start = read_u16(&page, 3) as usize;
+            for (slot, encoded) in updates {
+                let slot = slot as usize;
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if encoded.len() <= record_len {
+                    page[record_offset..record_offset + encoded.len()].copy_from_slice(&encoded);
+                    write_u16(&mut page, slot_offset + 2, encoded.len() as u16);
+                } else {
+                    page[next_free_start..next_free_start + encoded.len()]
+                        .copy_from_slice(&encoded);
+                    write_u16(&mut page, slot_offset, next_free_start as u16);
+                    write_u16(&mut page, slot_offset + 2, encoded.len() as u16);
+                    next_free_start += encoded.len();
+                }
+            }
+            write_u16(&mut page, 3, next_free_start as u16);
+            self.write_page(page_id, &page)?;
+        }
+        Ok(())
     }
 
     /// Replace all rows in a table with the provided rows.

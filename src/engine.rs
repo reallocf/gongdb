@@ -18,7 +18,7 @@ use crate::ast::{
     BeginTransaction, BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, Cte, DataType,
     Expr, Ident, IndexedColumn, InsertConflict, InsertSource, IsolationLevel, JoinConstraint,
     JoinOperator, Literal, NullsOrder, OrderByExpr, Select, SelectItem, SortOrder, Statement,
-    TableConstraint, TableRef, With,
+    TableConstraint, TableRef, Update, With,
 };
 use crate::parser;
 use crate::storage::{
@@ -707,57 +707,145 @@ impl GongDB {
                     .get_table(&table_name)
                     .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
                     .clone();
-                let rows = self.storage.scan_table(&table_name)?;
                 let table_scope = TableScope {
                     table_name: Some(table_name.clone()),
                     table_alias: None,
                 };
                 let column_scopes = vec![table_scope.clone(); table.columns.len()];
                 let column_lookup = build_column_lookup(&table.columns, &column_scopes);
-                let mut skip_predicate = false;
-                if let Some(predicate) = &update.selection {
+                let mut selection = update.selection.as_ref();
+                if let Some(predicate) = selection {
                     if expr_is_constant(predicate) {
                         let value = eval_constant_expr_checked(self, predicate)?;
                         if !value_to_bool(&value) {
                             return Ok(DBOutput::StatementComplete(0));
                         }
-                        skip_predicate = true;
+                        selection = None;
                     }
                 }
-                let mut updated_rows = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let scope = EvalScope {
-                        columns: &table.columns,
-                        column_scopes: &column_scopes,
-                        row: &row,
-                        table_scope: &table_scope,
-                        cte_context: None,
-                        column_lookup: Some(&column_lookup),
-                    };
-                    if !skip_predicate {
-                        if let Some(predicate) = &update.selection {
-                            let value = eval_expr(self, predicate, &scope, None)?;
-                            if !value_to_bool(&value) {
-                                updated_rows.push(row);
+                let predicate_plan = selection.map(|predicate| {
+                    self.build_row_predicate_plan(predicate, &table_scope, &table.columns)
+                });
+                let index_plan =
+                    choose_index_scan_plan(self, &table, selection, &[], &table_scope);
+                let mut updates = Vec::new();
+                if let Some(plan) = index_plan {
+                    let locations = self.storage.scan_index_range(
+                        &plan.index_name,
+                        plan.lower.as_deref(),
+                        plan.upper.as_deref(),
+                    )?;
+                    for location in locations {
+                        let row = self.storage.read_row_at(&location)?;
+                        if let Some(plan) = predicate_plan.as_ref() {
+                            if !row_matches_predicate_plan(
+                                self,
+                                plan,
+                                &row,
+                                &table.columns,
+                                &column_scopes,
+                                &table_scope,
+                                None,
+                                None,
+                                &column_lookup,
+                            )? {
                                 continue;
                             }
                         }
+                        let new_row = self.apply_update_assignments(
+                            &update,
+                            &row,
+                            &table,
+                            &column_scopes,
+                            &table_scope,
+                            &column_lookup,
+                        )?;
+                        updates.push((location, new_row));
                     }
-                    let mut new_row = row.clone();
-                    for assignment in &update.assignments {
-                        let idx = resolve_column_index(&assignment.column.value, &table.columns)
-                            .ok_or_else(|| {
-                                GongDBError::new(format!(
-                                    "no such column: {}",
-                                    assignment.column.value
-                                ))
-                            })?;
-                        let value = eval_expr(self, &assignment.value, &scope, None)?;
-                        new_row[idx] = apply_affinity(value, &table.columns[idx].data_type);
+                } else {
+                    let rows = self.storage.scan_table_with_locations(&table_name)?;
+                    for (location, row) in rows {
+                        if let Some(plan) = predicate_plan.as_ref() {
+                            if !row_matches_predicate_plan(
+                                self,
+                                plan,
+                                &row,
+                                &table.columns,
+                                &column_scopes,
+                                &table_scope,
+                                None,
+                                None,
+                                &column_lookup,
+                            )? {
+                                continue;
+                            }
+                        }
+                        let new_row = self.apply_update_assignments(
+                            &update,
+                            &row,
+                            &table,
+                            &column_scopes,
+                            &table_scope,
+                            &column_lookup,
+                        )?;
+                        updates.push((location, new_row));
                     }
-                    updated_rows.push(new_row);
                 }
-                self.storage.replace_table_rows(&table_name, &updated_rows)?;
+
+                if !updates.is_empty() {
+                    let mut used_replace = false;
+                    match self.storage.update_rows_at(&updates) {
+                        Ok(()) => {}
+                        Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                            let rows = self.storage.scan_table(&table_name)?;
+                            let mut updated_rows = Vec::with_capacity(rows.len());
+                            for row in rows {
+                                if let Some(plan) = predicate_plan.as_ref() {
+                                    if !row_matches_predicate_plan(
+                                        self,
+                                        plan,
+                                        &row,
+                                        &table.columns,
+                                        &column_scopes,
+                                        &table_scope,
+                                        None,
+                                        None,
+                                        &column_lookup,
+                                    )? {
+                                        updated_rows.push(row);
+                                        continue;
+                                    }
+                                }
+                                updated_rows.push(self.apply_update_assignments(
+                                    &update,
+                                    &row,
+                                    &table,
+                                    &column_scopes,
+                                    &table_scope,
+                                    &column_lookup,
+                                )?);
+                            }
+                            self.storage.replace_table_rows(&table_name, &updated_rows)?;
+                            used_replace = true;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                    if !used_replace {
+                        let mut indexed_columns = HashSet::new();
+                        for index in self.storage.list_indexes() {
+                            if index.table.eq_ignore_ascii_case(&table_name) {
+                                for column in &index.columns {
+                                    indexed_columns.insert(column.name.value.to_ascii_lowercase());
+                                }
+                            }
+                        }
+                        if update.assignments.iter().any(|assignment| {
+                            indexed_columns.contains(&assignment.column.value.to_ascii_lowercase())
+                        }) {
+                            self.storage.reindex(Some(&table_name))?;
+                        }
+                    }
+                }
                 self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(0))
             }
@@ -1767,6 +1855,34 @@ impl GongDB {
             rows = filtered;
         }
         Ok((rows, ordered_by_index))
+    }
+
+    fn apply_update_assignments(
+        &self,
+        update: &Update,
+        row: &[Value],
+        table: &TableMeta,
+        column_scopes: &[TableScope],
+        table_scope: &TableScope,
+        column_lookup: &ColumnLookup,
+    ) -> Result<Vec<Value>, GongDBError> {
+        let scope = EvalScope {
+            columns: &table.columns,
+            column_scopes,
+            row,
+            table_scope,
+            cte_context: None,
+            column_lookup: Some(column_lookup),
+        };
+        let mut new_row = row.to_vec();
+        for assignment in &update.assignments {
+            let idx = resolve_column_index(&assignment.column.value, &table.columns).ok_or_else(
+                || GongDBError::new(format!("no such column: {}", assignment.column.value)),
+            )?;
+            let value = eval_expr(self, &assignment.value, &scope, None)?;
+            new_row[idx] = apply_affinity(value, &table.columns[idx].data_type);
+        }
+        Ok(new_row)
     }
 
     fn build_row_predicate_plan(
