@@ -1254,7 +1254,7 @@ impl GongDB {
                 } else {
                     rows
                 };
-                sorted_rows.sort_by(|a, b| {
+                sorted_rows.sort_unstable_by(|a, b| {
                     compare_order_keys(&a.order_values, &b.order_values, &order_plans)
                 });
                 sorted_rows
@@ -1331,16 +1331,8 @@ impl GongDB {
                 )?);
             }
             if select.distinct {
-                let mut unique: Vec<Vec<Value>> = Vec::new();
-                'row: for row in rows {
-                    for existing in &unique {
-                        if rows_equal(existing, &row) {
-                            continue 'row;
-                        }
-                    }
-                    unique.push(row);
-                }
-                unique
+                dedup_rows(&mut rows);
+                rows
             } else {
                 rows
             }
@@ -1352,61 +1344,71 @@ impl GongDB {
             let order_column_scopes =
                 vec![order_table_scope.clone(); output_columns.len()];
             let order_lookup = build_column_lookup(&output_columns, &order_column_scopes);
-            let mut rows = Vec::with_capacity(filtered.len());
-            for row in filtered {
-                let scope = EvalScope {
-                    columns: &columns,
-                    column_scopes: &column_scopes,
-                    row: &row,
-                    table_scope: &table_scope,
-                    cte_context,
-                    column_lookup: Some(&column_lookup),
-                };
-                let projected_row = project_row(
-                    self,
-                    &select.projection,
-                    &row,
-                    &scope,
-                    outer,
-                )?;
-                let order_values = compute_order_values(
-                    self,
-                    &order_plans,
-                    &projected_row,
-                    &output_columns,
-                    &order_column_scopes,
-                    &order_table_scope,
-                    &order_lookup,
-                    &scope,
-                )?;
-                rows.push(SortedRow {
-                    order_values,
-                    projected: projected_row,
-                });
-            }
-            let mut sorted_rows = if select.distinct {
-                let mut unique: Vec<SortedRow> = Vec::new();
-                'row: for row in rows {
-                    for existing in &unique {
-                        if rows_equal(&existing.projected, &row.projected) {
-                            continue 'row;
-                        }
-                    }
-                    unique.push(row);
+            if preordered_by_index {
+                let mut rows = Vec::with_capacity(filtered.len());
+                for row in filtered {
+                    let scope = EvalScope {
+                        columns: &columns,
+                        column_scopes: &column_scopes,
+                        row: &row,
+                        table_scope: &table_scope,
+                        cte_context,
+                        column_lookup: Some(&column_lookup),
+                    };
+                    let projected_row = project_row(
+                        self,
+                        &select.projection,
+                        &row,
+                        &scope,
+                        outer,
+                    )?;
+                    rows.push(projected_row);
                 }
-                unique
-            } else {
+                if select.distinct {
+                    dedup_rows(&mut rows);
+                }
                 rows
-            };
-            if !preordered_by_index {
-                sorted_rows.sort_by(|a, b| {
+            } else {
+                let mut rows = Vec::with_capacity(filtered.len());
+                for row in filtered {
+                    let scope = EvalScope {
+                        columns: &columns,
+                        column_scopes: &column_scopes,
+                        row: &row,
+                        table_scope: &table_scope,
+                        cte_context,
+                        column_lookup: Some(&column_lookup),
+                    };
+                    let projected_row = project_row(
+                        self,
+                        &select.projection,
+                        &row,
+                        &scope,
+                        outer,
+                    )?;
+                    let order_values = compute_order_values(
+                        self,
+                        &order_plans,
+                        &projected_row,
+                        &output_columns,
+                        &order_column_scopes,
+                        &order_table_scope,
+                        &order_lookup,
+                        &scope,
+                    )?;
+                    rows.push(SortedRow {
+                        order_values,
+                        projected: projected_row,
+                    });
+                }
+                if select.distinct {
+                    dedup_sorted_rows(&mut rows);
+                }
+                rows.sort_unstable_by(|a, b| {
                     compare_order_keys(&a.order_values, &b.order_values, &order_plans)
                 });
+                rows.into_iter().map(|row| row.projected).collect()
             }
-            sorted_rows
-                .into_iter()
-                .map(|row| row.projected)
-                .collect()
         };
 
         Ok(QueryResult {
@@ -5481,6 +5483,18 @@ fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
     let mut unique: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
         let key = row_distinct_key(&row);
+        if seen.insert(key) {
+            unique.push(row);
+        }
+    }
+    *rows = unique;
+}
+
+fn dedup_sorted_rows(rows: &mut Vec<SortedRow>) {
+    let mut seen: HashSet<Vec<DistinctKey>> = HashSet::with_capacity(rows.len());
+    let mut unique: Vec<SortedRow> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let key = row_distinct_key(&row.projected);
         if seen.insert(key) {
             unique.push(row);
         }
