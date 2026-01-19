@@ -1,12 +1,34 @@
+//! Core library for GongDB, a from-scratch SQLite-like engine.
+//!
+//! The public API is intentionally small: the parser, AST, storage layer, and
+//! execution engine are exposed for experimentation and testing.
+//!
+//! # Examples
+//! ```no_run
+//! use gongdb::engine::GongDB;
+//!
+//! let mut db = GongDB::new_in_memory().expect("db");
+//! db.run_statement("CREATE TABLE t(id INTEGER)")
+//!     .expect("create");
+//! db.run_statement("INSERT INTO t VALUES (1)")
+//!     .expect("insert");
+//! let output = db.run_statement("SELECT id FROM t").expect("select");
+//! println!("{:?}", output);
+//! ```
+
 use sqllogictest::{DefaultColumnType, Normalizer};
 use regex::Regex;
 use md5::{Digest, Md5};
 use std::cell::RefCell;
 use std::fs;
 
+/// Abstract syntax tree types for parsed SQL.
 pub mod ast;
+/// SQL parser entrypoints and error types.
 pub mod parser;
+/// Storage engine types, metadata, and errors.
 pub mod storage;
+/// Execution engine for running SQL statements.
 pub mod engine;
 
 thread_local! {

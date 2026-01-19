@@ -1,10 +1,28 @@
+//! SQL parser for GongDB.
+//!
+//! This module exposes a single entry point, [`crate::parser::parse_statement`], which parses
+//! a SQL string into the AST types in `crate::ast`.
+//!
+//! # Examples
+//! ```no_run
+//! use gongdb::parser::parse_statement;
+//!
+//! let stmt = parse_statement("SELECT 1").expect("parse");
+//! println!("{:?}", stmt);
+//! ```
+
 use crate::ast::*;
 
 #[derive(Debug, Clone, PartialEq)]
+/// Error returned when parsing fails.
 pub struct ParserError {
+    /// Human-readable error message.
     pub message: String,
+    /// Token near which parsing failed, if known.
     pub near: Option<String>,
+    /// Whether the error was caused by unexpected EOF.
     pub is_eof: bool,
+    /// Byte offset into the input, when available.
     pub offset: Option<usize>,
 }
 
@@ -28,6 +46,7 @@ impl ParserError {
         }
     }
 
+    /// Render the error message in SQLite-compatible format.
     pub fn sqlite_message(&self) -> String {
         if self.is_eof {
             return "incomplete input".to_string();
@@ -38,6 +57,7 @@ impl ParserError {
         self.message.clone()
     }
 
+    /// Render the error message with additional SQL context.
     pub fn sqlite_message_with_sql(&self, sql: &str) -> String {
         if self.is_eof {
             return "incomplete input".to_string();
@@ -1901,6 +1921,15 @@ impl Parser {
     }
 }
 
+/// Parse a SQL string into a [`Statement`].
+///
+/// # Examples
+/// ```no_run
+/// use gongdb::parser::parse_statement;
+///
+/// let stmt = parse_statement("CREATE TABLE t(id INTEGER)").unwrap();
+/// println!("{:?}", stmt);
+/// ```
 pub fn parse_statement(input: &str) -> Result<Statement, ParserError> {
     let mut lexer = Lexer::new(input);
     let mut tokens = Vec::new();

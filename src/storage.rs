@@ -1,3 +1,17 @@
+//! Storage engine and on-disk format for GongDB.
+//!
+//! The storage layer manages pages, catalogs, and transactional snapshots.
+//! It exposes a low-level API used by the execution engine.
+//!
+//! # Examples
+//! ```no_run
+//! use gongdb::storage::StorageEngine;
+//!
+//! let mut storage = StorageEngine::new_in_memory().unwrap();
+//! let tables = storage.list_tables();
+//! assert!(tables.is_empty());
+//! ```
+
 use crate::ast::{
     BinaryOperator, ColumnConstraint, CompoundOperator, CompoundSelect, Cte, DataType, Expr, Ident,
     IndexedColumn, Literal, NullsOrder, ObjectName, OrderByExpr, Select, SelectItem, SortOrder,
@@ -34,11 +48,17 @@ static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 static LOCK_MANAGER: OnceLock<Mutex<LockManager>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq)]
+/// Value stored in a table cell.
 pub enum Value {
+    /// NULL value.
     Null,
+    /// Integer value.
     Integer(i64),
+    /// Floating-point value.
     Real(f64),
+    /// Text value.
     Text(String),
+    /// Blob value.
     Blob(Vec<u8>),
 }
 
@@ -67,44 +87,71 @@ struct BtreeSplit {
 }
 
 #[derive(Debug, Clone)]
+/// Column metadata stored in table definitions.
 pub struct Column {
+    /// Column name.
     pub name: String,
+    /// Declared data type.
     pub data_type: DataType,
+    /// Column constraints.
     pub constraints: Vec<ColumnConstraint>,
 }
 
 #[derive(Debug, Clone)]
+/// Table metadata stored in the catalog.
 pub struct TableMeta {
+    /// Table name.
     pub name: String,
+    /// Column definitions.
     pub columns: Vec<Column>,
+    /// Table constraints.
     pub constraints: Vec<TableConstraint>,
+    /// First data page ID.
     pub first_page: u32,
+    /// Last data page ID.
     pub last_page: u32,
 }
 
 #[derive(Debug, Clone)]
+/// Index metadata stored in the catalog.
 pub struct IndexMeta {
+    /// Index name.
     pub name: String,
+    /// Table the index targets.
     pub table: String,
+    /// Indexed columns.
     pub columns: Vec<IndexedColumn>,
+    /// Whether the index enforces uniqueness.
     pub unique: bool,
+    /// First index page ID.
     pub first_page: u32,
+    /// Last index page ID.
     pub last_page: u32,
 }
 
 #[derive(Debug, Clone)]
+/// View metadata stored in the catalog.
 pub struct ViewMeta {
+    /// View name.
     pub name: String,
+    /// Optional column list.
     pub columns: Vec<Ident>,
+    /// View query.
     pub query: Select,
 }
 
 #[derive(Debug)]
+/// Errors produced by the storage engine.
 pub enum StorageError {
+    /// Underlying I/O error.
     Io(std::io::Error),
+    /// Corruption detected in stored data.
     Corrupt(String),
+    /// Catalog lookup failed.
     NotFound(String),
+    /// Invalid request or format.
     Invalid(String),
+    /// Uniqueness constraint violation.
     UniqueViolation { table: String, columns: Vec<String> },
 }
 
@@ -159,6 +206,7 @@ enum StorageModeSnapshot {
 }
 
 #[derive(Debug, Clone)]
+/// Snapshot of storage state used for transactional rollback.
 pub struct StorageSnapshot {
     mode: StorageModeSnapshot,
     next_page_id: u32,
@@ -342,6 +390,11 @@ impl LockManager {
     }
 }
 
+/// Low-level storage engine managing pages, catalog, and transactions.
+///
+/// # Best Practices
+/// - Use `snapshot`/`restore` for transactional rollback.
+/// - Prefer `table_scan` for streaming large tables instead of `scan_table`.
 pub struct StorageEngine {
     mode: StorageMode,
     db_id: String,
@@ -361,6 +414,9 @@ pub struct StorageEngine {
     pending_sync_writes: usize,
 }
 
+/// Streaming table scan iterator.
+///
+/// This iterator yields decoded rows and loads pages on demand.
 pub struct TableScan<'a> {
     engine: &'a StorageEngine,
     page_id: u32,
@@ -422,6 +478,9 @@ impl<'a> Iterator for TableScan<'a> {
 }
 
 impl StorageEngine {
+    /// Create a new in-memory storage engine.
+    ///
+    /// This is best suited for tests and ephemeral databases.
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let mut pages = Vec::new();
         pages.push(vec![0; PAGE_SIZE]);
@@ -451,6 +510,9 @@ impl StorageEngine {
         Ok(engine)
     }
 
+    /// Create or open an on-disk storage engine at the given path.
+    ///
+    /// The file is created if it does not already exist.
     pub fn new_on_disk(path: &str) -> Result<Self, StorageError> {
         let exists = std::path::Path::new(path).exists();
         let mut file = OpenOptions::new()
@@ -534,6 +596,7 @@ impl StorageEngine {
         Ok(engine)
     }
 
+    /// Capture a snapshot of storage state for transactional rollback.
     pub fn snapshot(&self) -> Result<StorageSnapshot, StorageError> {
         let mode = match &self.mode {
             StorageMode::InMemory { pages } => StorageModeSnapshot::InMemory { pages: pages.clone() },
@@ -557,6 +620,9 @@ impl StorageEngine {
         })
     }
 
+    /// Restore storage state from a snapshot.
+    ///
+    /// This clears page cache state and resets catalog metadata.
     pub fn restore(&mut self, snapshot: StorageSnapshot) -> Result<(), StorageError> {
         match (&mut self.mode, snapshot.mode) {
             (StorageMode::InMemory { pages }, StorageModeSnapshot::InMemory { pages: snap }) => {
@@ -587,10 +653,12 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Mark the start of a transaction.
     pub fn begin_transaction(&mut self) {
         self.txn_active = true;
     }
 
+    /// Commit the active transaction and flush dirty pages.
     pub fn commit_transaction(&mut self) -> Result<(), StorageError> {
         self.txn_active = false;
         self.flush_dirty_pages(true)?;
@@ -603,6 +671,7 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Roll back the active transaction and clear page cache state.
     pub fn rollback_transaction(&mut self) {
         self.txn_active = false;
         if let Some(journal) = self.journal.take() {
@@ -611,6 +680,7 @@ impl StorageEngine {
         self.page_cache.borrow_mut().clear();
     }
 
+    /// Acquire a shared read lock for the given transaction.
     pub fn acquire_read_lock(&self, txn_id: u64) -> Result<(), StorageError> {
         let manager = LOCK_MANAGER.get_or_init(|| Mutex::new(LockManager::new()));
         let mut guard = manager
@@ -626,6 +696,7 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Acquire an exclusive write lock for the given transaction.
     pub fn acquire_write_lock(&self, txn_id: u64) -> Result<(), StorageError> {
         let manager = LOCK_MANAGER.get_or_init(|| Mutex::new(LockManager::new()));
         let mut guard = manager
@@ -648,6 +719,7 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Release read/write locks held by the given transaction.
     pub fn release_locks(&self, txn_id: u64) {
         let manager = LOCK_MANAGER.get_or_init(|| Mutex::new(LockManager::new()));
         let mut guard = match manager.lock() {
@@ -662,6 +734,7 @@ impl StorageEngine {
         }
     }
 
+    /// Create a table and persist it to the catalog.
     pub fn create_table(&mut self, table: TableMeta) -> Result<(), StorageError> {
         if self.tables.contains_key(&table.name) {
             return Err(StorageError::Invalid(format!(
@@ -674,6 +747,7 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    /// Drop a table and free its associated pages.
     pub fn drop_table(&mut self, name: &str) -> Result<(), StorageError> {
         let table = self
             .tables
@@ -706,10 +780,12 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    /// Lookup a table by name.
     pub fn get_table(&self, name: &str) -> Option<&TableMeta> {
         self.tables.get(name)
     }
 
+    /// Create a view and persist it to the catalog.
     pub fn create_view(&mut self, view: ViewMeta) -> Result<(), StorageError> {
         if self.views.contains_key(&view.name) {
             return Err(StorageError::Invalid(format!(
@@ -722,6 +798,7 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    /// Drop a view by name.
     pub fn drop_view(&mut self, name: &str) -> Result<(), StorageError> {
         if self.views.remove(name).is_none() {
             return Err(StorageError::NotFound(format!(
@@ -733,20 +810,24 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    /// Lookup a view by name.
     pub fn get_view(&self, name: &str) -> Option<&ViewMeta> {
         self.views.get(name)
     }
 
+    /// Lookup an index by name.
     pub fn get_index(&self, name: &str) -> Option<&IndexMeta> {
         self.indexes.get(name)
     }
 
+    /// Return all tables in the catalog.
     pub fn list_tables(&self) -> Vec<TableMeta> {
         let mut tables: Vec<TableMeta> = self.tables.values().cloned().collect();
         tables.sort_by(|a, b| a.name.cmp(&b.name));
         tables
     }
 
+    /// Return all indexes in the catalog.
     pub fn list_indexes(&self) -> Vec<IndexMeta> {
         let mut indexes: Vec<IndexMeta> = self.indexes.values().cloned().collect();
         indexes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -781,10 +862,12 @@ impl StorageEngine {
         Ok(rows)
     }
 
+    /// Current schema version.
     pub fn schema_version(&self) -> u32 {
         self.schema_version
     }
 
+    /// Insert a row into a table.
     pub fn insert_row(&mut self, table_name: &str, row: &[Value]) -> Result<(), StorageError> {
         let _ = self.insert_row_with_location(table_name, row)?;
         Ok(())
@@ -850,6 +933,7 @@ impl StorageEngine {
         Ok(location)
     }
 
+    /// Create an index and populate it from existing table rows.
     pub fn create_index(&mut self, index: IndexMeta) -> Result<(), StorageError> {
         if self.indexes.contains_key(&index.name) {
             return Err(StorageError::Invalid(format!(
@@ -887,6 +971,7 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    /// Drop an index by name.
     pub fn drop_index(&mut self, name: &str) -> Result<(), StorageError> {
         let index = self
             .indexes
@@ -899,6 +984,7 @@ impl StorageEngine {
         self.bump_schema_version()
     }
 
+    /// Rebuild one index or all indexes.
     pub fn reindex(&mut self, target: Option<&str>) -> Result<(), StorageError> {
         match target {
             None => {
@@ -936,6 +1022,9 @@ impl StorageEngine {
         }
     }
 
+    /// Read all rows from a table into memory.
+    ///
+    /// Prefer `table_scan` for large tables to avoid allocation spikes.
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Vec<Value>>, StorageError> {
         let mut rows = Vec::new();
         let mut scan = self.table_scan(table_name)?;
@@ -945,6 +1034,7 @@ impl StorageEngine {
         Ok(rows)
     }
 
+    /// Stream rows from a table as an iterator.
     pub fn table_scan(&self, table_name: &str) -> Result<TableScan<'_>, StorageError> {
         let table = self
             .tables
@@ -986,6 +1076,7 @@ impl StorageEngine {
         decode_row(&record)
     }
 
+    /// Replace all rows in a table with the provided rows.
     pub fn replace_table_rows(
         &mut self,
         table_name: &str,
@@ -1388,6 +1479,7 @@ impl StorageEngine {
         Ok(page_id)
     }
 
+    /// Allocate a new data page and return its page ID.
     pub fn allocate_data_page(&mut self) -> Result<u32, StorageError> {
         let page_id = self.allocate_page_id()?;
         let page = init_data_page();
@@ -1396,6 +1488,7 @@ impl StorageEngine {
         Ok(page_id)
     }
 
+    /// Allocate a new btree page of the given type.
     pub fn allocate_btree_page(&mut self, page_type: u8) -> Result<u32, StorageError> {
         if page_type != PAGE_TYPE_BTREE_LEAF && page_type != PAGE_TYPE_BTREE_INTERNAL {
             return Err(StorageError::Invalid(format!(
@@ -1410,6 +1503,7 @@ impl StorageEngine {
         Ok(page_id)
     }
 
+    /// Allocate a new index root (btree leaf) page.
     pub fn allocate_index_root(&mut self) -> Result<u32, StorageError> {
         self.allocate_btree_page(PAGE_TYPE_BTREE_LEAF)
     }

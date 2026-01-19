@@ -1,3 +1,19 @@
+//! Execution engine for GongDB.
+//!
+//! This module runs parsed SQL statements against a storage engine.
+//! It is intentionally minimal and geared toward correctness and testability.
+//!
+//! # Examples
+//! ```no_run
+//! use gongdb::engine::GongDB;
+//!
+//! let mut db = GongDB::new_in_memory().expect("db");
+//! db.run_statement("CREATE TABLE t(id INTEGER)").unwrap();
+//! db.run_statement("INSERT INTO t VALUES (1)").unwrap();
+//! let output = db.run_statement("SELECT id FROM t").unwrap();
+//! println!("{:?}", output);
+//! ```
+
 use crate::ast::{
     BeginTransaction, BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr,
     Ident, IndexedColumn, InsertConflict, InsertSource, IsolationLevel, JoinConstraint,
@@ -18,10 +34,15 @@ use std::sync::Arc;
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
+/// Error type returned by the execution engine.
 pub enum GongDBError {
+    /// Parsing failed for the input SQL.
     Parse(String),
+    /// Execution failed due to unsupported features or runtime errors.
     Execution(String),
+    /// Constraint violation (e.g. UNIQUE or NOT NULL).
     Constraint(String),
+    /// Storage layer error.
     Storage(StorageError),
 }
 
@@ -82,6 +103,11 @@ struct StatementLock {
     txn_id: u64,
 }
 
+/// Main entry point for executing SQL against GongDB.
+///
+/// # Best Practices
+/// - Reuse a single `GongDB` instance for multiple statements to keep caches warm.
+/// - Use explicit transactions for multi-statement updates to guarantee atomicity.
 pub struct GongDB {
     storage: StorageEngine,
     stats_cache: RefCell<HashMap<String, TableStats>>,
@@ -98,6 +124,15 @@ struct TriggerMeta {
 }
 
 impl GongDB {
+    /// Create a new in-memory database.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use gongdb::engine::GongDB;
+    ///
+    /// let mut db = GongDB::new_in_memory().unwrap();
+    /// db.run_statement("CREATE TABLE t(id INTEGER)").unwrap();
+    /// ```
     pub fn new_in_memory() -> Result<Self, GongDBError> {
         Ok(Self {
             storage: StorageEngine::new_in_memory()?,
@@ -110,6 +145,15 @@ impl GongDB {
         })
     }
 
+    /// Create or open an on-disk database at the given path.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use gongdb::engine::GongDB;
+    ///
+    /// let mut db = GongDB::new_on_disk("db.gong").unwrap();
+    /// db.run_statement("CREATE TABLE t(id INTEGER)").unwrap();
+    /// ```
     pub fn new_on_disk(path: &str) -> Result<Self, GongDBError> {
         Ok(Self {
             storage: StorageEngine::new_on_disk(path)?,
@@ -122,6 +166,19 @@ impl GongDB {
         })
     }
 
+    /// Execute a single SQL statement and return the result.
+    ///
+    /// This API accepts exactly one SQL statement. It returns `DBOutput`
+    /// matching the sqllogictest expectations used by GongDB's tests.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use gongdb::engine::GongDB;
+    ///
+    /// let mut db = GongDB::new_in_memory().unwrap();
+    /// let output = db.run_statement("SELECT 1").unwrap();
+    /// println!("{:?}", output);
+    /// ```
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
         self.in_list_cache.replace(InListCache::new());
         self.in_subquery_cache.replace(InSubqueryCache::new());
@@ -6438,6 +6495,9 @@ fn compute_aggregates(
     Ok(results)
 }
 
+/// Convert typed values into string rows for sqllogictest output.
+///
+/// This is primarily used by the test harness to normalize query results.
 pub fn format_query_rows(rows: Vec<Vec<Value>>) -> Vec<Vec<String>> {
     rows.into_iter()
         .map(|row| row.into_iter().map(|v| value_to_string(&v)).collect())
