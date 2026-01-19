@@ -4448,9 +4448,17 @@ fn compare_values(op: &BinaryOperator, left: &Value, right: &Value) -> Value {
             .partial_cmp(&right_num)
             .unwrap_or(std::cmp::Ordering::Equal)
     } else {
-        let left_text = value_to_text(left);
-        let right_text = value_to_text(right);
-        left_text.cmp(&right_text)
+        match (left, right) {
+            (Value::Text(l), Value::Text(r)) => l.cmp(r),
+            (Value::Text(l), Value::Blob(_)) => l.as_str().cmp(""),
+            (Value::Blob(_), Value::Text(r)) => "".cmp(r.as_str()),
+            (Value::Blob(_), Value::Blob(_)) => std::cmp::Ordering::Equal,
+            _ => {
+                let left_text = value_to_text(left);
+                let right_text = value_to_text(right);
+                left_text.cmp(&right_text)
+            }
+        }
     };
     let result = match op {
         BinaryOperator::Eq => ordering == std::cmp::Ordering::Equal,
@@ -4769,7 +4777,11 @@ fn distinct_key(value: &Value) -> DistinctKey {
                 }
                 DistinctKey::Numeric(num.to_bits())
             } else {
-                DistinctKey::Text(value_to_text(value))
+                match value {
+                    Value::Text(text) => DistinctKey::Text(text.clone()),
+                    Value::Blob(_) => DistinctKey::Text(String::new()),
+                    _ => DistinctKey::Text(value_to_text(value)),
+                }
             }
         }
     }
@@ -4789,7 +4801,13 @@ fn values_equal(left: &Value, right: &Value) -> bool {
                 let (right_num, _) = numeric_to_f64(right_num);
                 (left_num - right_num).abs() == 0.0
             } else {
-                value_to_text(left) == value_to_text(right)
+                match (left, right) {
+                    (Value::Text(l), Value::Text(r)) => l == r,
+                    (Value::Text(l), Value::Blob(_)) => l.is_empty(),
+                    (Value::Blob(_), Value::Text(r)) => r.is_empty(),
+                    (Value::Blob(_), Value::Blob(_)) => true,
+                    _ => value_to_text(left) == value_to_text(right),
+                }
             }
         }
     }
