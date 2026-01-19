@@ -1,0 +1,25 @@
+# Recursive CTE tests
+
+query I rowsort
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 5
+)
+SELECT x FROM cnt ORDER BY x
+----
+1
+2
+3
+4
+5
+
+query I rowsort
+WITH RECURSIVE single_row(x) AS (
+  SELECT 1
+  UNION
+  SELECT x FROM single_row
+)
+SELECT x FROM single_row
+----
+1

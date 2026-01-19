@@ -15,8 +15,8 @@
 //! ```
 
 use crate::ast::{
-    BeginTransaction, BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, DataType, Expr,
-    Ident, IndexedColumn, InsertConflict, InsertSource, IsolationLevel, JoinConstraint,
+    BeginTransaction, BinaryOperator, ColumnConstraint, ColumnDef, CreateTable, Cte, DataType,
+    Expr, Ident, IndexedColumn, InsertConflict, InsertSource, IsolationLevel, JoinConstraint,
     JoinOperator, Literal, NullsOrder, OrderByExpr, Select, SelectItem, SortOrder, Statement,
     TableConstraint, TableRef, With,
 };
@@ -1336,17 +1336,18 @@ impl GongDB {
         view_stack: &mut Vec<String>,
         outer: Option<&EvalScope<'_>>,
     ) -> Result<CteContext, GongDBError> {
-        if with_clause.recursive {
-            return Err(GongDBError::new("recursive CTEs are not supported"));
-        }
         let mut context = parent.cloned().unwrap_or_else(CteContext::new);
         for cte in &with_clause.ctes {
-            let mut result = self.evaluate_select_values_with_views(
-                &cte.query,
-                view_stack,
-                outer,
-                Some(&context),
-            )?;
+            let mut result = if with_clause.recursive {
+                self.evaluate_recursive_cte(cte, &context, view_stack, outer)?
+            } else {
+                self.evaluate_select_values_with_views(
+                    &cte.query,
+                    view_stack,
+                    outer,
+                    Some(&context),
+                )?
+            };
             if !cte.columns.is_empty() {
                 if cte.columns.len() != result.columns.len() {
                     return Err(GongDBError::new(format!(
@@ -1359,6 +1360,113 @@ impl GongDB {
             context.insert(&cte.name.value, result);
         }
         Ok(context)
+    }
+
+    fn evaluate_recursive_cte(
+        &self,
+        cte: &Cte,
+        context: &CteContext,
+        view_stack: &mut Vec<String>,
+        outer: Option<&EvalScope<'_>>,
+    ) -> Result<QueryResult, GongDBError> {
+        if cte.query.compounds.is_empty() {
+            return self.evaluate_select_values_with_views(
+                &cte.query,
+                view_stack,
+                outer,
+                Some(context),
+            );
+        }
+
+        let mut seed_select = (*cte.query).clone();
+        let compounds = seed_select.compounds.clone();
+        seed_select.compounds.clear();
+
+        let mut seed = self.evaluate_select_values_with_views(
+            &seed_select,
+            view_stack,
+            outer,
+            Some(context),
+        )?;
+        if !cte.columns.is_empty() {
+            if cte.columns.len() != seed.columns.len() {
+                return Err(GongDBError::new(format!(
+                    "CTE column count mismatch: {}",
+                    cte.name.value
+                )));
+            }
+            seed.columns = columns_from_idents(&cte.columns);
+        }
+
+        let mut union_all_only = true;
+        for compound in &compounds {
+            match compound.operator {
+                crate::ast::CompoundOperator::UnionAll => {}
+                crate::ast::CompoundOperator::Union => {
+                    union_all_only = false;
+                }
+                _ => {
+                    return Err(GongDBError::new(
+                        "recursive CTEs require UNION or UNION ALL",
+                    ));
+                }
+            }
+        }
+
+        let output_columns = seed.columns.clone();
+        let mut all_rows = seed.rows;
+        let mut seen: HashSet<Vec<DistinctKey>> = HashSet::new();
+        if !union_all_only {
+            dedup_rows(&mut all_rows);
+            seen.extend(all_rows.iter().map(|row| row_distinct_key(row)));
+        }
+        let mut delta = all_rows.clone();
+
+        while !delta.is_empty() {
+            let mut iter_context = context.clone();
+            iter_context.insert(
+                &cte.name.value,
+                QueryResult {
+                    columns: output_columns.clone(),
+                    rows: delta.clone(),
+                },
+            );
+            let mut generated = Vec::new();
+            for compound in &compounds {
+                let term = self.evaluate_select_values_with_views(
+                    &compound.select,
+                    view_stack,
+                    outer,
+                    Some(&iter_context),
+                )?;
+                if term.columns.len() != output_columns.len() {
+                    return Err(GongDBError::new(
+                        "compound select column count mismatch",
+                    ));
+                }
+                generated.extend(term.rows);
+            }
+
+            if union_all_only {
+                delta = generated.clone();
+                all_rows.extend(generated);
+            } else {
+                let mut next_delta = Vec::new();
+                for row in generated {
+                    let key = row_distinct_key(&row);
+                    if seen.insert(key) {
+                        next_delta.push(row.clone());
+                        all_rows.push(row);
+                    }
+                }
+                delta = next_delta;
+            }
+        }
+
+        Ok(QueryResult {
+            columns: output_columns,
+            rows: all_rows,
+        })
     }
 
     fn resolve_source(

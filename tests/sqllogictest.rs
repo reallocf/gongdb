@@ -94,6 +94,7 @@ test_file!(test_phase3_type_system, "tests/custom/phase3_type_system.test");
 test_file!(test_phase11_indexing, "tests/custom/phase11_indexing.test");
 test_file!(test_phase12_query_planning, "tests/custom/phase12_query_planning.test");
 test_file!(test_phase13_transactions, "tests/custom/phase13_transactions.test");
+test_file!(test_recursive_cte, "tests/custom/recursive_cte.test");
 
 // Phase-specific test suites
 // Run with: cargo test --test sqllogictest test_phase_1

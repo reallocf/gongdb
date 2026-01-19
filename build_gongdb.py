@@ -184,24 +184,33 @@ def get_all_tasks() -> list:
         except (json.JSONDecodeError, KeyError):
             pass
     
-    # Also read from issues.jsonl to catch any tasks that bd list might miss
-    try:
-        issues_file = '.beads/issues.jsonl'
-        import os
-        if os.path.exists(issues_file):
-            with open(issues_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            task = json.loads(line)
-                            # Only add if not already in tasks list
-                            if not any(t.get('id') == task.get('id') for t in tasks):
-                                tasks.append(task)
-                        except json.JSONDecodeError:
-                            pass
-    except Exception:
-        pass
+    # # Also read from issues.jsonl to catch any tasks that bd list might miss
+    # # Only add open tasks (not 'done' or 'closed') to avoid stale closed tasks
+    # # Use the latest entry per task ID (later lines in JSONL overwrite earlier ones)
+    # try:
+    #     issues_file = '.beads/issues.jsonl'
+    #     import os
+    #     if os.path.exists(issues_file):
+    #         jsonl_tasks = {}
+    #         with open(issues_file, 'r') as f:
+    #             for line in f:
+    #                 line = line.strip()
+    #                 if not line:
+    #                     continue
+    #                 try:
+    #                     task = json.loads(line)
+    #                     task_id = task.get('id')
+    #                     if task_id:
+    #                         jsonl_tasks[task_id] = task  # keep latest occurrence
+    #                 except json.JSONDecodeError:
+    #                     pass
+    #         for task in jsonl_tasks.values():
+    #             task_status = task.get('status', '')
+    #             if task_status not in ('done', 'closed'):
+    #                 if not any(t.get('id') == task.get('id') for t in tasks):
+    #                     tasks.append(task)
+    # except Exception:
+    #     pass
     
     return tasks
 
