@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 sqllogictest = "0.29"
 rusqlite = { version = "0.31", features = ["bundled"] }
+duckdb = { version = "1.4", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 itertools = "0.12"

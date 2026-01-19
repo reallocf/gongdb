@@ -4077,6 +4077,7 @@ impl InSubqueryCache {
 
 struct PreparedInList {
     literal_keys: HashSet<DistinctKey>,
+    literal_values: Vec<Value>,
     non_literal_indices: Vec<usize>,
     saw_null_literal: bool,
 }
@@ -5171,6 +5172,13 @@ fn eval_in_list<'a, 'b>(
     if prepared.saw_null_literal {
         saw_null = true;
     }
+    for literal in prepared.literal_values.iter() {
+        match compare_values(&BinaryOperator::Eq, expr_val, literal) {
+            Value::Integer(1) => return Ok(Value::Integer(1)),
+            Value::Null => saw_null = true,
+            _ => {}
+        }
+    }
     for idx in prepared.non_literal_indices.iter() {
         let item_val = eval_expr(db, &list[*idx], scope, outer)?;
         match compare_values(&BinaryOperator::Eq, expr_val, &item_val) {
@@ -5188,6 +5196,7 @@ fn eval_in_list<'a, 'b>(
 
 fn prepare_in_list(db: &GongDB, list: &[Expr]) -> PreparedInList {
     let mut literal_keys = HashSet::new();
+    let mut literal_values = Vec::new();
     let mut non_literal_indices = Vec::new();
     let mut saw_null_literal = false;
     for (idx, item) in list.iter().enumerate() {
@@ -5197,6 +5206,7 @@ fn prepare_in_list(db: &GongDB, list: &[Expr]) -> PreparedInList {
                     saw_null_literal = true;
                 } else {
                     literal_keys.insert(distinct_key(&value));
+                    literal_values.push(value);
                 }
                 continue;
             }
@@ -5205,6 +5215,7 @@ fn prepare_in_list(db: &GongDB, list: &[Expr]) -> PreparedInList {
     }
     PreparedInList {
         literal_keys,
+        literal_values,
         non_literal_indices,
         saw_null_literal,
     }
