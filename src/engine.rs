@@ -13,6 +13,7 @@ use sqllogictest::{DBOutput, DefaultColumnType};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -86,6 +87,7 @@ pub struct GongDB {
     stats_cache: RefCell<HashMap<String, TableStats>>,
     transaction: Option<TransactionState>,
     triggers: HashMap<String, TriggerMeta>,
+    in_list_cache: RefCell<InListCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +102,7 @@ impl GongDB {
             stats_cache: RefCell::new(HashMap::new()),
             transaction: None,
             triggers: HashMap::new(),
+            in_list_cache: RefCell::new(InListCache::new()),
         })
     }
 
@@ -109,10 +112,12 @@ impl GongDB {
             stats_cache: RefCell::new(HashMap::new()),
             transaction: None,
             triggers: HashMap::new(),
+            in_list_cache: RefCell::new(InListCache::new()),
         })
     }
 
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        self.in_list_cache.replace(InListCache::new());
         let stmt = parser::parse_statement(sql)
             .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
         match stmt {
@@ -3047,6 +3052,25 @@ struct QueryResult {
     rows: Vec<Vec<Value>>,
 }
 
+#[derive(Default)]
+struct InListCache {
+    entries: HashMap<(usize, usize), Arc<PreparedInList>>,
+}
+
+impl InListCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+}
+
+struct PreparedInList {
+    literal_keys: HashSet<DistinctKey>,
+    non_literal_indices: Vec<usize>,
+    saw_null_literal: bool,
+}
+
 #[derive(Clone, Default)]
 struct CteContext {
     entries: HashMap<String, QueryResult>,
@@ -4047,19 +4071,61 @@ fn eval_in_list<'a, 'b>(
     if list.is_empty() {
         return Ok(Value::Integer(0));
     }
+    if matches!(expr_val, Value::Null) {
+        return Ok(Value::Null);
+    }
     let mut saw_null = false;
-    for item in list {
-        let item_val = eval_expr(db, item, scope, outer)?;
+    let cache_key = (list.as_ptr() as usize, list.len());
+    let prepared = {
+        let mut cache = db.in_list_cache.borrow_mut();
+        cache
+            .entries
+            .entry(cache_key)
+            .or_insert_with(|| Arc::new(prepare_in_list(db, list)))
+            .clone()
+    };
+    if prepared.literal_keys.contains(&distinct_key(expr_val)) {
+        return Ok(Value::Integer(1));
+    }
+    if prepared.saw_null_literal {
+        saw_null = true;
+    }
+    for idx in prepared.non_literal_indices.iter() {
+        let item_val = eval_expr(db, &list[*idx], scope, outer)?;
         match compare_values(&BinaryOperator::Eq, expr_val, &item_val) {
             Value::Integer(1) => return Ok(Value::Integer(1)),
             Value::Null => saw_null = true,
             _ => {}
         }
     }
-    if saw_null {
-        Ok(Value::Null)
+    Ok(if saw_null {
+        Value::Null
     } else {
-        Ok(Value::Integer(0))
+        Value::Integer(0)
+    })
+}
+
+fn prepare_in_list(db: &GongDB, list: &[Expr]) -> PreparedInList {
+    let mut literal_keys = HashSet::new();
+    let mut non_literal_indices = Vec::new();
+    let mut saw_null_literal = false;
+    for (idx, item) in list.iter().enumerate() {
+        if expr_is_constant(item) {
+            if let Some(value) = eval_constant_expr(db, item) {
+                if matches!(value, Value::Null) {
+                    saw_null_literal = true;
+                } else {
+                    literal_keys.insert(distinct_key(&value));
+                }
+                continue;
+            }
+        }
+        non_literal_indices.push(idx);
+    }
+    PreparedInList {
+        literal_keys,
+        non_literal_indices,
+        saw_null_literal,
     }
 }
 
