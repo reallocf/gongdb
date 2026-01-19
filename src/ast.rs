@@ -7,6 +7,8 @@ pub enum Statement {
     Reindex(Reindex),
     CreateView(CreateView),
     DropView(DropView),
+    CreateTrigger(CreateTrigger),
+    DropTrigger(DropTrigger),
     Insert(Insert),
     Update(Update),
     Delete(Delete),
@@ -87,6 +89,19 @@ pub struct CreateView {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropView {
+    pub if_exists: bool,
+    pub name: ObjectName,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTrigger {
+    pub if_not_exists: bool,
+    pub name: ObjectName,
+    pub table: ObjectName,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTrigger {
     pub if_exists: bool,
     pub name: ObjectName,
 }

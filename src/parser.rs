@@ -59,6 +59,7 @@ fn token_hint(token: &TokenKind) -> (Option<String>, bool) {
         TokenKind::Ident(value, _) => (Some(value.clone()), false),
         TokenKind::Number(value) => (Some(value.clone()), false),
         TokenKind::String(value) => (Some(value.clone()), false),
+        TokenKind::Blob(_) => (Some("blob".to_string()), false),
         TokenKind::Operator(value) => (Some(value.clone()), false),
         TokenKind::Symbol(value) => (Some(value.to_string()), false),
         TokenKind::Eof => (None, true),
@@ -71,6 +72,7 @@ enum TokenKind {
     Ident(String, bool),
     Number(String),
     String(String),
+    Blob(Vec<u8>),
     Operator(String),
     Symbol(char),
     Eof,
@@ -104,6 +106,11 @@ impl<'a> Lexer<'a> {
         let mut chars = rest.chars();
         let ch = chars.next().unwrap();
         let start = self.pos;
+
+        if (ch == 'x' || ch == 'X') && rest.as_bytes().get(1) == Some(&b'\'') {
+            self.pos += 1;
+            return self.lex_blob_literal(start);
+        }
 
         if ch.is_ascii_alphabetic() || ch == '_' {
             self.pos += ch.len_utf8();
@@ -216,6 +223,43 @@ impl<'a> Lexer<'a> {
             }
         }
         Err(ParserError::new("unterminated string literal"))
+    }
+
+    fn lex_blob_literal(&mut self, start: usize) -> Result<Token, ParserError> {
+        if !self.input[self.pos..].starts_with('\'') {
+            return Err(ParserError::new("invalid blob literal"));
+        }
+        self.pos += 1;
+        let mut hex = String::new();
+        let mut closed = false;
+        while self.pos < self.input.len() {
+            let c = self.input[self.pos..].chars().next().unwrap();
+            if c == '\'' {
+                self.pos += 1;
+                closed = true;
+                break;
+            }
+            hex.push(c);
+            self.pos += c.len_utf8();
+        }
+        if hex.len() % 2 != 0 {
+            return Err(ParserError::new("invalid blob literal"));
+        }
+        if !closed {
+            return Err(ParserError::new("unterminated blob literal"));
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        let mut chars = hex.chars();
+        while let (Some(high), Some(low)) = (chars.next(), chars.next()) {
+            let pair = format!("{}{}", high, low);
+            let value = u8::from_str_radix(&pair, 16)
+                .map_err(|_| ParserError::new("invalid blob literal"))?;
+            bytes.push(value);
+        }
+        Ok(Token {
+            kind: TokenKind::Blob(bytes),
+            pos: start,
+        })
     }
 
     fn lex_quoted_ident(&mut self, start: usize, open: char, close: char) -> Result<Token, ParserError> {
@@ -633,6 +677,56 @@ impl Parser {
                 query,
             }));
         }
+        if self.eat_keyword("TRIGGER") {
+            let if_not_exists = self.eat_keyword("IF");
+            if if_not_exists {
+                self.expect_keyword("NOT")?;
+                self.expect_keyword("EXISTS")?;
+            }
+            let name = self.parse_object_name()?;
+            if self.eat_keyword("BEFORE")
+                || self.eat_keyword("AFTER")
+                || (self.eat_keyword("INSTEAD") && self.eat_keyword("OF"))
+            {
+            }
+            if self.eat_keyword("INSERT") {
+            } else if self.eat_keyword("UPDATE") {
+                if self.eat_keyword("OF") {
+                    let _ = self.parse_ident()?;
+                    while self.eat_symbol(',') {
+                        let _ = self.parse_ident()?;
+                    }
+                }
+            } else if self.eat_keyword("DELETE") {
+            } else {
+                return Err(ParserError::new("expected trigger event"));
+            }
+            self.expect_keyword("ON")?;
+            let table = self.parse_object_name()?;
+            if self.eat_keyword("FOR") {
+                self.expect_keyword("EACH")?;
+                self.expect_keyword("ROW")?;
+            }
+            if self.eat_keyword("WHEN") {
+                let _ = self.parse_expr()?;
+            }
+            self.expect_keyword("BEGIN")?;
+            loop {
+                if self.eat_keyword("END") {
+                    break;
+                }
+                if matches!(self.current(), TokenKind::Eof) {
+                    return Err(ParserError::new("unterminated trigger body"));
+                }
+                self.advance();
+            }
+            let _ = self.eat_symbol(';');
+            return Ok(Statement::CreateTrigger(CreateTrigger {
+                if_not_exists,
+                name,
+                table,
+            }));
+        }
         Err(ParserError::new("unsupported CREATE statement"))
     }
 
@@ -661,6 +755,14 @@ impl Parser {
             }
             let name = self.parse_object_name()?;
             return Ok(Statement::DropView(DropView { if_exists, name }));
+        }
+        if self.eat_keyword("TRIGGER") {
+            let if_exists = self.eat_keyword("IF");
+            if if_exists {
+                self.expect_keyword("EXISTS")?;
+            }
+            let name = self.parse_object_name()?;
+            return Ok(Statement::DropTrigger(DropTrigger { if_exists, name }));
         }
         Err(ParserError::new("unsupported DROP statement"))
     }
@@ -1019,6 +1121,12 @@ impl Parser {
         }
         let name = self.parse_object_name()?;
         let alias = self.parse_optional_alias()?;
+        if self.eat_keyword("INDEXED") {
+            self.expect_keyword("BY")?;
+            let _ = self.parse_ident()?;
+        } else if self.eat_keyword("NOT") {
+            self.expect_keyword("INDEXED")?;
+        }
         Ok(TableRef::Named { name, alias })
     }
 
@@ -1347,6 +1455,11 @@ impl Parser {
                 let value = s.clone();
                 self.advance();
                 Ok(Expr::Literal(Literal::String(value)))
+            }
+            TokenKind::Blob(bytes) => {
+                let value = bytes.clone();
+                self.advance();
+                Ok(Expr::Literal(Literal::Blob(value)))
             }
             TokenKind::Symbol('(') => self.parse_paren_expr_or_subquery(),
             TokenKind::Operator(op) if op == "*" => {

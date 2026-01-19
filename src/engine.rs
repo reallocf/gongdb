@@ -85,6 +85,12 @@ pub struct GongDB {
     storage: StorageEngine,
     stats_cache: RefCell<HashMap<String, TableStats>>,
     transaction: Option<TransactionState>,
+    triggers: HashMap<String, TriggerMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct TriggerMeta {
+    table: String,
 }
 
 impl GongDB {
@@ -93,6 +99,7 @@ impl GongDB {
             storage: StorageEngine::new_in_memory()?,
             stats_cache: RefCell::new(HashMap::new()),
             transaction: None,
+            triggers: HashMap::new(),
         })
     }
 
@@ -101,6 +108,7 @@ impl GongDB {
             storage: StorageEngine::new_on_disk(path)?,
             stats_cache: RefCell::new(HashMap::new()),
             transaction: None,
+            triggers: HashMap::new(),
         })
     }
 
@@ -314,6 +322,33 @@ impl GongDB {
                 self.invalidate_table_stats(&table_name);
                 Ok(DBOutput::StatementComplete(0))
             }
+            Statement::CreateTrigger(create) => {
+                let name = object_name(&create.name);
+                let key = name.to_ascii_lowercase();
+                if self.triggers.contains_key(&key) {
+                    if !create.if_not_exists {
+                        return Err(GongDBError::new(format!(
+                            "trigger already exists: {}",
+                            name
+                        )));
+                    }
+                    return Ok(DBOutput::StatementComplete(0));
+                }
+                let table_name = object_name(&create.table);
+                if self.storage.get_table(&table_name).is_none() {
+                    return Err(GongDBError::new(format!(
+                        "no such table: {}",
+                        table_name
+                    )));
+                }
+                self.triggers.insert(
+                    key,
+                    TriggerMeta {
+                        table: table_name,
+                    },
+                );
+                Ok(DBOutput::StatementComplete(0))
+            }
             Statement::DropIndex(drop) => {
                 let name = object_name(&drop.name);
                 if self.storage.get_index(&name).is_none() && !drop.if_exists {
@@ -324,6 +359,17 @@ impl GongDB {
                 }
                 if self.storage.get_index(&name).is_some() {
                     self.storage.drop_index(&name)?;
+                }
+                Ok(DBOutput::StatementComplete(0))
+            }
+            Statement::DropTrigger(drop) => {
+                let name = object_name(&drop.name);
+                let key = name.to_ascii_lowercase();
+                if self.triggers.remove(&key).is_none() && !drop.if_exists {
+                    return Err(GongDBError::new(format!(
+                        "no such trigger: {}",
+                        name
+                    )));
                 }
                 Ok(DBOutput::StatementComplete(0))
             }
@@ -343,6 +389,8 @@ impl GongDB {
                 if self.storage.get_table(&name).is_some() {
                     self.storage.drop_table(&name)?;
                 }
+                self.triggers
+                    .retain(|_, trigger| !trigger.table.eq_ignore_ascii_case(&name));
                 self.invalidate_table_stats(&name);
                 Ok(DBOutput::StatementComplete(0))
             }
@@ -1255,7 +1303,14 @@ impl GongDB {
                 let scope = source.table_scope.clone();
                 table_infos.push(TableInfo { source, scope });
             }
-            return self.resolve_join_plan(table_infos, predicates, outer, cte_context);
+            let ordered_scopes = table_infos.iter().map(|info| info.scope.clone()).collect();
+            return self.resolve_join_plan(
+                table_infos,
+                predicates,
+                ordered_scopes,
+                outer,
+                cte_context,
+            );
         }
 
         let mut rows = vec![Vec::new()];
@@ -1456,6 +1511,7 @@ impl GongDB {
         &self,
         tables: Vec<TableInfo>,
         predicates: Vec<Expr>,
+        ordered_scopes: Vec<TableScope>,
         outer: Option<&EvalScope<'_>>,
         cte_context: Option<&CteContext>,
     ) -> Result<QuerySource, GongDBError> {
@@ -1578,7 +1634,57 @@ impl GongDB {
             current_est_rows = best_est_rows;
         }
 
-        Ok(current)
+        Ok(Self::reorder_query_source(current, &ordered_scopes))
+    }
+
+    fn reorder_query_source(
+        mut source: QuerySource,
+        ordered_scopes: &[TableScope],
+    ) -> QuerySource {
+        if ordered_scopes.is_empty() {
+            return source;
+        }
+        let mut indices = Vec::with_capacity(source.column_scopes.len());
+        let mut used = vec![false; source.column_scopes.len()];
+        for scope in ordered_scopes {
+            for (idx, col_scope) in source.column_scopes.iter().enumerate() {
+                if used[idx] {
+                    continue;
+                }
+                if col_scope.same_source(scope) {
+                    indices.push(idx);
+                    used[idx] = true;
+                }
+            }
+        }
+        for idx in 0..source.column_scopes.len() {
+            if !used[idx] {
+                indices.push(idx);
+            }
+        }
+
+        if indices.len() != source.column_scopes.len() {
+            return source;
+        }
+
+        let columns = indices
+            .iter()
+            .map(|&idx| source.columns[idx].clone())
+            .collect();
+        let column_scopes = indices
+            .iter()
+            .map(|&idx| source.column_scopes[idx].clone())
+            .collect();
+        let rows = source
+            .rows
+            .into_iter()
+            .map(|row| indices.iter().map(|&idx| row[idx].clone()).collect())
+            .collect();
+
+        source.columns = columns;
+        source.column_scopes = column_scopes;
+        source.rows = rows;
+        source
     }
 
     fn join_sources_with_constraint(
@@ -2829,6 +2935,17 @@ impl TableScope {
         }
         false
     }
+
+    fn same_source(&self, other: &TableScope) -> bool {
+        match (&self.table_alias, &other.table_alias) {
+            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+            (None, None) => match (&self.table_name, &other.table_name) {
+                (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3040,6 +3157,8 @@ fn is_write_statement(stmt: &Statement) -> bool {
             | Statement::Reindex(_)
             | Statement::CreateView(_)
             | Statement::DropView(_)
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)

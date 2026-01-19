@@ -10,7 +10,8 @@ pub mod storage;
 pub mod engine;
 
 thread_local! {
-    static EXPECTED_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = RefCell::new(None);
+    pub(crate) static EXPECTED_TYPES: RefCell<Option<Vec<DefaultColumnType>>> = RefCell::new(None);
+    static CURRENT_SORT_MODE: RefCell<Option<sqllogictest::parser::SortMode>> = RefCell::new(None);
 }
 
 /// Custom validator that auto-detects valuewise vs rowwise format and handles hash-based comparison
@@ -25,6 +26,7 @@ fn auto_detect_validator(
     actual: &[Vec<String>],
     expected: &[String],
 ) -> bool {
+    let sort_mode = CURRENT_SORT_MODE.with(|mode| mode.borrow().clone());
     fn normalize_integer(value: &str) -> String {
         let trimmed = value.trim();
         if trimmed.eq_ignore_ascii_case("NULL") {
@@ -193,6 +195,46 @@ fn auto_detect_validator(
     // it's valuewise format. For single-column queries, both formats are equivalent.
     let is_valuewise = expected.len() == total_actual_values && num_columns > 1;
 
+    if matches!(
+        sort_mode,
+        Some(sqllogictest::parser::SortMode::RowSort)
+            | Some(sqllogictest::parser::SortMode::ValueSort)
+    ) {
+        let expected_types = EXPECTED_TYPES.with(|types| types.borrow().clone());
+        let expected_rows: Vec<Vec<String>> = if is_valuewise
+            || matches!(
+                sort_mode,
+                Some(sqllogictest::parser::SortMode::ValueSort)
+            ) {
+            expected.iter().map(|line| vec![line.clone()]).collect()
+        } else {
+            expected
+                .iter()
+                .map(|line| line.split_ascii_whitespace().map(|s| s.to_string()).collect())
+                .collect()
+        };
+        let actual_rows: Vec<Vec<String>> = if is_valuewise
+            || matches!(
+                sort_mode,
+                Some(sqllogictest::parser::SortMode::ValueSort)
+            ) {
+            actual
+                .iter()
+                .flat_map(|row| row.iter().cloned())
+                .map(|value| vec![value])
+                .collect()
+        } else {
+            actual.to_vec()
+        };
+        let mut normalized_actual =
+            normalized_rows_for_hash(normalizer, &actual_rows, expected_types.as_deref());
+        let mut normalized_expected =
+            normalized_rows_for_hash(normalizer, &expected_rows, expected_types.as_deref());
+        normalized_actual.sort_unstable();
+        normalized_expected.sort_unstable();
+        return normalized_actual == normalized_expected;
+    }
+
     if is_valuewise {
         let flattened_actual: Vec<String> = actual
             .iter()
@@ -284,6 +326,45 @@ pub async fn run_test_file(test_file: &str) -> Result<(), Box<dyn std::error::Er
     // Use the parser module directly since parse_with_name is not exported
     let records =
         sqllogictest::parser::parse_with_name::<DefaultColumnType>(&preprocessed, test_file)?;
-    tester.run_multi(records)?;
+    let mut current_sort_mode: Option<sqllogictest::parser::SortMode> = None;
+    for record in records {
+        if matches!(record, sqllogictest::parser::Record::Halt { .. }) {
+            break;
+        }
+        match &record {
+            sqllogictest::parser::Record::Control(
+                sqllogictest::parser::Control::SortMode(mode),
+            ) => {
+                current_sort_mode = Some(mode.clone());
+                EXPECTED_TYPES.with(|stored| {
+                    *stored.borrow_mut() = None;
+                });
+            }
+            sqllogictest::parser::Record::Query { expected, .. } => match expected {
+                sqllogictest::parser::QueryExpect::Results { types, sort_mode, .. } => {
+                    EXPECTED_TYPES.with(|stored| {
+                        *stored.borrow_mut() = Some(types.clone());
+                    });
+                    if sort_mode.is_some() {
+                        current_sort_mode = sort_mode.clone();
+                    }
+                }
+                sqllogictest::parser::QueryExpect::Error(_) => {
+                    EXPECTED_TYPES.with(|stored| {
+                        *stored.borrow_mut() = None;
+                    });
+                }
+            },
+            _ => {
+                EXPECTED_TYPES.with(|stored| {
+                    *stored.borrow_mut() = None;
+                });
+            }
+        }
+        CURRENT_SORT_MODE.with(|stored| {
+            *stored.borrow_mut() = current_sort_mode.clone();
+        });
+        tester.run(record)?;
+    }
     Ok(())
 }
