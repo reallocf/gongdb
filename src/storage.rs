@@ -68,6 +68,19 @@ pub(crate) struct RowLocation {
     slot: u16,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct IndexEqCacheKey {
+    index_name: String,
+    encoded_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct IndexEqRowCacheKey {
+    index_name: String,
+    encoded_key: Vec<u8>,
+    ordered: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct IndexEntry {
     key: Vec<Value>,
@@ -413,6 +426,8 @@ pub struct StorageEngine {
     txn_active: bool,
     journal: Option<Journal>,
     page_cache: RefCell<PageCache>,
+    index_eq_cache: RefCell<HashMap<IndexEqCacheKey, Vec<RowLocation>>>,
+    index_eq_row_cache: RefCell<HashMap<IndexEqRowCacheKey, Vec<Vec<Value>>>>,
     pending_sync_writes: usize,
 }
 
@@ -505,6 +520,8 @@ impl StorageEngine {
             txn_active: false,
             journal: None,
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
+            index_eq_cache: RefCell::new(HashMap::new()),
+            index_eq_row_cache: RefCell::new(HashMap::new()),
             pending_sync_writes: 0,
         };
         engine.write_header()?;
@@ -601,6 +618,8 @@ impl StorageEngine {
             txn_active: false,
             journal: None,
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
+            index_eq_cache: RefCell::new(HashMap::new()),
+            index_eq_row_cache: RefCell::new(HashMap::new()),
             pending_sync_writes: 0,
         };
         if needs_row_count_rebuild {
@@ -666,7 +685,14 @@ impl StorageEngine {
             StorageMode::OnDisk { file } => (file.metadata()?.len() / PAGE_SIZE as u64) as u32,
         };
         self.page_cache.borrow_mut().clear();
+        self.index_eq_cache.borrow_mut().clear();
+        self.index_eq_row_cache.borrow_mut().clear();
         Ok(())
+    }
+
+    fn clear_index_eq_cache(&self) {
+        self.index_eq_cache.borrow_mut().clear();
+        self.index_eq_row_cache.borrow_mut().clear();
     }
 
     /// Mark the start of a transaction.
@@ -694,6 +720,8 @@ impl StorageEngine {
             let _ = std::fs::remove_file(&journal.path);
         }
         self.page_cache.borrow_mut().clear();
+        self.index_eq_cache.borrow_mut().clear();
+        self.index_eq_row_cache.borrow_mut().clear();
     }
 
     /// Acquire a shared read lock for the given transaction.
@@ -869,7 +897,38 @@ impl StorageEngine {
             .indexes
             .get(index_name)
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
-        self.btree_scan_range(index.first_page, lower, upper)
+        let cache_key = match (lower, upper) {
+            (Some(lower), Some(upper)) if lower == upper => {
+                if let Ok(encoded_key) = encode_index_key(lower) {
+                    Some(IndexEqCacheKey {
+                        index_name: index_name.to_string(),
+                        encoded_key,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(key) = cache_key.as_ref() {
+            if let Some(cached) = self.index_eq_cache.borrow().get(key) {
+                return Ok(cached.clone());
+            }
+        }
+        let rows = if index.columns.len() == 1 {
+            match (lower, upper) {
+                (Some(lower), Some(upper)) if lower == upper && lower.len() == 1 => {
+                    self.btree_scan_eq_single(index.first_page, &lower[0])?
+                }
+                _ => self.btree_scan_range(index.first_page, lower, upper)?,
+            }
+        } else {
+            self.btree_scan_range(index.first_page, lower, upper)?
+        };
+        if let Some(key) = cache_key {
+            self.index_eq_cache.borrow_mut().insert(key, rows.clone());
+        }
+        Ok(rows)
     }
 
     pub(crate) fn scan_index_rows(
@@ -877,11 +936,52 @@ impl StorageEngine {
         index_name: &str,
         lower: Option<&[Value]>,
         upper: Option<&[Value]>,
+        preserve_index_order: bool,
     ) -> Result<Vec<Vec<Value>>, StorageError> {
-        let locations = self.scan_index_range(index_name, lower, upper)?;
+        let row_cache_key = match (lower, upper) {
+            (Some(lower), Some(upper)) if lower == upper => {
+                if let Ok(encoded_key) = encode_index_key(lower) {
+                    Some(IndexEqRowCacheKey {
+                        index_name: index_name.to_string(),
+                        encoded_key,
+                        ordered: preserve_index_order,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(key) = row_cache_key.as_ref() {
+            if let Some(cached) = self.index_eq_row_cache.borrow().get(key) {
+                return Ok(cached.clone());
+            }
+        }
+        let mut locations = self.scan_index_range(index_name, lower, upper)?;
+        if locations.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !preserve_index_order {
+            locations.sort_by(|a, b| {
+                a.page_id
+                    .cmp(&b.page_id)
+                    .then_with(|| a.slot.cmp(&b.slot))
+            });
+        }
         let mut rows = Vec::with_capacity(locations.len());
-        for location in &locations {
-            rows.push(self.read_row_at(location)?);
+        let mut current_page_id = None;
+        let mut current_page = Vec::new();
+        for location in locations {
+            if current_page_id != Some(location.page_id) {
+                current_page = self.read_page(location.page_id)?;
+                current_page_id = Some(location.page_id);
+            }
+            let record = record_slice_at_slot(&current_page, location.slot)
+                .ok_or_else(|| StorageError::Corrupt("invalid row location".to_string()))?;
+            rows.push(decode_row(record)?);
+        }
+        if let Some(key) = row_cache_key {
+            self.index_eq_row_cache.borrow_mut().insert(key, rows.clone());
         }
         Ok(rows)
     }
@@ -918,6 +1018,7 @@ impl StorageEngine {
         row: &[Value],
         write_catalog: bool,
     ) -> Result<RowLocation, StorageError> {
+        self.clear_index_eq_cache();
         let table = self
             .tables
             .get(table_name)
@@ -980,6 +1081,7 @@ impl StorageEngine {
 
     /// Create an index and populate it from existing table rows.
     pub fn create_index(&mut self, index: IndexMeta) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
         if self.indexes.contains_key(&index.name) {
             return Err(StorageError::Invalid(format!(
                 "index already exists: {}",
@@ -1018,6 +1120,7 @@ impl StorageEngine {
 
     /// Drop an index by name.
     pub fn drop_index(&mut self, name: &str) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
         let index = self
             .indexes
             .get(name)
@@ -1031,6 +1134,7 @@ impl StorageEngine {
 
     /// Rebuild one index or all indexes.
     pub fn reindex(&mut self, target: Option<&str>) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
         match target {
             None => {
                 let index_names: Vec<String> = self.indexes.keys().cloned().collect();
@@ -1136,10 +1240,10 @@ impl StorageEngine {
 
     pub(crate) fn read_row_at(&self, location: &RowLocation) -> Result<Vec<Value>, StorageError> {
         let page = self.read_page(location.page_id)?;
-        let record = read_record_at_slot(&page, location.slot).ok_or_else(|| {
+        let record = record_slice_at_slot(&page, location.slot).ok_or_else(|| {
             StorageError::Corrupt("invalid row location".to_string())
         })?;
-        decode_row(&record)
+        decode_row(record)
     }
 
     /// Replace all rows in a table with the provided rows.
@@ -1148,6 +1252,7 @@ impl StorageEngine {
         table_name: &str,
         rows: &[Vec<Value>],
     ) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
         let table = self
             .tables
             .get(table_name)
@@ -1201,6 +1306,7 @@ impl StorageEngine {
     }
 
     fn rebuild_index(&mut self, index_name: &str) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
         let index = self
             .indexes
             .get(index_name)
@@ -1328,8 +1434,9 @@ impl StorageEngine {
                     "invalid btree leaf page".to_string(),
                 ));
             }
-            let entries = read_leaf_entries(&page)?;
-            for entry in entries {
+            let records = read_record_slices(&page);
+            for record in records {
+                let entry = decode_index_entry(record)?;
                 if let Some(low) = lower {
                     if compare_index_keys(&entry.key, low) == std::cmp::Ordering::Less {
                         continue;
@@ -1341,6 +1448,39 @@ impl StorageEngine {
                     }
                 }
                 rows.push(entry.row);
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(rows)
+    }
+
+    fn btree_scan_eq_single(
+        &self,
+        root: u32,
+        target: &Value,
+    ) -> Result<Vec<RowLocation>, StorageError> {
+        let key = vec![target.clone()];
+        let mut page_id = self.btree_find_leaf(root, Some(&key))?;
+        let mut rows = Vec::new();
+        loop {
+            let page = self.read_page(page_id)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(StorageError::Corrupt(
+                    "invalid btree leaf page".to_string(),
+                ));
+            }
+            let records = read_record_slices(&page);
+            for record in records {
+                let (value, row) = decode_index_entry_single(record)?;
+                match compare_index_value(&value, target) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => rows.push(row),
+                    std::cmp::Ordering::Greater => return Ok(rows),
+                }
             }
             let next = get_next_page_id(&page);
             if next == 0 {
@@ -2102,6 +2242,20 @@ fn read_records(page: &[u8]) -> Vec<Vec<u8>> {
     records
 }
 
+fn read_record_slices<'a>(page: &'a [u8]) -> Vec<&'a [u8]> {
+    let slot_count = read_u16(page, 1) as usize;
+    let mut records = Vec::new();
+    for idx in 0..slot_count {
+        let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+        let record_offset = read_u16(page, slot_offset) as usize;
+        let record_len = read_u16(page, slot_offset + 2) as usize;
+        if record_offset + record_len <= PAGE_SIZE {
+            records.push(&page[record_offset..record_offset + record_len]);
+        }
+    }
+    records
+}
+
 fn read_records_with_slots(page: &[u8]) -> Vec<(u16, Vec<u8>)> {
     let slot_count = read_u16(page, 1) as usize;
     let mut records = Vec::new();
@@ -2117,6 +2271,10 @@ fn read_records_with_slots(page: &[u8]) -> Vec<(u16, Vec<u8>)> {
 }
 
 fn read_record_at_slot(page: &[u8], slot: u16) -> Option<Vec<u8>> {
+    record_slice_at_slot(page, slot).map(|record| record.to_vec())
+}
+
+fn record_slice_at_slot(page: &[u8], slot: u16) -> Option<&[u8]> {
     let slot_count = read_u16(page, 1) as usize;
     let slot = slot as usize;
     if slot >= slot_count {
@@ -2128,7 +2286,7 @@ fn read_record_at_slot(page: &[u8], slot: u16) -> Option<Vec<u8>> {
     if record_offset + record_len > PAGE_SIZE {
         return None;
     }
-    Some(page[record_offset..record_offset + record_len].to_vec())
+    Some(&page[record_offset..record_offset + record_len])
 }
 
 fn encode_row(row: &[Value]) -> Result<Vec<u8>, StorageError> {
@@ -2203,6 +2361,26 @@ fn decode_index_entry(record: &[u8]) -> Result<IndexEntry, StorageError> {
     })
 }
 
+fn decode_index_entry_single(record: &[u8]) -> Result<(Value, RowLocation), StorageError> {
+    if record.len() < 2 + 4 + 2 {
+        return Err(StorageError::Corrupt("invalid index entry".to_string()));
+    }
+    let mut pos = 0;
+    let count = read_u16(record, pos) as usize;
+    pos += 2;
+    if count != 1 {
+        return Err(StorageError::Corrupt("invalid index entry".to_string()));
+    }
+    let (value, new_pos) = decode_value(record, pos)?;
+    pos = new_pos;
+    if pos + 6 > record.len() {
+        return Err(StorageError::Corrupt("invalid index entry location".to_string()));
+    }
+    let page_id = read_u32(record, pos);
+    let slot = read_u16(record, pos + 4);
+    Ok((value, RowLocation { page_id, slot }))
+}
+
 fn encode_internal_cell(cell: &InternalCell) -> Result<Vec<u8>, StorageError> {
     let mut buf = encode_index_key(&cell.key)?;
     buf.extend_from_slice(&cell.right_child.to_le_bytes());
@@ -2234,19 +2412,19 @@ fn page_type(page: &[u8]) -> u8 {
 }
 
 fn read_leaf_entries(page: &[u8]) -> Result<Vec<IndexEntry>, StorageError> {
-    let records = read_records(page);
+    let records = read_record_slices(page);
     let mut entries = Vec::with_capacity(records.len());
     for record in records {
-        entries.push(decode_index_entry(&record)?);
+        entries.push(decode_index_entry(record)?);
     }
     Ok(entries)
 }
 
 fn read_internal_cells(page: &[u8]) -> Result<Vec<InternalCell>, StorageError> {
-    let records = read_records(page);
+    let records = read_record_slices(page);
     let mut cells = Vec::with_capacity(records.len());
     for record in records {
-        cells.push(decode_internal_cell(&record)?);
+        cells.push(decode_internal_cell(record)?);
     }
     Ok(cells)
 }

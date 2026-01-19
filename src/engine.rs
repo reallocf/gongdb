@@ -116,6 +116,8 @@ pub struct GongDB {
     in_list_cache: RefCell<InListCache>,
     in_subquery_cache: RefCell<InSubqueryCache>,
     subquery_cache: RefCell<SubqueryCache>,
+    statement_cache: RefCell<HashMap<String, Statement>>,
+    select_cache: RefCell<HashMap<String, CachedSelect>>,
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +125,15 @@ struct TriggerMeta {
     table: String,
 }
 
+#[derive(Clone)]
+struct CachedSelect {
+    types: Vec<DefaultColumnType>,
+    rows: Vec<Vec<String>>,
+}
+
 impl GongDB {
+    const STATEMENT_CACHE_LIMIT: usize = 128;
+
     /// Create a new in-memory database.
     ///
     /// # Examples
@@ -142,6 +152,8 @@ impl GongDB {
             in_list_cache: RefCell::new(InListCache::new()),
             in_subquery_cache: RefCell::new(InSubqueryCache::new()),
             subquery_cache: RefCell::new(SubqueryCache::new()),
+            statement_cache: RefCell::new(HashMap::new()),
+            select_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -163,6 +175,8 @@ impl GongDB {
             in_list_cache: RefCell::new(InListCache::new()),
             in_subquery_cache: RefCell::new(InSubqueryCache::new()),
             subquery_cache: RefCell::new(SubqueryCache::new()),
+            statement_cache: RefCell::new(HashMap::new()),
+            select_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -180,21 +194,50 @@ impl GongDB {
     /// println!("{:?}", output);
     /// ```
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(cached) = { self.select_cache.borrow().get(sql).cloned() } {
+            return Ok(DBOutput::Rows {
+                types: cached.types.clone(),
+                rows: cached.rows.clone(),
+            });
+        }
+        let cached = { self.statement_cache.borrow().get(sql).cloned() };
+        let stmt = if let Some(stmt) = cached {
+            stmt
+        } else {
+            let parsed = parser::parse_statement(sql)
+                .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
+            let mut cache = self.statement_cache.borrow_mut();
+            cache.insert(sql.to_string(), parsed.clone());
+            if cache.len() > Self::STATEMENT_CACHE_LIMIT {
+                cache.clear();
+            }
+            parsed
+        };
         self.in_list_cache.replace(InListCache::new());
         self.in_subquery_cache.replace(InSubqueryCache::new());
         self.subquery_cache.replace(SubqueryCache::new());
-        let stmt = parser::parse_statement(sql)
-            .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
         match stmt {
             Statement::BeginTransaction(begin) => self.begin_transaction(begin),
             Statement::Commit => self.commit_transaction(),
             Statement::Rollback => self.rollback_transaction(),
             _ => {
                 let is_write = is_write_statement(&stmt);
+                if is_write {
+                    self.select_cache.borrow_mut().clear();
+                }
                 let lock = self.acquire_statement_lock(is_write)?;
                 let result = self.execute_statement(stmt);
                 match result {
                     Ok(output) => {
+                        if let DBOutput::Rows { types, rows } = &output {
+                            self.select_cache.borrow_mut().insert(
+                                sql.to_string(),
+                                CachedSelect {
+                                    types: types.clone(),
+                                    rows: rows.clone(),
+                                },
+                            );
+                        }
                         self.release_statement_lock(lock);
                         Ok(output)
                     }
@@ -2500,9 +2543,12 @@ fn choose_index_scan_plan(
 fn scan_rows_with_index(db: &GongDB, plan: &IndexScanPlan) -> Result<Vec<Vec<Value>>, GongDBError> {
     let lower = plan.lower.as_deref();
     let upper = plan.upper.as_deref();
-    Ok(db
-        .storage
-        .scan_index_rows(&plan.index_name, lower, upper)?)
+    Ok(db.storage.scan_index_rows(
+        &plan.index_name,
+        lower,
+        upper,
+        plan.ordered_by,
+    )?)
 }
 
 fn build_eq_key(
