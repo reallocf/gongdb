@@ -976,6 +976,19 @@ impl StorageEngine {
         Ok(rows)
     }
 
+    pub(crate) fn scan_index_first_location(
+        &self,
+        index_name: &str,
+        key: &[Value],
+    ) -> Result<Option<RowLocation>, StorageError> {
+        let index = self
+            .indexes
+            .get(index_name)
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?
+            .clone();
+        self.scan_index_first_location_for_index(&index, key)
+    }
+
     pub(crate) fn scan_index_rows(
         &self,
         index_name: &str,
@@ -1895,6 +1908,116 @@ impl StorageEngine {
             page_id = next;
         }
         Ok(rows)
+    }
+
+    fn scan_index_first_location_for_index(
+        &self,
+        index: &IndexMeta,
+        key: &[Value],
+    ) -> Result<Option<RowLocation>, StorageError> {
+        if key.is_empty() {
+            return Ok(None);
+        }
+        match index.columns.len() {
+            1 => self.btree_scan_eq_single_first(index.first_page, &key[0]),
+            _ => self.btree_scan_eq_multi_first(index.first_page, key),
+        }
+    }
+
+    fn btree_scan_eq_single_first(
+        &self,
+        root: u32,
+        target: &Value,
+    ) -> Result<Option<RowLocation>, StorageError> {
+        let key = vec![target.clone()];
+        let mut page_id = self.btree_find_leaf(root, Some(&key))?;
+        loop {
+            let page = self.read_page(page_id)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(StorageError::Corrupt(
+                    "invalid btree leaf page".to_string(),
+                ));
+            }
+            let slot_count = read_u16(&page, 1) as usize;
+            for idx in 0..slot_count {
+                let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    continue;
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt(
+                        "invalid index record bounds".to_string(),
+                    ));
+                }
+                let record = &page[record_offset..record_offset + record_len];
+                let (value, row) = decode_index_entry_single(record)?;
+                match compare_index_value(&value, target) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => return Ok(Some(row)),
+                    std::cmp::Ordering::Greater => return Ok(None),
+                }
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(None)
+    }
+
+    fn btree_scan_eq_multi_first(
+        &self,
+        root: u32,
+        target: &[Value],
+    ) -> Result<Option<RowLocation>, StorageError> {
+        let mut page_id = self.btree_find_leaf(root, Some(target))?;
+        loop {
+            let page = self.read_page(page_id)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(StorageError::Corrupt(
+                    "invalid btree leaf page".to_string(),
+                ));
+            }
+            let slot_count = read_u16(&page, 1) as usize;
+            for idx in 0..slot_count {
+                let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    continue;
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt(
+                        "invalid index record bounds".to_string(),
+                    ));
+                }
+                let record = &page[record_offset..record_offset + record_len];
+                let (ordering, key_end) = compare_index_record_key(record, target)?;
+                match ordering {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        if key_end + 6 > record.len() {
+                            return Err(StorageError::Corrupt(
+                                "invalid index entry location".to_string(),
+                            ));
+                        }
+                        let page_id = read_u32(record, key_end);
+                        let slot = read_u16(record, key_end + 4);
+                        return Ok(Some(RowLocation { page_id, slot }));
+                    }
+                    std::cmp::Ordering::Greater => return Ok(None),
+                }
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(None)
     }
 
     #[allow(dead_code)]

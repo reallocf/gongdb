@@ -1299,49 +1299,94 @@ impl GongDB {
                     .unwrap();
                 key.push(value);
             }
-            let locations = match self.storage.scan_index_range(
-                &index.name,
-                Some(&key),
-                Some(&key),
-            ) {
-                Ok(locations) => locations,
-                Err(err) => return Some(Err(err.into())),
-            };
-            for location in locations {
-                let record = match self.storage.read_record_at(&location) {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+            if index.unique {
+                let location = match self.storage.scan_index_first_location(&index.name, &key) {
+                    Ok(location) => location,
                     Err(err) => return Some(Err(err.into())),
                 };
-                let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
-                    Ok(matches) => matches,
-                    Err(err) => return Some(Err(err)),
-                };
-                if !matches {
-                    continue;
-                }
-                match apply_fast_update_record_bytes(
-                    &table.columns,
-                    &record,
-                    &assignment_indices,
-                ) {
-                    Ok(Some(updated)) => encoded_updates.push((location, updated)),
-                    Ok(None) => {
-                        let row = match crate::storage::decode_row_from_record(&record) {
-                            Ok(row) => row,
-                            Err(err) => return Some(Err(err.into())),
-                        };
-                        let new_row = match apply_fast_update_assignments(
+                if let Some(location) = location {
+                    let record = match self.storage.read_record_at(&location) {
+                        Ok(record) => record,
+                        Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
+                            return Some(Ok(DBOutput::StatementComplete(0)))
+                        }
+                        Err(err) => return Some(Err(err.into())),
+                    };
+                    let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
+                        Ok(matches) => matches,
+                        Err(err) => return Some(Err(err)),
+                    };
+                    if matches {
+                        match apply_fast_update_record_bytes(
                             &table.columns,
-                            &row,
+                            &record,
                             &assignment_indices,
                         ) {
-                            Ok(new_row) => new_row,
+                            Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                            Ok(None) => {
+                                let row = match crate::storage::decode_row_from_record(&record) {
+                                    Ok(row) => row,
+                                    Err(err) => return Some(Err(err.into())),
+                                };
+                                let new_row = match apply_fast_update_assignments(
+                                    &table.columns,
+                                    &row,
+                                    &assignment_indices,
+                                ) {
+                                    Ok(new_row) => new_row,
+                                    Err(err) => return Some(Err(err)),
+                                };
+                                updates.push((location, new_row));
+                            }
                             Err(err) => return Some(Err(err)),
-                        };
-                        updates.push((location, new_row));
+                        }
                     }
-                    Err(err) => return Some(Err(err)),
+                }
+            } else {
+                let locations = match self.storage.scan_index_range(
+                    &index.name,
+                    Some(&key),
+                    Some(&key),
+                ) {
+                    Ok(locations) => locations,
+                    Err(err) => return Some(Err(err.into())),
+                };
+                for location in locations {
+                    let record = match self.storage.read_record_at(&location) {
+                        Ok(record) => record,
+                        Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+                        Err(err) => return Some(Err(err.into())),
+                    };
+                    let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
+                        Ok(matches) => matches,
+                        Err(err) => return Some(Err(err)),
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    match apply_fast_update_record_bytes(
+                        &table.columns,
+                        &record,
+                        &assignment_indices,
+                    ) {
+                        Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                        Ok(None) => {
+                            let row = match crate::storage::decode_row_from_record(&record) {
+                                Ok(row) => row,
+                                Err(err) => return Some(Err(err.into())),
+                            };
+                            let new_row = match apply_fast_update_assignments(
+                                &table.columns,
+                                &row,
+                                &assignment_indices,
+                            ) {
+                                Ok(new_row) => new_row,
+                                Err(err) => return Some(Err(err)),
+                            };
+                            updates.push((location, new_row));
+                        }
+                        Err(err) => return Some(Err(err)),
+                    }
                 }
             }
         } else {
@@ -1592,17 +1637,42 @@ impl GongDB {
         let rows = if let Some((index, key)) =
             fast_select_eq_index(&indexes, &predicate_values)
         {
-            let mut rows = match self
-                .storage
-                .scan_index_rows(&index.name, Some(&key), Some(&key), false)
-            {
-                Ok(rows) => rows,
-                Err(err) => return Some(Err(GongDBError::from(err))),
-            };
-            if !predicate_indices.is_empty() {
-                rows.retain(|row| fast_row_matches_predicates(row, &predicate_indices));
+            if index.unique {
+                let location = match self.storage.scan_index_first_location(&index.name, &key) {
+                    Ok(location) => location,
+                    Err(err) => return Some(Err(GongDBError::from(err))),
+                };
+                let mut rows = Vec::new();
+                if let Some(location) = location {
+                    let row = match self.storage.read_row_at(&location) {
+                        Ok(row) => row,
+                        Err(StorageError::NotFound(_)) => Vec::new(),
+                        Err(err) => return Some(Err(GongDBError::from(err))),
+                    };
+                    if row.is_empty() || (!predicate_indices.is_empty()
+                        && !fast_row_matches_predicates(&row, &predicate_indices))
+                    {
+                        rows
+                    } else {
+                        rows.push(row);
+                        rows
+                    }
+                } else {
+                    rows
+                }
+            } else {
+                let mut rows = match self
+                    .storage
+                    .scan_index_rows(&index.name, Some(&key), Some(&key), false)
+                {
+                    Ok(rows) => rows,
+                    Err(err) => return Some(Err(GongDBError::from(err))),
+                };
+                if !predicate_indices.is_empty() {
+                    rows.retain(|row| fast_row_matches_predicates(row, &predicate_indices));
+                }
+                rows
             }
-            rows
         } else if let Some(order_by) = plan.order_by.as_ref() {
             let limit = plan.limit.unwrap_or(usize::MAX);
             let (index, lower, upper) = match fast_select_order_by_range(
