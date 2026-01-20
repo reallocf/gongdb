@@ -197,6 +197,9 @@ impl GongDB {
         if let Some(result) = self.try_fast_insert(sql) {
             return result;
         }
+        if let Some(result) = self.try_fast_update(sql) {
+            return result;
+        }
         if let Some(cached) = { self.select_cache.borrow().get(sql).cloned() } {
             return Ok(DBOutput::Rows {
                 types: cached.types.clone(),
@@ -1003,6 +1006,189 @@ impl GongDB {
         }
         self.invalidate_table_stats(&table_name);
         Some(Ok(DBOutput::StatementComplete(rows.len() as u64)))
+    }
+
+    fn try_fast_update(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let plan = parse_fast_update(sql)?;
+        let table = match self.storage.get_table(&plan.table) {
+            Some(table) => table.clone(),
+            None => {
+                return Some(Err(GongDBError::new(format!(
+                    "no such table: {}",
+                    plan.table
+                ))))
+            }
+        };
+        if self.storage.get_view(&plan.table).is_some() {
+            return Some(Err(GongDBError::new(format!(
+                "cannot modify view {}",
+                plan.table
+            ))));
+        }
+        let mut indexed_columns = HashSet::new();
+        for index in self.storage.list_indexes() {
+            if index.table.eq_ignore_ascii_case(&plan.table) {
+                for column in &index.columns {
+                    indexed_columns.insert(column.name.value.to_ascii_lowercase());
+                }
+            }
+        }
+        if plan
+            .assignments
+            .iter()
+            .any(|assignment| indexed_columns.contains(&assignment.column))
+        {
+            return None;
+        }
+        let mut column_map = HashMap::new();
+        for (idx, col) in table.columns.iter().enumerate() {
+            column_map.insert(col.name.to_ascii_lowercase(), idx);
+        }
+        let mut predicate_values = HashMap::new();
+        let mut predicate_indices = Vec::with_capacity(plan.predicates.len());
+        for (column, value) in &plan.predicates {
+            let idx = match column_map.get(column) {
+                Some(idx) => *idx,
+                None => {
+                    return Some(Err(GongDBError::new(format!(
+                        "no such column: {}",
+                        column
+                    ))))
+                }
+            };
+            let value = apply_affinity(value.clone(), &table.columns[idx].data_type);
+            predicate_values.insert(column.clone(), value.clone());
+            predicate_indices.push((idx, value));
+        }
+        let mut assignment_indices = Vec::with_capacity(plan.assignments.len());
+        for assignment in &plan.assignments {
+            let idx = match column_map.get(&assignment.column) {
+                Some(idx) => *idx,
+                None => {
+                    return Some(Err(GongDBError::new(format!(
+                        "no such column: {}",
+                        assignment.column
+                    ))))
+                }
+            };
+            assignment_indices.push((idx, assignment.clone()));
+        }
+        let mut best_index: Option<IndexMeta> = None;
+        for index in self.storage.list_indexes() {
+            if !index.table.eq_ignore_ascii_case(&plan.table) {
+                continue;
+            }
+            let mut matches = true;
+            for column in &index.columns {
+                if !predicate_values.contains_key(&column.name.value.to_ascii_lowercase()) {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                let replace = match &best_index {
+                    Some(best) => index.columns.len() > best.columns.len(),
+                    None => true,
+                };
+                if replace {
+                    best_index = Some(index);
+                }
+            }
+        }
+        let mut updates = Vec::new();
+        if let Some(index) = best_index {
+            let mut key = Vec::with_capacity(index.columns.len());
+            for column in &index.columns {
+                let value = predicate_values
+                    .get(&column.name.value.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap();
+                key.push(value);
+            }
+            let locations = match self.storage.scan_index_range(
+                &index.name,
+                Some(&key),
+                Some(&key),
+            ) {
+                Ok(locations) => locations,
+                Err(err) => return Some(Err(err.into())),
+            };
+            for location in locations {
+                let row = match self.storage.read_row_at(&location) {
+                    Ok(row) => row,
+                    Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+                    Err(err) => return Some(Err(err.into())),
+                };
+                if !fast_row_matches_predicates(&row, &predicate_indices) {
+                    continue;
+                }
+                let new_row = match apply_fast_update_assignments(
+                    &table.columns,
+                    &row,
+                    &assignment_indices,
+                ) {
+                    Ok(new_row) => new_row,
+                    Err(err) => return Some(Err(err)),
+                };
+                updates.push((location, new_row));
+            }
+        } else {
+            let rows = match self.storage.scan_table_with_locations(&plan.table) {
+                Ok(rows) => rows,
+                Err(err) => return Some(Err(err.into())),
+            };
+            for (location, row) in rows {
+                if !fast_row_matches_predicates(&row, &predicate_indices) {
+                    continue;
+                }
+                let new_row = match apply_fast_update_assignments(
+                    &table.columns,
+                    &row,
+                    &assignment_indices,
+                ) {
+                    Ok(new_row) => new_row,
+                    Err(err) => return Some(Err(err)),
+                };
+                updates.push((location, new_row));
+            }
+        }
+        if !updates.is_empty() {
+            match self.storage.update_rows_at(&updates) {
+                Ok(()) => {}
+                Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                    let rows = match self.storage.scan_table(&plan.table) {
+                        Ok(rows) => rows,
+                        Err(err) => return Some(Err(err.into())),
+                    };
+                    let mut updated_rows = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        if fast_row_matches_predicates(&row, &predicate_indices) {
+                            let new_row = match apply_fast_update_assignments(
+                                &table.columns,
+                                &row,
+                                &assignment_indices,
+                            ) {
+                                Ok(new_row) => new_row,
+                                Err(err) => return Some(Err(err)),
+                            };
+                            updated_rows.push(new_row);
+                        } else {
+                            updated_rows.push(row);
+                        }
+                    }
+                    if let Err(err) = self.storage.replace_table_rows(&plan.table, &updated_rows) {
+                        return Some(Err(err.into()));
+                    }
+                }
+                Err(err) => return Some(Err(err.into())),
+            }
+        }
+        self.select_cache.borrow_mut().clear();
+        self.invalidate_table_stats(&plan.table);
+        Some(Ok(DBOutput::StatementComplete(0)))
     }
 
     fn invalidate_table_stats(&self, table_name: &str) {
@@ -4889,6 +5075,258 @@ fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Vec<Value>>)> {
     Some((table_name, rows))
 }
 
+#[derive(Clone)]
+struct FastUpdateAssignment {
+    column: String,
+    action: FastUpdateAction,
+}
+
+#[derive(Clone)]
+enum FastUpdateAction {
+    Set(Value),
+    Add(Value),
+    Sub(Value),
+}
+
+struct FastUpdatePlan {
+    table: String,
+    assignments: Vec<FastUpdateAssignment>,
+    predicates: Vec<(String, Value)>,
+}
+
+fn parse_fast_update(sql: &str) -> Option<FastUpdatePlan> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = strip_prefix_ci(input, "UPDATE")?.trim_start();
+    let table_end = rest
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or_else(|| rest.len());
+    if table_end == 0 {
+        return None;
+    }
+    let table_name = rest[..table_end].trim().to_string();
+    let mut rest = rest[table_end..].trim_start();
+    rest = strip_prefix_ci(rest, "SET")?.trim_start();
+    let (assignments_str, predicates_str) = split_where_clause(rest)?;
+    let assignment_parts = split_commas_outside_quotes(assignments_str)?;
+    let mut assignments = Vec::with_capacity(assignment_parts.len());
+    for part in assignment_parts {
+        let assignment = parse_fast_update_assignment(part)?;
+        assignments.push(assignment);
+    }
+    if assignments.is_empty() {
+        return None;
+    }
+    let predicate_parts = split_and_outside_quotes(predicates_str)?;
+    let mut predicates = Vec::with_capacity(predicate_parts.len());
+    for part in predicate_parts {
+        let predicate = parse_fast_update_predicate(part)?;
+        predicates.push(predicate);
+    }
+    if predicates.is_empty() {
+        return None;
+    }
+    Some(FastUpdatePlan {
+        table: table_name,
+        assignments,
+        predicates,
+    })
+}
+
+fn split_where_clause(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut idx = 0usize;
+    let mut in_string = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if byte == b'\'' {
+            if in_string {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                    idx += 2;
+                    continue;
+                }
+                in_string = false;
+                idx += 1;
+                continue;
+            }
+            in_string = true;
+            idx += 1;
+            continue;
+        }
+        if !in_string && idx + 5 <= bytes.len() {
+            if input[idx..idx + 5].eq_ignore_ascii_case("WHERE") {
+                let prev = if idx == 0 {
+                    None
+                } else {
+                    input[..idx].chars().last()
+                };
+                let next = input[idx + 5..].chars().next();
+                if prev.map_or(true, |c| c.is_whitespace())
+                    && next.map_or(true, |c| c.is_whitespace())
+                {
+                    let left = input[..idx].trim_end();
+                    let right = input[idx + 5..].trim_start();
+                    if left.is_empty() || right.is_empty() {
+                        return None;
+                    }
+                    return Some((left, right));
+                }
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_commas_outside_quotes(input: &str) -> Option<Vec<&str>> {
+    let bytes = input.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let mut in_string = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if byte == b'\'' {
+            if in_string {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                    idx += 2;
+                    continue;
+                }
+                in_string = false;
+                idx += 1;
+                continue;
+            }
+            in_string = true;
+            idx += 1;
+            continue;
+        }
+        if !in_string && byte == b',' {
+            let part = input[start..idx].trim();
+            if part.is_empty() {
+                return None;
+            }
+            parts.push(part);
+            start = idx + 1;
+        }
+        idx += 1;
+    }
+    let part = input[start..].trim();
+    if part.is_empty() {
+        return None;
+    }
+    parts.push(part);
+    Some(parts)
+}
+
+fn split_and_outside_quotes(input: &str) -> Option<Vec<&str>> {
+    let bytes = input.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let mut in_string = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if byte == b'\'' {
+            if in_string {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                    idx += 2;
+                    continue;
+                }
+                in_string = false;
+                idx += 1;
+                continue;
+            }
+            in_string = true;
+            idx += 1;
+            continue;
+        }
+        if !in_string && idx + 3 <= bytes.len() {
+            if input[idx..idx + 3].eq_ignore_ascii_case("AND") {
+                let prev = if idx == 0 {
+                    None
+                } else {
+                    input[..idx].chars().last()
+                };
+                let next = input[idx + 3..].chars().next();
+                if prev.map_or(true, |c| c.is_whitespace())
+                    && next.map_or(true, |c| c.is_whitespace())
+                {
+                    let part = input[start..idx].trim();
+                    if part.is_empty() {
+                        return None;
+                    }
+                    parts.push(part);
+                    start = idx + 3;
+                }
+            }
+        }
+        idx += 1;
+    }
+    let part = input[start..].trim();
+    if part.is_empty() {
+        return None;
+    }
+    parts.push(part);
+    Some(parts)
+}
+
+fn parse_fast_update_assignment(input: &str) -> Option<FastUpdateAssignment> {
+    let mut iter = input.splitn(2, '=');
+    let column = iter.next()?.trim();
+    let expr = iter.next()?.trim();
+    if column.is_empty() || expr.is_empty() {
+        return None;
+    }
+    if expr.len() >= column.len() && expr[..column.len()].eq_ignore_ascii_case(column) {
+        let after = &expr[column.len()..];
+        if !after.chars().next().map_or(false, |c| c.is_whitespace()) {
+            return None;
+        }
+        let mut rest = expr[column.len()..].trim_start();
+        let op = rest.chars().next()?;
+        if op == '+' || op == '-' {
+            rest = rest[op.len_utf8()..].trim_start();
+            let (value, remainder) = parse_fast_value(rest)?;
+            if !remainder.trim().is_empty() {
+                return None;
+            }
+            let action = if op == '+' {
+                FastUpdateAction::Add(value)
+            } else {
+                FastUpdateAction::Sub(value)
+            };
+            return Some(FastUpdateAssignment {
+                column: column.to_ascii_lowercase(),
+                action,
+            });
+        }
+    }
+    let (value, remainder) = parse_fast_value(expr)?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+    Some(FastUpdateAssignment {
+        column: column.to_ascii_lowercase(),
+        action: FastUpdateAction::Set(value),
+    })
+}
+
+fn parse_fast_update_predicate(input: &str) -> Option<(String, Value)> {
+    let mut iter = input.splitn(2, '=');
+    let column = iter.next()?.trim();
+    let expr = iter.next()?.trim();
+    if column.is_empty() || expr.is_empty() {
+        return None;
+    }
+    let (value, remainder) = parse_fast_value(expr)?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+    Some((column.to_ascii_lowercase(), value))
+}
+
 fn parse_fast_rows(input: &str) -> Option<(Vec<Vec<Value>>, &str)> {
     let mut rows = Vec::new();
     let mut rest = input;
@@ -4976,6 +5414,41 @@ fn parse_fast_value(input: &str) -> Option<(Value, &str)> {
     }
     let value = token.parse::<i64>().ok()?;
     Some((Value::Integer(value), remainder))
+}
+
+fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> bool {
+    for (idx, value) in predicates {
+        if !values_equal(&row[*idx], value) {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_fast_update_assignments(
+    columns: &[Column],
+    row: &[Value],
+    assignments: &[(usize, FastUpdateAssignment)],
+) -> Result<Vec<Value>, GongDBError> {
+    let mut new_row = row.to_vec();
+    for (idx, assignment) in assignments {
+        let column = &columns[*idx];
+        let updated = match &assignment.action {
+            FastUpdateAction::Set(value) => apply_affinity(value.clone(), &column.data_type),
+            FastUpdateAction::Add(delta) => {
+                let delta = apply_affinity(delta.clone(), &column.data_type);
+                let value = apply_binary_op(&BinaryOperator::Plus, new_row[*idx].clone(), delta)?;
+                apply_affinity(value, &column.data_type)
+            }
+            FastUpdateAction::Sub(delta) => {
+                let delta = apply_affinity(delta.clone(), &column.data_type);
+                let value = apply_binary_op(&BinaryOperator::Minus, new_row[*idx].clone(), delta)?;
+                apply_affinity(value, &column.data_type)
+            }
+        };
+        new_row[*idx] = updated;
+    }
+    Ok(new_row)
 }
 
 fn qualified_wildcard_indices(qualifier: &str, column_scopes: &[TableScope]) -> Vec<usize> {
