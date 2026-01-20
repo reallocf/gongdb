@@ -1830,6 +1830,91 @@ impl StorageEngine {
         Ok(result)
     }
 
+    pub(crate) fn update_records_at_with_data<T>(
+        &mut self,
+        updates: &[(RowLocation, T)],
+        mut f: impl FnMut(&mut [u8], &T) -> Result<bool, StorageError>,
+    ) -> Result<usize, StorageError> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut updates_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, (location, _)) in updates.iter().enumerate() {
+            updates_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push(idx);
+        }
+        let mut applied_total = 0usize;
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            for (page_id, page_updates) in updates_by_page {
+                let applied = self.with_page_mut(page_id, |page| {
+                    let slot_count = read_u16(page, 1) as usize;
+                    let mut applied = 0usize;
+                    for update_idx in page_updates {
+                        let (location, data) = &updates[update_idx];
+                        let slot = location.slot as usize;
+                        if slot >= slot_count {
+                            return Err(StorageError::Corrupt(
+                                "invalid row location".to_string(),
+                            ));
+                        }
+                        let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                        let record_offset = read_u16(page, slot_offset) as usize;
+                        let record_len = read_u16(page, slot_offset + 2) as usize;
+                        if record_len == 0 {
+                            return Err(StorageError::NotFound("row deleted".to_string()));
+                        }
+                        if record_offset + record_len > PAGE_SIZE {
+                            return Err(StorageError::Corrupt(
+                                "invalid row location".to_string(),
+                            ));
+                        }
+                        let record = &mut page[record_offset..record_offset + record_len];
+                        if f(record, data)? {
+                            applied = applied.saturating_add(1);
+                        }
+                    }
+                    Ok(applied)
+                })?;
+                applied_total = applied_total.saturating_add(applied);
+            }
+            return Ok(applied_total);
+        }
+        for (page_id, page_updates) in updates_by_page {
+            let mut page = self.read_page(page_id)?;
+            let slot_count = read_u16(&page, 1) as usize;
+            let mut applied = 0usize;
+            let mut modified = false;
+            for update_idx in page_updates {
+                let (location, data) = &updates[update_idx];
+                let slot = location.slot as usize;
+                if slot >= slot_count {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    return Err(StorageError::NotFound("row deleted".to_string()));
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let record = &mut page[record_offset..record_offset + record_len];
+                if f(record, data)? {
+                    applied = applied.saturating_add(1);
+                    modified = true;
+                }
+            }
+            if modified {
+                self.write_page(page_id, &page)?;
+            }
+            applied_total = applied_total.saturating_add(applied);
+        }
+        Ok(applied_total)
+    }
+
     fn update_record_fields_at_internal(
         &mut self,
         updates: &[(RowLocation, Vec<FieldUpdate>)],

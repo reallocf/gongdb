@@ -2061,7 +2061,9 @@ impl GongDB {
         };
         let mut cached_offsets = self.fast_stock_offsets_cache.borrow().clone();
         let mut cache_update: Option<FastStockOffsetsCache> = None;
+        let mut fallback_needed = false;
         let mut any_applied = false;
+        let mut updates = Vec::with_capacity(plans.len());
         for plan in plans {
             let key = vec![Value::Integer(plan.w_id), Value::Integer(plan.i_id)];
             let location = match self.storage.scan_index_first_location(&index.name, &key) {
@@ -2072,11 +2074,24 @@ impl GongDB {
                 Some(location) => location,
                 None => continue,
             };
-            let cached_snapshot = cached_offsets.clone();
-            let mut local_cache_update: Option<FastStockOffsetsCache> = None;
-            let mut fallback_needed = false;
-            let applied = match self.storage.update_record_at_with(location, |record| {
-                let cached = cached_snapshot.as_ref().and_then(|cache| {
+            updates.push((
+                location,
+                FastStockUpdatePlan {
+                    quantity: plan.quantity,
+                    ytd: plan.ytd,
+                    w_id: plan.w_id,
+                    i_id: plan.i_id,
+                    remote: plan.remote,
+                },
+            ));
+        }
+        let result = self
+            .storage
+            .update_records_at_with_data(&updates, |record, plan| {
+                if fallback_needed {
+                    return Ok(false);
+                }
+                let cached = cached_offsets.as_ref().and_then(|cache| {
                     if cache.record_len == record.len()
                         && (!plan.remote || cache.offsets.remote_cnt.is_some())
                     {
@@ -2089,10 +2104,14 @@ impl GongDB {
                     Some(offsets) => offsets,
                     None => match fast_stock_update_offsets(record, plan.remote) {
                         Ok(Some(offsets)) => {
-                            local_cache_update = Some(FastStockOffsetsCache {
+                            let update = FastStockOffsetsCache {
                                 record_len: record.len(),
                                 offsets: offsets.clone(),
-                            });
+                            };
+                            cached_offsets = Some(update.clone());
+                            if cache_update.is_none() {
+                                cache_update = Some(update);
+                            }
                             offsets
                         }
                         Ok(None) => {
@@ -2163,24 +2182,16 @@ impl GongDB {
                         return Ok(false);
                     }
                 }
-                Ok(true)
-            }) {
-                Ok(applied) => applied,
-                Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
-                Err(err) => return Some(Err(err.into())),
-            };
-            if fallback_needed {
-                return None;
-            }
-            if let Some(update) = local_cache_update {
-                cached_offsets = Some(update.clone());
-                if cache_update.is_none() {
-                    cache_update = Some(update);
-                }
-            }
-            if applied {
                 any_applied = true;
-            }
+                Ok(true)
+            });
+        match result {
+            Ok(_) => {}
+            Err(StorageError::NotFound(msg)) if msg == "row deleted" => {}
+            Err(err) => return Some(Err(err.into())),
+        }
+        if fallback_needed {
+            return None;
         }
         if let Some(cache_update) = cache_update {
             self.fast_stock_offsets_cache
