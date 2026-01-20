@@ -1,0 +1,175 @@
+commit_hash,timestamp,message,lines_of_code
+52e0597d0434eb6039e6048ba402a6cf6be1dc6c,2026-01-20 00:02:33,Work on bead: gongdb-rvt - Investigate deferred/batched index maintenance for TPCC new order [COMPLETED],23638
+88f8e3f0f554de3ffcf781790654b697cfb1475f,2026-01-19 23:54:37,Work on bead: gongdb-o7u - Reduce per-row insert overhead during bulk loads [COMPLETED],23595
+897671423181194c5c09603520101bcd17d19709,2026-01-19 23:51:16,Work on bead: gongdb-gq9 - Defer/batch index maintenance for bulk inserts [COMPLETED],23595
+fa999055ffd8bc98b4d8f97833925adc94685c66,2026-01-19 23:47:28,Work on bead: gongdb-cuc - Cut TPCC statement overhead [COMPLETED],23587
+882fe333daa98c03dbd0e49cbdddc492c6e6d286,2026-01-19 23:40:07,Work on bead: gongdb-bez - Investigate normalized statement cache for dynamic TPCC SQL [COMPLETED],23444
+de8e8d87c474992f39409e062f9532cb960d6b36,2026-01-19 23:23:29,Work on bead: gongdb-at8 - Optimize TPCC stock level query [COMPLETED],23045
+f8646fcd9a2ba59b6b907ba9fe678562696f8f0b,2026-01-19 23:11:15,Work on bead: gongdb-at8 - Optimize TPCC stock level query [IN PROGRESS],22874
+fbe938c59b58bf32a1a7b89d0a516a44eb388fef,2026-01-19 22:56:26,Work on bead: gongdb-at8 - Optimize TPCC stock level query [IN PROGRESS],22626
+bb2dd79679fc6f6918bb1687202f50cc045637ac,2026-01-19 22:42:47,Work on bead: gongdb-at8 - Optimize TPCC stock level query [IN PROGRESS],22469
+dbe96980cccd639479d24822a39d8fc39c94fd8e,2026-01-19 22:30:19,Work on bead: gongdb-aca - Optimize TPCC new order update/insert path [COMPLETED],22260
+99ed1227d5fe9190f50293c0348b858c295afc23,2026-01-19 22:19:09,Work on bead: gongdb-9hm - Fast SELECT path for simple equality queries [COMPLETED],22109
+518e29682b20c6379880a9b998b1a5513c97bff3,2026-01-19 22:14:23,Work on bead: gongdb-6k1 - Normalized statement cache for TPCC [COMPLETED],22007
+a8433db875a311c3d0b538f0365e06553de07226,2026-01-19 22:00:27,Work on bead: gongdb-6il - Add index-driven join lookups for equality joins [COMPLETED],21852
+403708c91476f628a5d8604316c74da2e351580f,2026-01-19 21:54:05,Work on bead: gongdb-6ai - Reduce GongDB insert/update overhead for TPCC [COMPLETED],21779
+feda83e796949e7ad6f78ed35aa6c2352d0b38b1,2026-01-19 21:49:36,Work on bead: gongdb-5dq - Batch/defer index updates for TPCC load [COMPLETED],21682
+783bf97c6d6fb3bb47d725a3da17f9f7f5785682,2026-01-19 21:42:37,Work on bead: gongdb-4zc - Fast-path UPDATE execution for TPCC patterns [COMPLETED],21533
+7328fff99728bb603fe0cb53a84d5b3af08bbbc0,2026-01-19 21:35:49,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [COMPLETED],21388
+573e82f1b70753b6dc10d29cefb29950f9116545,2026-01-19 21:15:56,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],20800
+e0c46cc21889fcd79bbdd63762d8166671397372,2026-01-19 20:41:27,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],20747
+0d80f25bf7a4f91b1688cf1af5e852aaebd366ca,2026-01-19 20:35:33,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],20651
+4e9a2788d624553e62c2841f44b927adf90b09c6,2026-01-19 20:31:18,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],20595
+36aa9d2d2b216f1fe3c2e6a7e30e04bc5de68818,2026-01-19 20:23:50,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],20136
+5403a30459313b366477f4dfad6fb0d7a1fb2cf3,2026-01-19 20:17:54,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],20130
+9ca564f76cc8f58583f6f7f86af2c52631619e4c,2026-01-19 20:12:36,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19798
+2bcc14fd492c4dc264967353776a6050a956f7ec,2026-01-19 20:08:09,Work on bead: gongdb-3wz - Investigate new order bottleneck with prepared/normalized execution [COMPLETED],19766
+eba1a19ad7840bf0c8271f54c3d02994e4fc26c0,2026-01-19 20:00:34,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19661
+c09b48294a027864f856660f10a3fb6f75474f2b,2026-01-19 19:53:46,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19573
+575fbdeaa337a9439c6ef3753cbc31db76d11e56,2026-01-19 19:49:09,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19533
+491093d3f799c263af9e1b5ea1a1c2b44b9c38e7,2026-01-19 19:42:18,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19448
+6f0919a848b92a9f12724e425108f48b91ecd6b3,2026-01-19 19:33:03,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19059
+1382355f7bf5e48049728d0470e8e01e6e845a24,2026-01-19 19:28:35,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19035
+147d45199ff460fe276e3632ebfb7430f897c467,2026-01-19 19:21:54,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],19017
+b7bde91a1a836c6c8121b9d997cfe733ac9a558e,2026-01-19 19:15:17,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18901
+01092f4f27aa8d82d6f25faca2c2d81cedb2cbbd,2026-01-19 19:09:04,Work on bead: gongdb-4ee - Optimize in-memory page mutation to avoid page cloning [COMPLETED],18745
+de0c8a323f782778e3aed45545edf3a85a46c6c6,2026-01-19 19:01:06,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18491
+2092253adae545f714dbd6b3b19232fe382267ad,2026-01-19 18:54:53,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18413
+1c835171a1ef839343fb53b0c61abe4e026146cc,2026-01-19 18:50:00,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18350
+739e8daf62c70ce3a5be2fdfebc68d2d0d392e08,2026-01-19 18:46:32,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18266
+aaf95bd99912369bc7730d03086fa74743b0f8ca,2026-01-19 18:44:00,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18212
+c1dc4706c4774051e0744fb8360cc837a12832c2,2026-01-19 18:41:28,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18200
+730b3937cc9121a78b981eb374bd2ab241deea42,2026-01-19 18:36:22,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],18174
+3240eedb7144da5abff37d6f8e26e4ad24d1338a,2026-01-19 18:31:59,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],17981
+de973d6dfd3a544032edb55800d426b6610970e6,2026-01-19 18:26:45,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],17903
+a4ad63c0e8a3c07369c87f2de63d54ff95001c82,2026-01-19 18:20:02,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],17680
+c510a766c66d5af297c06307c20118fe35825e30,2026-01-19 18:06:40,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],16870
+6320f72fe481ee5d392cead7a9ce763663585130,2026-01-19 18:02:42,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],16827
+11d2e415db6b5022a5be8734d0efc0b9144f17dd,2026-01-19 17:57:40,Work on bead: gongdb-4ou - Add normalized statement cache for literal-heavy SQL [COMPLETED],16775
+6877d89638902737e757a875a6aeb357ef81a6f2,2026-01-19 17:41:24,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],16442
+47dffc36975260913efa75c3a7752f1feada158f,2026-01-19 17:35:37,Work on bead: gongdb-2t5 - Auto-index or query-specific index for orders customer lookup [COMPLETED],16355
+4e62c92954310d30f860cececeef8b96b44a6d74,2026-01-19 17:31:06,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],16305
+583b58e0f925774fa643c9ecadcff38bd4ccc0d0,2026-01-19 17:22:30,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15832
+2467fc9cecad6b3820f2214403532102bc94ecc4,2026-01-19 17:16:43,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15801
+c1474aa1f920fa8b7fcbb7344b9dd68916e6b939,2026-01-19 17:10:02,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15778
+479f23b3d01e30edee36712d88d39c3e89843427,2026-01-19 17:06:34,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15693
+8f979ced380a1042a46e26eb4e8ebf03c7b9ca97,2026-01-19 16:58:30,Work on bead: gongdb-3tx - Reduce TPCC load/index update overhead [COMPLETED],15548
+84a159c0cb06064adceebd8c650293d66d10b8c3,2026-01-19 16:51:41,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15501
+21c871b98650966672736f5a751eaefe4716bf67,2026-01-19 16:41:56,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15372
+43128b56d854138aa98494007265a60391991583,2026-01-19 16:38:29,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15240
+4520115430def0521c8a7ab5fdd82b4150668c93,2026-01-19 16:26:44,Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS],15078
+9e876e0ebb255b374e60ebe0a7add3dfd2ea543f,2026-01-19 15:59:35,Work on bead: gongdb-3gr - Re-enable SELECT predicate planning safely [COMPLETED],14884
+6a0ce6398e3c01a3541dcd1eb29f0834e73b5037,2026-01-19 15:40:34,Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [COMPLETED],14881
+64f866ad6048677eac0fdb547e82e522ac921e9c,2026-01-19 15:18:25,Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [IN PROGRESS],14883
+300dcf7bdfa2bb96c2cf2a190abb84e876ef4e75,2026-01-19 14:44:53,Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [IN PROGRESS],14883
+ca88df07106dbe65544e7c48d251a33e5bde5c18,2026-01-19 14:20:04,Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [IN PROGRESS],14872
+d0b544310497b594e149f52fef719ec032d80f81,2026-01-19 13:50:29,Work on bead: gongdb-zhn - Optimize JOIN operations (critical: 63344x slower) [COMPLETED],14880
+86a2067160141d585454a42e053a4aa2e4f2df6a,2026-01-19 13:47:17,Work on bead: gongdb-zhn - Optimize JOIN operations (critical: 63344x slower) [IN PROGRESS],14880
+137753522e733cd92086933270993d92b3e11a00,2026-01-19 13:41:30,Work on bead: gongdb-q51 - Optimize DELETE operations (high: 62x slower) [COMPLETED],14737
+0efed81414a561ce51790fb03894d313bbd5d38e,2026-01-19 12:06:56,Work on bead: gongdb-lnk - Optimize UPDATE operations (high: 111x slower) [COMPLETED],14612
+f317b2ed75a6b200593e2890e953cb114f093213,2026-01-19 11:56:55,Work on bead: gongdb-ev4 - Optimize ORDER BY operations (medium: 14x slower) [COMPLETED],14424
+adb4c26169b67842fb9bcbaeabd092bac7b8919e,2026-01-19 11:47:13,Work on bead: gongdb-zxa - Improve index usage for WHERE clauses (high: 25x slower) [COMPLETED],14410
+6999456e69fa14f2e662465cf23966574173e4b5,2026-01-19 11:21:20,Work on bead: gongdb-z81 - Optimize GROUP BY operations (high: 20x slower) [COMPLETED],14186
+e43370ad91630198832e322eed0e2cf499ff3495,2026-01-19 11:16:50,Work on bead: gongdb-uwo - Optimize SUM aggregation (medium: 12x slower) [COMPLETED],14201
+9adaae04e6a33db7ee3f19d6e67a078b7b5a8bd3,2026-01-19 11:13:41,Work on bead: gongdb-s3c - Optimize COUNT(*) queries (critical: 1318x slower) [COMPLETED],14161
+d8cf478b792ec84efb30e629468a5cdae2af4e33,2026-01-19 11:07:09,Work on bead: gongdb-qew - Optimize WHERE clause filtering (high: 18x slower) [COMPLETED],14149
+633d9eb81a4aa9e6014ad55f6057fd9d397e1869,2026-01-19 10:59:45,Work on bead: gongdb-4jc - Optimize bulk INSERT operations (low: 6.65x slower) [COMPLETED],13922
+cc424b0d0f40d7593b4680a38cbfd130f3356824,2026-01-19 10:31:41,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+32741f8984ab71e4a9760e415c513651ffb4bd8d,2026-01-19 10:30:49,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+3dcc324cca779ac0d91be02bce3db798086daafb,2026-01-19 10:30:01,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+a6bd7ae95fc6f2a11d7f2722bb9d6a01b88daca8,2026-01-19 10:29:18,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+7e0eeaa6944388b219a40157eb9fa4787687c095,2026-01-19 10:28:28,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+58980589103a84389de4f3f67282ed02938cf830,2026-01-19 10:27:54,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+305c2d3b10a455eb605c165fce33210de0313174,2026-01-19 10:26:49,Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS],13894
+8accefcf207cf4b0500dda561532fd8f32912521,2026-01-19 10:11:23,Add performance tests,13800
+186020420a5d828940a9c4627afde3ec01baf495,2026-01-18 23:55:10,Work on bead: gongdb-2wu - Recursive CTEs with UNION [COMPLETED],13800
+072c2df0f02958d8c85052d5cd970a735aab83d8,2026-01-18 23:16:18,Work on bead: gongdb-at2 - Phase 17: Documentation - API Documentation [COMPLETED],13692
+360b0052fe0563cf0ebb92b8dac7d33f80572888,2026-01-18 23:09:58,Work on bead: gongdb-6rv - Phase 17: Documentation - Architecture Documentation [COMPLETED],13256
+b4990a69eec28c166506f821783bc5ef0d0c34e9,2026-01-18 23:06:42,Work on bead: gongdb-ot8 - Run full sqllogictest to completion for Phase 16 [COMPLETED],13256
+e21016c85f50ae1ea3d5febe5ff8decacafc7fee,2026-01-18 21:51:53,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [COMPLETED],13256
+b703f95769c4781f80cd096e3bfb5b66412ff10f,2026-01-18 21:33:18,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13253
+bd9dcc6a8a0d3120d69b5de17d87adfb545321ce,2026-01-18 21:31:04,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13240
+7f34be39073c527a4213fc6dd85ef7b55d529f56,2026-01-18 21:22:13,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13178
+962235f2720d0483bfe0bcc0539d801cfa770a92,2026-01-18 21:19:46,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13169
+9d1b66e407d9c59267d0ee03ce746de02ec1575f,2026-01-18 21:12:42,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13109
+2f326815c3a425406870a7f7e9f780b0afc26018,2026-01-18 21:08:40,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13091
+ebd4907de58fabc560c2b90cee3096a6a630e92e,2026-01-18 21:04:29,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],13042
+7a8ec5eef3e0d4b6ca8672d67272e37711554ef2,2026-01-18 20:58:05,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],12964
+937a23ff17cf152fad935d010a2dd2609bd430fa,2026-01-18 20:52:19,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],12959
+6c601d0bfaeef56ce661cda34e5f08695de901ad,2026-01-18 20:41:24,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],12867
+82798497b5fff95715bfde7ab4f8981a057bb622,2026-01-18 20:33:59,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],12801
+f700ad862de804ab91543405c99b31e342554fb0,2026-01-18 20:30:33,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],12651
+99de6403b097babaa1256e91b52c3ef803b1bce4,2026-01-18 20:25:32,Work on bead: gongdb-lpp - Phase 16: Performance - Query Optimization [IN PROGRESS],12648
+fb72e6819e3b157c30de59a24660c6d660dc91e9,2026-01-18 20:14:39,Work on bead: gongdb-8og - Phase 16: Performance - Storage Engine Optimization [COMPLETED],12603
+5d456afcb06ad1e9a88f220d05bcdb6a8d033695,2026-01-18 20:10:25,Work on bead: gongdb-8og - Phase 16: Performance - Storage Engine Optimization [IN PROGRESS],12584
+ae77997652ec3f1f052a71baba03f253a48796fa,2026-01-18 20:01:29,Work on bead: gongdb-tip - Phase 15: Final Integration Testing - Pass All 408 SQLite Tests [COMPLETED],12343
+1e5aaba9ce07c0732e9314b707b39550a4217599,2026-01-18 17:44:58,Work on bead: gongdb-tip - Phase 15: Final Integration Testing - Pass All 408 SQLite Tests [IN PROGRESS],12015
+4c483d0fbcea73f87c272110749cdf1f2ceeae50,2026-01-18 16:51:34,Work on bead: gongdb-tip - Phase 15: Final Integration Testing - Pass All 408 SQLite Tests [IN PROGRESS],11909
+8641bbdf8776c213658600e98c45b5e0752c1aac,2026-01-18 16:22:08,Work on bead: gongdb-tip - Phase 15: Final Integration Testing - Pass All 408 SQLite Tests [IN PROGRESS],11805
+213573616ce6c38f561a19d8b273b89a0497e1f2,2026-01-18 15:37:00,Update docs to tell model to output all test text,11805
+9e3c8fb6c092a6ce4d549355830237c13096b896,2026-01-18 04:47:44,Stopped cuz going to airport,11805
+a14c1e742921c7b741af56460f659037b02a282d,2026-01-18 01:05:37,Work on bead: gongdb-tip - Phase 15: Final Integration Testing - Pass All 408 SQLite Tests [IN PROGRESS],11775
+9f89cf867dd4f32468407b04914daad93b59fe6a,2026-01-18 00:55:18,Work on bead: gongdb-bxp - Phase 15: Testing - Pass select1.test [COMPLETED],11779
+2457fdccee8316d5d4ade79c9f994f55d13b5c8a,2026-01-18 00:54:35,Work on bead: gongdb-bqw - Phase 15: Testing - Pass select2-5.test [COMPLETED],11779
+3fd4f1f48ec544e295f29fd010963af86ce1d8bc,2026-01-18 00:53:14,Work on bead: gongdb-7e2 - Phase 15: Testing - Pass Evidence Tests [COMPLETED],11779
+23c062a80e4e20b63e272082ee7f913b98ac16ad,2026-01-18 00:51:45,Work on bead: gongdb-3ve - Phase 15: Testing - Pass Random Test Suites [COMPLETED],11779
+2dbdf151c749b24844928bf69fb06d445883f572,2026-01-18 00:50:51,Work on bead: gongdb-0rw - Phase 15: Testing - Pass All 408 SQLite Tests [COMPLETED],11779
+fb2f1e846557a78444be7c0c00ba5c40747eaf2c,2026-01-18 00:49:19,Work on bead: gongdb-m2r - Phase 14: Integration - Replace rusqlite with gongdb [COMPLETED],11779
+18dd6da8600572908f87e657a17faaaa66786bde,2026-01-18 00:46:35,Work on bead: gongdb-l91 - Phase 14: Integration - Error Handling [COMPLETED],11878
+dccc7d2e47628b5e3a949a6fdeb55ea685e39b76,2026-01-18 00:35:15,Work on bead: gongdb-akc - Phase 13: Transaction Management - ACID Properties [COMPLETED],11764
+278aee95935d94ed062c0890587f94b577a16b19,2026-01-18 00:27:12,Work on bead: gongdb-2ur - Phase 13: Transaction Management - Transaction Support [COMPLETED],11605
+c1cde196a9d6da58c0c078614a92c15277246761,2026-01-18 00:24:42,Work on bead: gongdb-2ur - Phase 13: Transaction Management - Transaction Support [IN PROGRESS],11605
+6037e125283efbe2d0919c11f7846e3264404741,2026-01-18 00:23:38,Work on bead: gongdb-2p0 - Phase 13: Transaction Management - Locking and Concurrency [COMPLETED],11605
+e4e73065853354da7026ec86a0f8214fb122e517,2026-01-18 00:14:12,Work on bead: gongdb-5ic - Phase 12: Query Planning - Basic Query Planner [COMPLETED],11196
+8713a327a4ab0ca937b7fd2b1012c8d89b6c597a,2026-01-18 00:12:19,Work on bead: gongdb-5el - Phase 12: Query Planning - Cost-Based Optimization [COMPLETED],11196
+226713f0a7b91695faa6aea41b012e2381efaa76,2026-01-18 00:00:51,Work on bead: gongdb-n8r - Phase 11: Indexing - Index Maintenance [COMPLETED],10871
+00e4eee2a3ed67a48e936b408308e2005c1e8dbb,2026-01-17 23:54:58,Work on bead: gongdb-apv - Phase 11: Indexing - Index Scan and Lookup [COMPLETED],10754
+73d6d0c7dccb01c4521479cb1152ec70cffd7daa,2026-01-17 23:34:39,Work on bead: gongdb-a74 - Phase 11: Indexing - B-Tree Index Structure [COMPLETED],10270
+c14d21c596a485a356dab3c0b04a452499e64873,2026-01-17 23:06:44,Work on bead: gongdb-a74 - Phase 11: Indexing - B-Tree Index Structure [IN PROGRESS],10021
+fa752bd4fd263bfda58a49be263c79e7d69c7516,2026-01-17 22:39:56,Work on bead: gongdb-z6t - Phase 10: Subqueries - Scalar Subqueries [COMPLETED],9520
+fddcd3bf7f8980784f65b2499d06b0c9c774588a,2026-01-17 22:36:55,Work on bead: gongdb-7nl - Phase 10: Subqueries - EXISTS and IN Subqueries [COMPLETED],9506
+e7eabdef693728dc9d1be75438a0f383926105d6,2026-01-17 22:33:07,Work on bead: gongdb-5ms - Phase 10: Subqueries - Derived Tables and CTEs [COMPLETED],9506
+e552cb3ca8a5edc423bf397e285fdf6418384bc7,2026-01-17 22:14:47,Work on bead: gongdb-47m - Phase 9: Joins - LEFT/RIGHT/OUTER Joins [COMPLETED],9194
+ef1dd990886fa0d78c19f4dc90a95114652943e8,2026-01-17 22:09:34,Work on bead: gongdb-2a7 - Phase 9: Joins - Multiple Table Joins [COMPLETED],9161
+d6893ab3a5680b0e1f64dbdf245353e8e8cb4cd4,2026-01-17 22:05:30,Work on bead: gongdb-1kl - Phase 9: Joins - Inner Join [COMPLETED],9123
+7e5b1664b6af9af94fb357ea3a248ff358beb2e6,2026-01-17 21:49:41,Work on bead: gongdb-onx - Phase 8: Aggregation - GROUP BY [COMPLETED],8566
+05e6829ca1bb042141fc7de337acb6d53e3648fe,2026-01-17 21:40:06,Work on bead: gongdb-d1y - Phase 8: Aggregation - Aggregate Functions [COMPLETED],8262
+48366f17aa54cbd4ae26d71e00b6adc00477f3b4,2026-01-17 21:18:36,Work on bead: gongdb-k2f - Phase 7: Query Execution - DISTINCT [COMPLETED],7732
+13f599cfa4f89d6ec39c0f332bfa75d5e746d406,2026-01-17 21:15:08,Work on bead: gongdb-erb - Phase 7: Query Execution - ORDER BY [COMPLETED],7691
+ddcef701bb65ad2dfb47f35c014bcb2105ecddfa,2026-01-17 20:54:44,Work on bead: gongdb-erb - Phase 7: Query Execution - ORDER BY [IN PROGRESS],7670
+d25436a7e6c9d484bea7946ba99749f5de1cbc18,2026-01-17 20:41:24,Work on bead: gongdb-dgc - Phase 7: Query Execution - Column Selection and Projection [COMPLETED],7517
+eca30caf2cb64afaebc2be1bdf4d6736b575aa35,2026-01-17 20:36:48,Work on bead: gongdb-6xg - Phase 7: Query Execution - WHERE Clause Filtering [COMPLETED],7488
+fef1b4ede4032be8810b69ba303a0fad2054ae92,2026-01-17 20:06:47,Continue on even if task is not completed,7398
+0327941330d199ce35b05860a39977ddae35580f,2026-01-17 20:01:25,Work on bead: gongdb-6xg - Phase 7: Query Execution - WHERE Clause Filtering [IN PROGRESS],7398
+2778b9cd7719d23394ea8ed4bf2eb2923efb92ca,2026-01-17 19:44:09,Update AGENTS.md to fix conflict with build_gongdb.py around how to wrap up work,7398
+29fb7fb40d3ea92abebabdf19ddc9a4ee6871395,2026-01-17 19:36:34,Work on bead: gongdb-6xg - Phase 7: Query Execution - WHERE Clause Filtering [IN PROGRESS],7398
+c0261226ae69d7aa4e98a54311302f05ade774ea,2026-01-17 19:29:44,Work on bead: gongdb-3f5 - Phase 7: Query Execution - Table Scan [COMPLETED],7374
+19a1291b10cae4b10245646fb1c8f000766e42e9,2026-01-17 19:22:20,Work on bead: gongdb-eeu - Phase 6: DML Implementation - REPLACE [COMPLETED],7247
+0636dada01f001c1a827acc3ef83bda99bbd37a6,2026-01-17 19:15:08,Work on bead: gongdb-c4w - Phase 6: DML Implementation - DELETE [COMPLETED],7049
+c7950562e676722d2d604483ac6ff455133057da,2026-01-17 19:10:40,Work on bead: gongdb-8ri - Phase 6: DML Implementation - INSERT [COMPLETED],7049
+69c67ba0d4aaa9394846304af43b79b2936d1e5b,2026-01-17 19:03:56,Work on bead: gongdb-8b3 - Phase 6: DML Implementation - UPDATE [COMPLETED],6939
+778f9915074f73d4daac7a66ab39a1b2ee08d22c,2026-01-17 18:32:57,Work on bead: gongdb-xu5 - Phase 5: Expression Evaluation - Built-in Functions [COMPLETED],6810
+6e340e993a28066d0be53b42dc52a42946721328,2026-01-17 18:12:22,Work on bead: gongdb-r31 - Phase 5: Expression Evaluation - IN and NOT IN [COMPLETED],6375
+2808f73d1fcb8b0e895ac61ce6ce6c0fdc993ec6,2026-01-17 18:02:28,Work on bead: gongdb-r31 - Phase 5: Expression Evaluation - IN and NOT IN [IN PROGRESS],6356
+36b4bf2ebd737114ac2060f9e20b04a22530fcfc,2026-01-17 16:56:40,Work on bead: gongdb-e4q - Phase 5: Expression Evaluation - BETWEEN and EXISTS [COMPLETED],6179
+df10ac48f9f0fd42d83e9a6eba33059a89be5cb1,2026-01-17 16:46:02,Work on bead: gongdb-dvp - Phase 5: Expression Evaluation - Arithmetic and Logical Operators [COMPLETED],6021
+7d7c511b25092478378646799a0d53860e74e0fa,2026-01-17 16:41:30,Work on bead: gongdb-9yx - Phase 5: Expression Evaluation - CASE Expressions [COMPLETED],5981
+0d7eae71ee75e3ef9702eee3d9efaab04c7944ff,2026-01-17 16:27:23,Work on bead: gongdb-9yx - Phase 5: Expression Evaluation - CASE Expressions [IN PROGRESS],5954
+fba80e68445acc42c60e6520c8677fbeeac354dc,2026-01-17 16:19:06,Work on bead: gongdb-xkj - Phase 4: DDL Implementation - CREATE/DROP VIEW [COMPLETED],5926
+b526042898c4dd3ec2fd2c6c8fba841c2ecbb36f,2026-01-17 16:05:11,Work on bead: gongdb-s88 - Phase 4: DDL Implementation - CREATE TABLE [COMPLETED],5327
+0c6edca7f8e2c8c4c26d39a0f3fc14c929c2e30b,2026-01-17 15:56:21,Work on bead: gongdb-mza - Phase 4: DDL Implementation - DROP TABLE [COMPLETED],5129
+5926e280ab883d84e40bad749516c28b135114a2,2026-01-17 15:50:36,Work on bead: gongdb-eah - Phase 4: DDL Implementation - CREATE/DROP INDEX [COMPLETED],5021
+d4913b54c3f676137df9bfc0b9b3bd630ffd2f31,2026-01-17 15:38:41,Work on bead: gongdb-eah - Phase 4: DDL Implementation - CREATE/DROP INDEX [IN PROGRESS],4775
+1b0f0c644386bc40a6f0a0f0a6703028013e817d,2026-01-17 15:33:52,Work on bead: gongdb-t8s - Phase 3: Type System - Value Representation [COMPLETED],4520
+ad54e0d83d4ae102ef73b89df94834bdde168e7b,2026-01-17 15:30:01,Work on bead: gongdb-eh8 - Phase 3: Type System - Data Type Support [COMPLETED],4520
+5dd4e2fd2f44f83b38d3a3bd6c47d0c61fac4b25,2026-01-17 15:20:05,Work on bead: gongdb-uo2 - Phase 2: Storage Engine - Row Storage and Serialization [COMPLETED],4089
+b3ca0290bfe1709f076cf3cba5bd38e4c313a617,2026-01-17 15:15:13,Work on bead: gongdb-c2j - Phase 2: Storage Engine - Table Schema Management [COMPLETED],4089
+20dfe679209d2409219982b2adad048d5af3987a,2026-01-17 15:03:18,Work on bead: gongdb-bzd - Phase 2: Storage Engine - Page-Based Storage [COMPLETED],3245
+a6be1bc81c2ac650de12178e7f5bc9394af2d75f,2026-01-17 14:50:26,Work on bead: gongdb-bzl - Phase 1: Core Infrastructure - SQL Parser [COMPLETED],2158
+e761a42517fcd525cf153c808e742afd09372fbe,2026-01-17 14:43:53,Improve logging,2158
+cfc294497c0c8d329f629e01ec0439b4af4b8ef5,2026-01-17 14:39:14,Work on bead: gongdb-bzl - Phase 1: Core Infrastructure - SQL Parser,2158
+0f6040e3d9d7aef277fc865aa9b4166aff719560,2026-01-17 14:32:13,Work on bead: gongdb-bdb - Phase 1: Core Infrastructure - AST Representation,606
+5ccf85d290d6b5f6eca9247c64f4a4bb78887a0f,2026-01-17 14:14:32,Add uv for build_gongdb.py,294
+9f607a787d215765ae791c6d2473e0488c97f40f,2026-01-17 14:12:57,Use gpt-5.2-codex specifically,294
+7e9eb82094c2502bb809a72a9155da804e6743ff,2026-01-17 14:09:38,Tests or almost all passing. Time to start cooking,294
+dc61965060fdaad86579cb55b3f74135506d5aca,2026-01-17 00:00:44,Add tests and initial runner. Still getting all tests to pass with ref impl.,226

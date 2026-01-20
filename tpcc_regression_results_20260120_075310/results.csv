@@ -1,0 +1,85 @@
+commit_hash,commit_date,commit_message,test_status,elapsed_time
+186020420a5d828940a9c4627afde3ec01baf495,2026-01-18 23:55:10 -0800,"Work on bead: gongdb-2wu - Recursive CTEs with UNION [COMPLETED]",FAIL,0
+8accefcf207cf4b0500dda561532fd8f32912521,2026-01-19 10:11:23 -0800,"Add performance tests",FAIL,124.0
+305c2d3b10a455eb605c165fce33210de0313174,2026-01-19 10:26:49 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+58980589103a84389de4f3f67282ed02938cf830,2026-01-19 10:27:54 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+7e0eeaa6944388b219a40157eb9fa4787687c095,2026-01-19 10:28:28 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+a6bd7ae95fc6f2a11d7f2722bb9d6a01b88daca8,2026-01-19 10:29:18 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+3dcc324cca779ac0d91be02bce3db798086daafb,2026-01-19 10:30:01 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+32741f8984ab71e4a9760e415c513651ffb4bd8d,2026-01-19 10:30:49 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+cc424b0d0f40d7593b4680a38cbfd130f3356824,2026-01-19 10:31:41 -0800,"Work on bead: gongdb-3ti - Optimize COUNT(*) queries (critical: 1318x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+633d9eb81a4aa9e6014ad55f6057fd9d397e1869,2026-01-19 10:59:45 -0800,"Work on bead: gongdb-4jc - Optimize bulk INSERT operations (low: 6.65x slower) [COMPLETED]",CHECKOUT_FAILED,0
+d8cf478b792ec84efb30e629468a5cdae2af4e33,2026-01-19 11:07:09 -0800,"Work on bead: gongdb-qew - Optimize WHERE clause filtering (high: 18x slower) [COMPLETED]",CHECKOUT_FAILED,0
+9adaae04e6a33db7ee3f19d6e67a078b7b5a8bd3,2026-01-19 11:13:41 -0800,"Work on bead: gongdb-s3c - Optimize COUNT(*) queries (critical: 1318x slower) [COMPLETED]",CHECKOUT_FAILED,0
+e43370ad91630198832e322eed0e2cf499ff3495,2026-01-19 11:16:50 -0800,"Work on bead: gongdb-uwo - Optimize SUM aggregation (medium: 12x slower) [COMPLETED]",CHECKOUT_FAILED,0
+6999456e69fa14f2e662465cf23966574173e4b5,2026-01-19 11:21:20 -0800,"Work on bead: gongdb-z81 - Optimize GROUP BY operations (high: 20x slower) [COMPLETED]",CHECKOUT_FAILED,0
+adb4c26169b67842fb9bcbaeabd092bac7b8919e,2026-01-19 11:47:13 -0800,"Work on bead: gongdb-zxa - Improve index usage for WHERE clauses (high: 25x slower) [COMPLETED]",CHECKOUT_FAILED,0
+f317b2ed75a6b200593e2890e953cb114f093213,2026-01-19 11:56:55 -0800,"Work on bead: gongdb-ev4 - Optimize ORDER BY operations (medium: 14x slower) [COMPLETED]",CHECKOUT_FAILED,0
+0efed81414a561ce51790fb03894d313bbd5d38e,2026-01-19 12:06:56 -0800,"Work on bead: gongdb-lnk - Optimize UPDATE operations (high: 111x slower) [COMPLETED]",CHECKOUT_FAILED,0
+137753522e733cd92086933270993d92b3e11a00,2026-01-19 13:41:30 -0800,"Work on bead: gongdb-q51 - Optimize DELETE operations (high: 62x slower) [COMPLETED]",CHECKOUT_FAILED,0
+86a2067160141d585454a42e053a4aa2e4f2df6a,2026-01-19 13:47:17 -0800,"Work on bead: gongdb-zhn - Optimize JOIN operations (critical: 63344x slower) [IN PROGRESS]",CHECKOUT_FAILED,0
+d0b544310497b594e149f52fef719ec032d80f81,2026-01-19 13:50:29 -0800,"Work on bead: gongdb-zhn - Optimize JOIN operations (critical: 63344x slower) [COMPLETED]",CHECKOUT_FAILED,0
+ca88df07106dbe65544e7c48d251a33e5bde5c18,2026-01-19 14:20:04 -0800,"Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [IN PROGRESS]",CHECKOUT_FAILED,0
+300dcf7bdfa2bb96c2cf2a190abb84e876ef4e75,2026-01-19 14:44:53 -0800,"Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [IN PROGRESS]",CHECKOUT_FAILED,0
+64f866ad6048677eac0fdb547e82e522ac921e9c,2026-01-19 15:18:25 -0800,"Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [IN PROGRESS]",CHECKOUT_FAILED,0
+6a0ce6398e3c01a3541dcd1eb29f0834e73b5037,2026-01-19 15:40:34 -0800,"Work on bead: gongdb-7jz - Investigate select4.test set operation mismatch [COMPLETED]",CHECKOUT_FAILED,0
+9e876e0ebb255b374e60ebe0a7add3dfd2ea543f,2026-01-19 15:59:35 -0800,"Work on bead: gongdb-3gr - Re-enable SELECT predicate planning safely [COMPLETED]",CHECKOUT_FAILED,0
+4520115430def0521c8a7ab5fdd82b4150668c93,2026-01-19 16:26:44 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+43128b56d854138aa98494007265a60391991583,2026-01-19 16:38:29 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+21c871b98650966672736f5a751eaefe4716bf67,2026-01-19 16:41:56 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+84a159c0cb06064adceebd8c650293d66d10b8c3,2026-01-19 16:51:41 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+8f979ced380a1042a46e26eb4e8ebf03c7b9ca97,2026-01-19 16:58:30 -0800,"Work on bead: gongdb-3tx - Reduce TPCC load/index update overhead [COMPLETED]",CHECKOUT_FAILED,0
+479f23b3d01e30edee36712d88d39c3e89843427,2026-01-19 17:06:34 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+c1474aa1f920fa8b7fcbb7344b9dd68916e6b939,2026-01-19 17:10:02 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+2467fc9cecad6b3820f2214403532102bc94ecc4,2026-01-19 17:16:43 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+583b58e0f925774fa643c9ecadcff38bd4ccc0d0,2026-01-19 17:22:30 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+4e62c92954310d30f860cececeef8b96b44a6d74,2026-01-19 17:31:06 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+47dffc36975260913efa75c3a7752f1feada158f,2026-01-19 17:35:37 -0800,"Work on bead: gongdb-2t5 - Auto-index or query-specific index for orders customer lookup [COMPLETED]",CHECKOUT_FAILED,0
+6877d89638902737e757a875a6aeb357ef81a6f2,2026-01-19 17:41:24 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+11d2e415db6b5022a5be8734d0efc0b9144f17dd,2026-01-19 17:57:40 -0800,"Work on bead: gongdb-4ou - Add normalized statement cache for literal-heavy SQL [COMPLETED]",CHECKOUT_FAILED,0
+6320f72fe481ee5d392cead7a9ce763663585130,2026-01-19 18:02:42 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+c510a766c66d5af297c06307c20118fe35825e30,2026-01-19 18:06:40 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+a4ad63c0e8a3c07369c87f2de63d54ff95001c82,2026-01-19 18:20:02 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+de973d6dfd3a544032edb55800d426b6610970e6,2026-01-19 18:26:45 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+3240eedb7144da5abff37d6f8e26e4ad24d1338a,2026-01-19 18:31:59 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+730b3937cc9121a78b981eb374bd2ab241deea42,2026-01-19 18:36:22 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+c1dc4706c4774051e0744fb8360cc837a12832c2,2026-01-19 18:41:28 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+aaf95bd99912369bc7730d03086fa74743b0f8ca,2026-01-19 18:44:00 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+739e8daf62c70ce3a5be2fdfebc68d2d0d392e08,2026-01-19 18:46:32 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+1c835171a1ef839343fb53b0c61abe4e026146cc,2026-01-19 18:50:00 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+2092253adae545f714dbd6b3b19232fe382267ad,2026-01-19 18:54:53 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+de0c8a323f782778e3aed45545edf3a85a46c6c6,2026-01-19 19:01:06 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+01092f4f27aa8d82d6f25faca2c2d81cedb2cbbd,2026-01-19 19:09:04 -0800,"Work on bead: gongdb-4ee - Optimize in-memory page mutation to avoid page cloning [COMPLETED]",CHECKOUT_FAILED,0
+b7bde91a1a836c6c8121b9d997cfe733ac9a558e,2026-01-19 19:15:17 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+147d45199ff460fe276e3632ebfb7430f897c467,2026-01-19 19:21:54 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+1382355f7bf5e48049728d0470e8e01e6e845a24,2026-01-19 19:28:35 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+6f0919a848b92a9f12724e425108f48b91ecd6b3,2026-01-19 19:33:03 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+491093d3f799c263af9e1b5ea1a1c2b44b9c38e7,2026-01-19 19:42:18 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+575fbdeaa337a9439c6ef3753cbc31db76d11e56,2026-01-19 19:49:09 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+c09b48294a027864f856660f10a3fb6f75474f2b,2026-01-19 19:53:46 -0800,"",CHECKOUT_FAILED,0
+eba1a19ad7840bf0c8271f54c3d02994e4fc26c0,2026-01-19 20:00:34 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+2bcc14fd492c4dc264967353776a6050a956f7ec,2026-01-19 20:08:09 -0800,"Work on bead: gongdb-3wz - Investigate new order bottleneck with prepared/normalized execution [COMPLETED]",CHECKOUT_FAILED,0
+9ca564f76cc8f58583f6f7f86af2c52631619e4c,2026-01-19 20:12:36 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+5403a30459313b366477f4dfad6fb0d7a1fb2cf3,2026-01-19 20:17:54 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+36aa9d2d2b216f1fe3c2e6a7e30e04bc5de68818,2026-01-19 20:23:50 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+4e9a2788d624553e62c2841f44b927adf90b09c6,2026-01-19 20:31:18 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+0d80f25bf7a4f91b1688cf1af5e852aaebd366ca,2026-01-19 20:35:33 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+e0c46cc21889fcd79bbdd63762d8166671397372,2026-01-19 20:41:27 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+573e82f1b70753b6dc10d29cefb29950f9116545,2026-01-19 21:15:56 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [IN PROGRESS]",CHECKOUT_FAILED,0
+7328fff99728bb603fe0cb53a84d5b3af08bbbc0,2026-01-19 21:35:49 -0800,"Work on bead: gongdb-4v4 - Make gongdb <5x slower than rusqlite on TPCC [COMPLETED]",CHECKOUT_FAILED,0
+783bf97c6d6fb3bb47d725a3da17f9f7f5785682,2026-01-19 21:42:37 -0800,"Work on bead: gongdb-4zc - Fast-path UPDATE execution for TPCC patterns [COMPLETED]",CHECKOUT_FAILED,0
+feda83e796949e7ad6f78ed35aa6c2352d0b38b1,2026-01-19 21:49:36 -0800,"Work on bead: gongdb-5dq - Batch/defer index updates for TPCC load [COMPLETED]",CHECKOUT_FAILED,0
+403708c91476f628a5d8604316c74da2e351580f,2026-01-19 21:54:05 -0800,"Work on bead: gongdb-6ai - Reduce GongDB insert/update overhead for TPCC [COMPLETED]",CHECKOUT_FAILED,0
+a8433db875a311c3d0b538f0365e06553de07226,2026-01-19 22:00:27 -0800,"Work on bead: gongdb-6il - Add index-driven join lookups for equality joins [COMPLETED]",CHECKOUT_FAILED,0
+518e29682b20c6379880a9b998b1a5513c97bff3,2026-01-19 22:14:23 -0800,"Work on bead: gongdb-6k1 - Normalized statement cache for TPCC [COMPLETED]",CHECKOUT_FAILED,0
+99ed1227d5fe9190f50293c0348b858c295afc23,2026-01-19 22:19:09 -0800,"Work on bead: gongdb-9hm - Fast SELECT path for simple equality queries [COMPLETED]",CHECKOUT_FAILED,0
+dbe96980cccd639479d24822a39d8fc39c94fd8e,2026-01-19 22:30:19 -0800,"Work on bead: gongdb-aca - Optimize TPCC new order update/insert path [COMPLETED]",CHECKOUT_FAILED,0
+bb2dd79679fc6f6918bb1687202f50cc045637ac,2026-01-19 22:42:47 -0800,"Work on bead: gongdb-at8 - Optimize TPCC stock level query [IN PROGRESS]",CHECKOUT_FAILED,0
+fbe938c59b58bf32a1a7b89d0a516a44eb388fef,2026-01-19 22:56:26 -0800,"Work on bead: gongdb-at8 - Optimize TPCC stock level query [IN PROGRESS]",CHECKOUT_FAILED,0
+f8646fcd9a2ba59b6b907ba9fe678562696f8f0b,2026-01-19 23:11:15 -0800,"Work on bead: gongdb-at8 - Optimize TPCC stock level query [IN PROGRESS]",CHECKOUT_FAILED,0
+de8e8d87c474992f39409e062f9532cb960d6b36,2026-01-19 23:23:29 -0800,"Work on bead: gongdb-at8 - Optimize TPCC stock level query [COMPLETED]",CHECKOUT_FAILED,0
+882fe333daa98c03dbd0e49cbdddc492c6e6d286,2026-01-19 23:40:07 -0800,"Work on bead: gongdb-bez - Investigate normalized statement cache for dynamic TPCC SQL [COMPLETED]",CHECKOUT_FAILED,0
+fa999055ffd8bc98b4d8f97833925adc94685c66,2026-01-19 23:47:28 -0800,"Work on bead: gongdb-cuc - Cut TPCC statement overhead [COMPLETED]",CHECKOUT_FAILED,0
+897671423181194c5c09603520101bcd17d19709,2026-01-19 23:51:16 -0800,"Work on bead: gongdb-gq9 - Defer/batch index maintenance for bulk inserts [COMPLETED]",CHECKOUT_FAILED,0
+88f8e3f0f554de3ffcf781790654b697cfb1475f,2026-01-19 23:54:37 -0800,"Work on bead: gongdb-o7u - Reduce per-row insert overhead during bulk loads [COMPLETED]",FAIL,4.0
+52e0597d0434eb6039e6048ba402a6cf6be1dc6c,2026-01-20 00:02:33 -0800,"Work on bead: gongdb-rvt - Investigate deferred/batched index maintenance for TPCC new order [COMPLETED]",FAIL,3.0

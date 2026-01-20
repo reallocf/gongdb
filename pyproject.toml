@@ -3,6 +3,9 @@ name = "gongdb"
 version = "0.1.0"
 description = "Build GongDB - Database implementation from scratch in Rust"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+]
 
 [tool.uv]
