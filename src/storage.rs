@@ -2336,6 +2336,16 @@ impl StorageEngine {
             .remove(index_name)
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
         let mut start = 0usize;
+        if entries.len() == 1 {
+            if !self.try_append_index_entry(&mut index, &entries[0])? {
+                self.insert_index_record_btree(&mut index, &entries[0])?;
+            }
+            if index.unique && matches!(self.mode, StorageMode::InMemory { .. }) {
+                self.cache_unique_index_entry(&index, &entries[0])?;
+            }
+            self.indexes.insert(index_name.to_string(), index);
+            return Ok(());
+        }
         if entries.len() > 1 {
             if let Some(first_unappended) = self.try_append_index_entries_batch(&mut index, entries)? {
                 start = first_unappended;
@@ -2344,17 +2354,60 @@ impl StorageEngine {
                 return Ok(());
             }
         }
-        for entry in &entries[start..] {
-            if !self.try_append_index_entry(&mut index, entry)? {
-                self.insert_index_record_btree(&mut index, entry)?;
-            }
-        }
+        self.insert_index_entries_leaf_batch(&mut index, &entries[start..])?;
         if index.unique && matches!(self.mode, StorageMode::InMemory { .. }) {
             for entry in entries {
                 self.cache_unique_index_entry(&index, entry)?;
             }
         }
         self.indexes.insert(index_name.to_string(), index);
+        Ok(())
+    }
+
+    fn insert_index_entries_leaf_batch(
+        &mut self,
+        index: &mut IndexMeta,
+        entries: &[IndexEntry],
+    ) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut leaf_groups: HashMap<u32, Vec<IndexEntry>> = HashMap::new();
+        for entry in entries {
+            let leaf_id = self.btree_find_leaf(index.first_page, Some(&entry.key))?;
+            leaf_groups
+                .entry(leaf_id)
+                .or_default()
+                .push(entry.clone());
+        }
+        for (leaf_id, group_entries) in leaf_groups {
+            if group_entries.len() == 1 {
+                self.insert_index_record_btree(index, &group_entries[0])?;
+                continue;
+            }
+            let page = self.read_page(leaf_id)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(StorageError::Corrupt(
+                    "invalid btree page type".to_string(),
+                ));
+            }
+            let next_leaf = get_next_page_id(&page);
+            let mut leaf_entries = read_leaf_entries(&page)?;
+            for entry in group_entries.iter().cloned() {
+                insert_leaf_entry_sorted(&mut leaf_entries, entry);
+            }
+            match build_leaf_page(&leaf_entries, next_leaf) {
+                Ok(new_page) => {
+                    self.write_page(leaf_id, &new_page)?;
+                }
+                Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                    for entry in &group_entries {
+                        self.insert_index_record_btree(index, entry)?;
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
         Ok(())
     }
 
