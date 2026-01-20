@@ -125,6 +125,9 @@ pub struct GongDB {
     insert_validation_cache: RefCell<HashMap<String, InsertValidationInfo>>,
     fast_stock_offsets_cache: RefCell<Option<FastStockOffsetsCache>>,
     fast_district_offsets_cache: RefCell<Option<FastDistrictOffsetsCache>>,
+    fast_warehouse_offsets_cache: RefCell<Option<FastWarehouseOffsetsCache>>,
+    fast_district_payment_offsets_cache: RefCell<Option<FastDistrictPaymentOffsetsCache>>,
+    fast_customer_payment_offsets_cache: RefCell<Option<FastCustomerPaymentOffsetsCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +180,33 @@ struct FastDistrictOffsetsCache {
     next_o_id: usize,
 }
 
+#[derive(Clone)]
+struct FastWarehouseOffsetsCache {
+    record_len: usize,
+    ytd: usize,
+}
+
+#[derive(Clone)]
+struct FastDistrictPaymentOffsetsCache {
+    record_len: usize,
+    ytd: usize,
+}
+
+#[derive(Clone)]
+struct FastCustomerPaymentOffsetsCache {
+    record_len: usize,
+    balance: usize,
+    ytd_payment: usize,
+    payment_cnt: usize,
+}
+
+#[derive(Clone)]
+struct FastCustomerPaymentOffsets {
+    balance: usize,
+    ytd_payment: usize,
+    payment_cnt: usize,
+}
+
 impl GongDB {
     const STATEMENT_CACHE_LIMIT: usize = 128;
 
@@ -206,6 +236,9 @@ impl GongDB {
             insert_validation_cache: RefCell::new(HashMap::new()),
             fast_stock_offsets_cache: RefCell::new(None),
             fast_district_offsets_cache: RefCell::new(None),
+            fast_warehouse_offsets_cache: RefCell::new(None),
+            fast_district_payment_offsets_cache: RefCell::new(None),
+            fast_customer_payment_offsets_cache: RefCell::new(None),
         })
     }
 
@@ -235,6 +268,9 @@ impl GongDB {
             insert_validation_cache: RefCell::new(HashMap::new()),
             fast_stock_offsets_cache: RefCell::new(None),
             fast_district_offsets_cache: RefCell::new(None),
+            fast_warehouse_offsets_cache: RefCell::new(None),
+            fast_district_payment_offsets_cache: RefCell::new(None),
+            fast_customer_payment_offsets_cache: RefCell::new(None),
         })
     }
 
@@ -245,6 +281,9 @@ impl GongDB {
         self.insert_validation_cache.borrow_mut().clear();
         self.fast_stock_offsets_cache.borrow_mut().take();
         self.fast_district_offsets_cache.borrow_mut().take();
+        self.fast_warehouse_offsets_cache.borrow_mut().take();
+        self.fast_district_payment_offsets_cache.borrow_mut().take();
+        self.fast_customer_payment_offsets_cache.borrow_mut().take();
     }
 
     fn table_indexes_cached(&self, table_name: &str) -> Vec<IndexMeta> {
@@ -514,6 +553,58 @@ impl GongDB {
         for (quantity, ytd, w_id, i_id, remote) in updates {
             self.run_fast_stock_update(*quantity, *ytd, *w_id, *i_id, *remote)?;
         }
+        Ok(DBOutput::StatementComplete(0))
+    }
+
+    /// Fast path for TPC-C payment updates without SQL parsing.
+    pub fn run_fast_payment(
+        &mut self,
+        payment: f64,
+        w_id: i64,
+        d_id: i64,
+        c_w_id: i64,
+        c_d_id: i64,
+        c_id: i64,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(result) = self.apply_fast_payment(payment, w_id, d_id, c_w_id, c_d_id, c_id) {
+            return result;
+        }
+        let params = [Literal::Float(payment), Literal::Integer(w_id)];
+        self.run_statement_with_params(
+            "UPDATE warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?",
+            &params,
+        )?;
+        let params = [
+            Literal::Float(payment),
+            Literal::Integer(w_id),
+            Literal::Integer(d_id),
+        ];
+        self.run_statement_with_params(
+            "UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?",
+            &params,
+        )?;
+        let params = [
+            Literal::Float(payment),
+            Literal::Float(payment),
+            Literal::Integer(c_w_id),
+            Literal::Integer(c_d_id),
+            Literal::Integer(c_id),
+        ];
+        self.run_statement_with_params(
+            "UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+            &params,
+        )?;
+        self.run_statement_with_params(
+            "INSERT INTO history VALUES (?, ?, ?, ?, ?, '2024-01-01', ?, 'Payment history data')",
+            &[
+                Literal::Integer(c_id),
+                Literal::Integer(c_d_id),
+                Literal::Integer(c_w_id),
+                Literal::Integer(d_id),
+                Literal::Integer(w_id),
+                Literal::Float(payment),
+            ],
+        )?;
         Ok(DBOutput::StatementComplete(0))
     }
 
@@ -2168,6 +2259,280 @@ impl GongDB {
         if applied {
             self.select_cache.borrow_mut().clear();
             self.invalidate_table_stats("district");
+        }
+        Some(Ok(DBOutput::StatementComplete(0)))
+    }
+
+    fn apply_fast_payment(
+        &mut self,
+        payment: f64,
+        w_id: i64,
+        d_id: i64,
+        c_w_id: i64,
+        c_d_id: i64,
+        c_id: i64,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let warehouse_indexes = self.table_indexes_cached("warehouse");
+        let warehouse_index = fast_find_index_prefix(&warehouse_indexes, &["w_id"])?;
+        if !warehouse_index.unique {
+            return None;
+        }
+        let district_indexes = self.table_indexes_cached("district");
+        let district_index = fast_find_index_prefix(&district_indexes, &["d_w_id", "d_id"])?;
+        if !district_index.unique {
+            return None;
+        }
+        let customer_indexes = self.table_indexes_cached("customer");
+        let customer_index =
+            fast_find_index_prefix(&customer_indexes, &["c_w_id", "c_d_id", "c_id"])?;
+        if !customer_index.unique {
+            return None;
+        }
+        let mut fallback_needed = false;
+
+        let warehouse_key = vec![Value::Integer(w_id)];
+        let warehouse_location = match self
+            .storage
+            .scan_index_first_location(&warehouse_index.name, &warehouse_key)
+        {
+            Ok(Some(location)) => location,
+            Ok(None) => return None,
+            Err(err) => return Some(Err(err.into())),
+        };
+        let cached_snapshot = self.fast_warehouse_offsets_cache.borrow().clone();
+        let mut cache_update: Option<FastWarehouseOffsetsCache> = None;
+        let warehouse_applied = match self.storage.update_record_at_with(warehouse_location, |record| {
+            let cached = cached_snapshot
+                .as_ref()
+                .and_then(|cache| if cache.record_len == record.len() { Some(cache.ytd) } else { None });
+            let offset = match cached {
+                Some(offset) => offset,
+                None => match fast_warehouse_ytd_offset(record) {
+                    Ok(Some(offset)) => {
+                        cache_update = Some(FastWarehouseOffsetsCache {
+                            record_len: record.len(),
+                            ytd: offset,
+                        });
+                        offset
+                    }
+                    Ok(None) => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                },
+            };
+            if record[offset] != 2 {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            let current = match read_f64_at(record, offset + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            };
+            let next = current + payment;
+            if write_f64_at(record, offset + 1, next).is_none() {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            Ok(true)
+        }) {
+            Ok(applied) => applied,
+            Err(StorageError::NotFound(msg)) if msg == "row deleted" => return None,
+            Err(err) => return Some(Err(err.into())),
+        };
+        if fallback_needed {
+            return None;
+        }
+        if let Some(update) = cache_update {
+            self.fast_warehouse_offsets_cache
+                .borrow_mut()
+                .replace(update);
+        }
+
+        let district_key = vec![Value::Integer(w_id), Value::Integer(d_id)];
+        let district_location = match self
+            .storage
+            .scan_index_first_location(&district_index.name, &district_key)
+        {
+            Ok(Some(location)) => location,
+            Ok(None) => return None,
+            Err(err) => return Some(Err(err.into())),
+        };
+        let cached_snapshot = self.fast_district_payment_offsets_cache.borrow().clone();
+        let mut cache_update: Option<FastDistrictPaymentOffsetsCache> = None;
+        let district_applied = match self.storage.update_record_at_with(district_location, |record| {
+            let cached = cached_snapshot
+                .as_ref()
+                .and_then(|cache| if cache.record_len == record.len() { Some(cache.ytd) } else { None });
+            let offset = match cached {
+                Some(offset) => offset,
+                None => match fast_district_ytd_offset(record) {
+                    Ok(Some(offset)) => {
+                        cache_update = Some(FastDistrictPaymentOffsetsCache {
+                            record_len: record.len(),
+                            ytd: offset,
+                        });
+                        offset
+                    }
+                    Ok(None) => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                },
+            };
+            if record[offset] != 2 {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            let current = match read_f64_at(record, offset + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            };
+            let next = current + payment;
+            if write_f64_at(record, offset + 1, next).is_none() {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            Ok(true)
+        }) {
+            Ok(applied) => applied,
+            Err(StorageError::NotFound(msg)) if msg == "row deleted" => return None,
+            Err(err) => return Some(Err(err.into())),
+        };
+        if fallback_needed {
+            return None;
+        }
+        if let Some(update) = cache_update {
+            self.fast_district_payment_offsets_cache
+                .borrow_mut()
+                .replace(update);
+        }
+
+        let customer_key = vec![
+            Value::Integer(c_w_id),
+            Value::Integer(c_d_id),
+            Value::Integer(c_id),
+        ];
+        let customer_location = match self
+            .storage
+            .scan_index_first_location(&customer_index.name, &customer_key)
+        {
+            Ok(Some(location)) => location,
+            Ok(None) => return None,
+            Err(err) => return Some(Err(err.into())),
+        };
+        let cached_snapshot = self.fast_customer_payment_offsets_cache.borrow().clone();
+        let mut cache_update: Option<FastCustomerPaymentOffsetsCache> = None;
+        let customer_applied = match self.storage.update_record_at_with(customer_location, |record| {
+            let cached = cached_snapshot.as_ref().and_then(|cache| {
+                if cache.record_len == record.len() {
+                    Some(cache.clone())
+                } else {
+                    None
+                }
+            });
+            let offsets = match cached {
+                Some(offsets) => FastCustomerPaymentOffsets {
+                    balance: offsets.balance,
+                    ytd_payment: offsets.ytd_payment,
+                    payment_cnt: offsets.payment_cnt,
+                },
+                None => match fast_customer_payment_offsets(record) {
+                    Ok(Some(offsets)) => {
+                        cache_update = Some(FastCustomerPaymentOffsetsCache {
+                            record_len: record.len(),
+                            balance: offsets.balance,
+                            ytd_payment: offsets.ytd_payment,
+                            payment_cnt: offsets.payment_cnt,
+                        });
+                        offsets
+                    }
+                    Ok(None) => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                },
+            };
+            if record[offsets.balance] != 2
+                || record[offsets.ytd_payment] != 2
+                || record[offsets.payment_cnt] != 1
+            {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            let current_balance = match read_f64_at(record, offsets.balance + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            };
+            let current_ytd = match read_f64_at(record, offsets.ytd_payment + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            };
+            let current_cnt = match read_i64_at(record, offsets.payment_cnt + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            };
+            let next_balance = current_balance - payment;
+            let next_ytd = current_ytd + payment;
+            let next_cnt = current_cnt.wrapping_add(1);
+            if write_f64_at(record, offsets.balance + 1, next_balance).is_none()
+                || write_f64_at(record, offsets.ytd_payment + 1, next_ytd).is_none()
+                || write_i64_at(record, offsets.payment_cnt + 1, next_cnt).is_none()
+            {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            Ok(true)
+        }) {
+            Ok(applied) => applied,
+            Err(StorageError::NotFound(msg)) if msg == "row deleted" => return None,
+            Err(err) => return Some(Err(err.into())),
+        };
+        if fallback_needed {
+            return None;
+        }
+        if let Some(update) = cache_update {
+            self.fast_customer_payment_offsets_cache
+                .borrow_mut()
+                .replace(update);
+        }
+
+        if warehouse_applied || district_applied || customer_applied {
+            self.select_cache.borrow_mut().clear();
+            self.invalidate_table_stats("warehouse");
+            self.invalidate_table_stats("district");
+            self.invalidate_table_stats("customer");
+        }
+        let history_row = vec![vec![
+            Value::Integer(c_id),
+            Value::Integer(c_d_id),
+            Value::Integer(c_w_id),
+            Value::Integer(d_id),
+            Value::Integer(w_id),
+            Value::Text("2024-01-01".to_string()),
+            Value::Real(payment),
+            Value::Text("Payment history data".to_string()),
+        ]];
+        if let Err(err) = self.run_fast_insert_rows("history", history_row) {
+            return Some(Err(err));
         }
         Some(Ok(DBOutput::StatementComplete(0)))
     }
@@ -7750,6 +8115,91 @@ fn fast_district_next_o_id_offset(record: &[u8]) -> Result<Option<usize>, GongDB
     Ok(None)
 }
 
+fn fast_warehouse_ytd_offset(record: &[u8]) -> Result<Option<usize>, GongDBError> {
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    if count <= 8 {
+        return Ok(None);
+    }
+    let mut pos = 2usize;
+    for col_idx in 0..count {
+        if col_idx == 8 {
+            return Ok(Some(pos));
+        }
+        let len = crate::storage::value_length_at(record, pos).map_err(GongDBError::Storage)?;
+        pos = pos.saturating_add(len);
+    }
+    Ok(None)
+}
+
+fn fast_district_ytd_offset(record: &[u8]) -> Result<Option<usize>, GongDBError> {
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    if count <= 9 {
+        return Ok(None);
+    }
+    let mut pos = 2usize;
+    for col_idx in 0..count {
+        if col_idx == 9 {
+            return Ok(Some(pos));
+        }
+        let len = crate::storage::value_length_at(record, pos).map_err(GongDBError::Storage)?;
+        pos = pos.saturating_add(len);
+    }
+    Ok(None)
+}
+
+fn fast_customer_payment_offsets(
+    record: &[u8],
+) -> Result<Option<FastCustomerPaymentOffsets>, GongDBError> {
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    if count <= 18 {
+        return Ok(None);
+    }
+    let mut pos = 2usize;
+    let mut balance = None;
+    let mut ytd_payment = None;
+    let mut payment_cnt = None;
+    for col_idx in 0..count {
+        if col_idx == 16 {
+            balance = Some(pos);
+        } else if col_idx == 17 {
+            ytd_payment = Some(pos);
+        } else if col_idx == 18 {
+            payment_cnt = Some(pos);
+        }
+        let len = crate::storage::value_length_at(record, pos).map_err(GongDBError::Storage)?;
+        pos = pos.saturating_add(len);
+        if col_idx >= 18 && balance.is_some() && ytd_payment.is_some() && payment_cnt.is_some() {
+            break;
+        }
+    }
+    let balance = match balance {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let ytd_payment = match ytd_payment {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let payment_cnt = match payment_cnt {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    Ok(Some(FastCustomerPaymentOffsets {
+        balance,
+        ytd_payment,
+        payment_cnt,
+    }))
+}
+
 fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> bool {
     for (idx, value) in predicates {
         if !values_equal(&row[*idx], value) {
@@ -7977,6 +8427,15 @@ fn read_f64_at(record: &[u8], pos: usize) -> Option<f64> {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&record[pos..end]);
     Some(f64::from_le_bytes(buf))
+}
+
+fn write_f64_at(record: &mut [u8], pos: usize, value: f64) -> Option<()> {
+    let end = pos.checked_add(8)?;
+    if end > record.len() {
+        return None;
+    }
+    record[pos..end].copy_from_slice(&value.to_le_bytes());
+    Some(())
 }
 
 fn fast_select_eq_index<'a>(

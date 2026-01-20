@@ -1123,45 +1123,13 @@ fn run_payment(
     
     db.run_statement("BEGIN TRANSACTION")?;
     
-    // Update warehouse (always local warehouse)
-    db.run_statement_with_params(
-        "UPDATE warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?",
-        &[Literal::Float(payment), Literal::Integer(w_id as i64)],
-    )?;
-    
-    // Update district (always local district)
-    db.run_statement_with_params(
-        "UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?",
-        &[
-            Literal::Float(payment),
-            Literal::Integer(w_id as i64),
-            Literal::Integer(d_id as i64),
-        ],
-    )?;
-    
-    // Update customer (may be remote)
-    db.run_statement_with_params(
-        "UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
-        &[
-            Literal::Float(payment),
-            Literal::Float(payment),
-            Literal::Integer(c_w_id as i64),
-            Literal::Integer(c_d_id as i64),
-            Literal::Integer(c_id as i64),
-        ],
-    )?;
-    
-    // Insert into history table (TPC-C spec requirement)
-    db.run_statement_with_params(
-        "INSERT INTO history VALUES (?, ?, ?, ?, ?, '2024-01-01', ?, 'Payment history data')",
-        &[
-            Literal::Integer(c_id as i64),
-            Literal::Integer(c_d_id as i64),
-            Literal::Integer(c_w_id as i64),
-            Literal::Integer(d_id as i64),
-            Literal::Integer(w_id as i64),
-            Literal::Float(payment),
-        ],
+    db.run_fast_payment(
+        payment,
+        w_id as i64,
+        d_id as i64,
+        c_w_id as i64,
+        c_d_id as i64,
+        c_id as i64,
     )?;
     
     db.run_statement("COMMIT")?;
