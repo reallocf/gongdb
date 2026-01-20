@@ -3183,30 +3183,6 @@ impl GongDB {
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let trimmed = sql.trim();
         if trimmed.eq_ignore_ascii_case(
-            "SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
-        ) {
-            if params.len() != 3 {
-                return Some(Err(GongDBError::new("parameter count mismatch")));
-            }
-            let plan = FastSelectPlan {
-                table: "customer".to_string(),
-                columns: vec![
-                    "c_balance".to_string(),
-                    "c_first".to_string(),
-                    "c_middle".to_string(),
-                    "c_last".to_string(),
-                ],
-                predicates: vec![
-                    ("c_w_id".to_string(), literal_to_value(&params[0])),
-                    ("c_d_id".to_string(), literal_to_value(&params[1])),
-                    ("c_id".to_string(), literal_to_value(&params[2])),
-                ],
-                order_by: None,
-                limit: None,
-            };
-            return self.execute_fast_select_plan(plan);
-        }
-        if trimmed.eq_ignore_ascii_case(
             "SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_c_id = ? ORDER BY o_id DESC LIMIT 1",
         ) {
             if params.len() != 3 {
@@ -3231,6 +3207,11 @@ impl GongDB {
                 limit: Some(1),
             };
             return self.execute_fast_select_plan(plan);
+        }
+        match parse_fast_select_with_params(sql, params) {
+            Ok(Some(plan)) => return self.execute_fast_select_plan(plan),
+            Ok(None) => {}
+            Err(err) => return Some(Err(err)),
         }
         None
     }
@@ -3367,7 +3348,28 @@ impl GongDB {
             }
             rows
         } else {
-            return None;
+            let limit = plan.limit.unwrap_or(usize::MAX);
+            let mut rows = Vec::new();
+            let mut scan = match self.storage.table_scan(&table.name) {
+                Ok(scan) => scan,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            while let Some(result) = scan.next() {
+                let row = match result {
+                    Ok(row) => row,
+                    Err(err) => return Some(Err(GongDBError::from(err))),
+                };
+                if !predicate_indices.is_empty()
+                    && !fast_row_matches_predicates(&row, &predicate_indices)
+                {
+                    continue;
+                }
+                rows.push(row);
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+            rows
         };
 
         let limit = plan.limit.unwrap_or(rows.len());
@@ -7909,6 +7911,61 @@ fn parse_fast_select(sql: &str) -> Option<FastSelectPlan> {
     })
 }
 
+fn parse_fast_select_with_params(
+    sql: &str,
+    params: &[Literal],
+) -> Result<Option<FastSelectPlan>, GongDBError> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = match consume_fast_keyword(input, "SELECT") {
+        Some(rest) => rest,
+        None => return Ok(None),
+    };
+    let lower = rest.to_ascii_lowercase();
+    let from_idx = match lower.find(" from ") {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+    let columns_str = rest[..from_idx].trim();
+    if columns_str.is_empty() {
+        return Ok(None);
+    }
+    let columns = match parse_fast_ident_list(columns_str) {
+        Some(columns) => columns,
+        None => return Ok(None),
+    };
+    let mut rest = &rest[from_idx + 6..];
+    let (table, remainder) = match parse_fast_ident(rest) {
+        Some(result) => result,
+        None => return Ok(None),
+    };
+    rest = remainder;
+    let rest = match consume_fast_keyword(rest, "WHERE") {
+        Some(rest) => rest,
+        None => return Ok(None),
+    };
+    let mut param_pos = 0usize;
+    let predicates = match parse_fast_predicates_with_params(rest, params, &mut param_pos) {
+        Some(predicates) => predicates,
+        None => return Ok(None),
+    };
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+    if param_pos != params.len() {
+        return Err(GongDBError::new("parameter count mismatch"));
+    }
+    Ok(Some(FastSelectPlan {
+        table: table.to_string(),
+        columns,
+        predicates,
+        order_by: None,
+        limit: None,
+    }))
+}
+
 fn parse_fast_stock_level(sql: &str) -> Option<(i64, i64, i64, i64)> {
     let mut input = sql.trim();
     if let Some(stripped) = input.strip_suffix(';') {
@@ -8791,6 +8848,22 @@ fn parse_fast_param_value<'a>(
     parse_fast_value(rest)
 }
 
+fn parse_fast_param_literal<'a>(
+    input: &'a str,
+    params: &'a [Literal],
+    param_pos: &mut usize,
+) -> Option<(Value, &'a str)> {
+    let rest = input.trim_start();
+    if rest.starts_with('?') {
+        let idx = *param_pos;
+        let literal = params.get(idx)?;
+        *param_pos += 1;
+        let value = literal_to_value(literal);
+        return Some((value, &rest[1..]));
+    }
+    parse_fast_literal(rest)
+}
+
 fn parse_fast_predicates(input: &str) -> Option<Vec<(String, Value)>> {
     let mut rest = input.trim_start();
     let mut predicates = Vec::new();
@@ -8802,6 +8875,35 @@ fn parse_fast_predicates(input: &str) -> Option<Vec<(String, Value)>> {
         }
         remainder = &remainder[1..];
         let (value, after_value) = parse_fast_literal(remainder)?;
+        predicates.push((column.to_string(), value));
+        rest = after_value.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(next) = consume_fast_keyword(rest, "AND") {
+            rest = next;
+            continue;
+        }
+        return None;
+    }
+    Some(predicates)
+}
+
+fn parse_fast_predicates_with_params(
+    input: &str,
+    params: &[Literal],
+    param_pos: &mut usize,
+) -> Option<Vec<(String, Value)>> {
+    let mut rest = input.trim_start();
+    let mut predicates = Vec::new();
+    loop {
+        let (column, after_col) = parse_fast_ident(rest)?;
+        let mut remainder = after_col.trim_start();
+        if !remainder.starts_with('=') {
+            return None;
+        }
+        remainder = &remainder[1..];
+        let (value, after_value) = parse_fast_param_literal(remainder, params, param_pos)?;
         predicates.push((column.to_string(), value));
         rest = after_value.trim_start();
         if rest.is_empty() {
