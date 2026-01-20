@@ -1276,16 +1276,24 @@ fn run_order_status(
     let c_id = (txn_id % customers_per_district) + 1;
     
     // Get customer info
-    db.run_statement(&format!(
-        "SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}",
-        w_id, d_id, c_id
-    ))?;
+    db.run_statement_with_params(
+        "SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+        &[
+            Literal::Integer(w_id as i64),
+            Literal::Integer(d_id as i64),
+            Literal::Integer(c_id as i64),
+        ],
+    )?;
     
     // Get last order
-    db.run_statement(&format!(
-        "SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = {} AND o_d_id = {} AND o_c_id = {} ORDER BY o_id DESC LIMIT 1",
-        w_id, d_id, c_id
-    ))?;
+    db.run_statement_with_params(
+        "SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_c_id = ? ORDER BY o_id DESC LIMIT 1",
+        &[
+            Literal::Integer(w_id as i64),
+            Literal::Integer(d_id as i64),
+            Literal::Integer(c_id as i64),
+        ],
+    )?;
     
     Ok(())
 }
@@ -1366,10 +1374,16 @@ fn run_stock_level(
     let next_o_id = 3001 + (txn_id % 1000); // Simulated - in real implementation would read from district
     
     // TPC-C spec: Count distinct items from last 20 orders where stock < threshold
-    db.run_statement(&format!(
-        "SELECT COUNT(DISTINCT ol_i_id) FROM order_line, stock WHERE ol_w_id = {} AND ol_d_id = {} AND ol_o_id >= {} - 20 AND ol_o_id < {} AND s_w_id = ol_w_id AND s_i_id = ol_i_id AND s_quantity < {}",
-        w_id, d_id, next_o_id, next_o_id, threshold
-    ))?;
+    db.run_statement_with_params(
+        "SELECT COUNT(DISTINCT ol_i_id) FROM order_line, stock WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id >= ? - 20 AND ol_o_id < ? AND s_w_id = ol_w_id AND s_i_id = ol_i_id AND s_quantity < ?",
+        &[
+            Literal::Integer(w_id as i64),
+            Literal::Integer(d_id as i64),
+            Literal::Integer(next_o_id as i64),
+            Literal::Integer(next_o_id as i64),
+            Literal::Integer(threshold as i64),
+        ],
+    )?;
     
     Ok(())
 }
@@ -1479,10 +1493,19 @@ fn run_delivery(
         )?;
         
         // TPC-C spec: Update customer balance (add sum of ol_amount) and delivery count
-        db.run_statement(&format!(
-            "UPDATE customer SET c_balance = c_balance + (SELECT COALESCE(SUM(ol_amount), 0) FROM order_line WHERE ol_w_id = {} AND ol_d_id = {} AND ol_o_id = {}), c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = {} AND c_d_id = {} AND c_id = (SELECT o_c_id FROM orders WHERE o_w_id = {} AND o_d_id = {} AND o_id = {})",
-            w_id, d_id, o_id, w_id, d_id, w_id, d_id, o_id
-        ))?;
+        db.run_statement_with_params(
+            "UPDATE customer SET c_balance = c_balance + (SELECT COALESCE(SUM(ol_amount), 0) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?), c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = (SELECT o_c_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?)",
+            &[
+                Literal::Integer(w_id as i64),
+                Literal::Integer(d_id as i64),
+                Literal::Integer(o_id as i64),
+                Literal::Integer(w_id as i64),
+                Literal::Integer(d_id as i64),
+                Literal::Integer(w_id as i64),
+                Literal::Integer(d_id as i64),
+                Literal::Integer(o_id as i64),
+            ],
+        )?;
     }
     
     db.run_statement("COMMIT")?;

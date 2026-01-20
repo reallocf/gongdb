@@ -542,6 +542,15 @@ impl GongDB {
         sql: &str,
         params: &[Literal],
     ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(result) = self.try_fast_select_params(sql, params) {
+            return result;
+        }
+        if let Some(result) = self.try_fast_stock_level_params(sql, params) {
+            return result;
+        }
+        if let Some(result) = self.try_fast_delivery_customer_update_params(sql, params) {
+            return result;
+        }
         if let Some(result) = self.try_fast_delivery_params(sql, params) {
             return result;
         }
@@ -1745,51 +1754,107 @@ impl GongDB {
         sql: &str,
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let (w_id, d_id, o_id) = parse_fast_delivery_customer_update(sql)?;
-        let orders = self.storage.get_table("orders")?.clone();
-        let order_line = self.storage.get_table("order_line")?.clone();
-        let customer = self.storage.get_table("customer")?.clone();
+        Some(self.apply_fast_delivery_customer_update(w_id, d_id, o_id))
+    }
+
+    fn try_fast_delivery_customer_update_params(
+        &mut self,
+        sql: &str,
+        params: &[Literal],
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let trimmed = sql.trim();
+        if trimmed.eq_ignore_ascii_case(
+            "UPDATE customer SET c_balance = c_balance + (SELECT COALESCE(SUM(ol_amount), 0) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?), c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = (SELECT o_c_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?)",
+        ) {
+            if params.len() != 8 {
+                return Some(Err(GongDBError::new("parameter count mismatch")));
+            }
+            let w_id = literal_to_i64(&params[0])?;
+            let d_id = literal_to_i64(&params[1])?;
+            let o_id = literal_to_i64(&params[2])?;
+            let c_w_id = literal_to_i64(&params[3])?;
+            let c_d_id = literal_to_i64(&params[4])?;
+            let o_w_id = literal_to_i64(&params[5])?;
+            let o_d_id = literal_to_i64(&params[6])?;
+            let o_id2 = literal_to_i64(&params[7])?;
+            if w_id != c_w_id || w_id != o_w_id || d_id != c_d_id || d_id != o_d_id || o_id != o_id2
+            {
+                return None;
+            }
+            return Some(self.apply_fast_delivery_customer_update(w_id, d_id, o_id));
+        }
+        None
+    }
+
+    fn apply_fast_delivery_customer_update(
+        &mut self,
+        w_id: i64,
+        d_id: i64,
+        o_id: i64,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        let orders = self
+            .storage
+            .get_table("orders")
+            .ok_or_else(|| GongDBError::new("no such table: orders"))?
+            .clone();
+        let order_line = self
+            .storage
+            .get_table("order_line")
+            .ok_or_else(|| GongDBError::new("no such table: order_line"))?
+            .clone();
+        let customer = self
+            .storage
+            .get_table("customer")
+            .ok_or_else(|| GongDBError::new("no such table: customer"))?
+            .clone();
 
         let orders_idx = self.column_index_map_cached(&orders);
         let customer_idx = self.column_index_map_cached(&customer);
-        let o_c_id_idx = *orders_idx.get("o_c_id")?;
-        let c_balance_idx = *customer_idx.get("c_balance")?;
-        let c_delivery_cnt_idx = *customer_idx.get("c_delivery_cnt")?;
+        let o_c_id_idx = *orders_idx
+            .get("o_c_id")
+            .ok_or_else(|| GongDBError::new("no such column: o_c_id"))?;
+        let c_balance_idx = *customer_idx
+            .get("c_balance")
+            .ok_or_else(|| GongDBError::new("no such column: c_balance"))?;
+        let c_delivery_cnt_idx = *customer_idx
+            .get("c_delivery_cnt")
+            .ok_or_else(|| GongDBError::new("no such column: c_delivery_cnt"))?;
 
         let orders_indexes = self.table_indexes_cached(&orders.name);
         let order_line_indexes = self.table_indexes_cached(&order_line.name);
         let customer_indexes = self.table_indexes_cached(&customer.name);
 
-        let orders_index = fast_find_index_prefix(&orders_indexes, &["o_w_id", "o_d_id", "o_id"])?;
+        let orders_index =
+            fast_find_index_prefix(&orders_indexes, &["o_w_id", "o_d_id", "o_id"])
+                .ok_or_else(|| GongDBError::new("missing orders index"))?;
         let order_line_index =
-            fast_find_index_prefix(&order_line_indexes, &["ol_w_id", "ol_d_id", "ol_o_id"])?;
+            fast_find_index_prefix(&order_line_indexes, &["ol_w_id", "ol_d_id", "ol_o_id"])
+                .ok_or_else(|| GongDBError::new("missing order_line index"))?;
         let customer_index =
-            fast_find_index_prefix(&customer_indexes, &["c_w_id", "c_d_id", "c_id"])?;
+            fast_find_index_prefix(&customer_indexes, &["c_w_id", "c_d_id", "c_id"])
+                .ok_or_else(|| GongDBError::new("missing customer index"))?;
 
         let order_key = vec![
             Value::Integer(w_id),
             Value::Integer(d_id),
             Value::Integer(o_id),
         ];
-        let order_location = match self
+        let order_location = self
             .storage
-            .scan_index_first_location(&orders_index.name, &order_key)
-        {
-            Ok(location) => location,
-            Err(err) => return Some(Err(GongDBError::from(err))),
-        };
+            .scan_index_first_location(&orders_index.name, &order_key)?;
         let order_location = match order_location {
             Some(location) => location,
-            None => return Some(Ok(DBOutput::StatementComplete(0))),
+            None => return Ok(DBOutput::StatementComplete(0)),
         };
         let order_row = match self.storage.read_row_at(&order_location) {
             Ok(row) => row,
-            Err(StorageError::NotFound(_)) => return Some(Ok(DBOutput::StatementComplete(0))),
-            Err(err) => return Some(Err(GongDBError::from(err))),
+            Err(StorageError::NotFound(_)) => return Ok(DBOutput::StatementComplete(0)),
+            Err(err) => return Err(GongDBError::from(err)),
         };
         let o_c_id = match order_row.get(o_c_id_idx) {
             Some(Value::Integer(v)) => *v,
             Some(Value::Real(v)) => *v as i64,
-            _ => return Some(Ok(DBOutput::StatementComplete(0))),
+            _ => return Ok(DBOutput::StatementComplete(0)),
         };
 
         let lower_key = build_index_bound(
@@ -1804,13 +1869,9 @@ impl GongDB {
             Some(&Value::Integer(o_id)),
             Value::Blob(Vec::new()),
         );
-        let locations = match self
+        let locations = self
             .storage
-            .scan_index_range(&order_line_index.name, Some(&lower_key), Some(&upper_key))
-        {
-            Ok(locations) => locations,
-            Err(err) => return Some(Err(GongDBError::from(err))),
-        };
+            .scan_index_range(&order_line_index.name, Some(&lower_key), Some(&upper_key))?;
         let mut amount_cache = self.fast_order_line_amount_offsets_cache.borrow().clone();
         let mut amount_cache_update: Option<FastOrderLineAmountOffsetsCache> = None;
         let mut sum_amount = 0.0_f64;
@@ -1852,7 +1913,7 @@ impl GongDB {
                 Ok(Some(amount)) => amount,
                 Ok(None) => continue,
                 Err(StorageError::NotFound(_)) => continue,
-                Err(err) => return Some(Err(GongDBError::from(err))),
+                Err(err) => return Err(GongDBError::from(err)),
             };
             sum_amount += amount;
         }
@@ -1867,15 +1928,11 @@ impl GongDB {
             Value::Integer(d_id),
             Value::Integer(o_c_id),
         ];
-        let customer_location = match self
+        let customer_location = self
             .storage
-            .scan_index_first_location(&customer_index.name, &customer_key)
-        {
-            Ok(location) => location,
-            Err(err) => return Some(Err(GongDBError::from(err))),
-        };
+            .scan_index_first_location(&customer_index.name, &customer_key)?;
         let Some(customer_location) = customer_location else {
-            return Some(Ok(DBOutput::StatementComplete(0)));
+            return Ok(DBOutput::StatementComplete(0));
         };
         let mut cached_offsets = self.fast_customer_delivery_offsets_cache.borrow().clone();
         let mut cache_update: Option<FastCustomerDeliveryOffsetsCache> = None;
@@ -1947,7 +2004,7 @@ impl GongDB {
         }) {
             Ok(applied) => applied,
             Err(StorageError::NotFound(_)) => false,
-            Err(err) => return Some(Err(GongDBError::from(err))),
+            Err(err) => return Err(GongDBError::from(err)),
         };
         if let Some(update) = cache_update {
             self.fast_customer_delivery_offsets_cache
@@ -1957,8 +2014,8 @@ impl GongDB {
         if fallback_needed {
             let row = match self.storage.read_row_at(&customer_location) {
                 Ok(row) => row,
-                Err(StorageError::NotFound(_)) => return Some(Ok(DBOutput::StatementComplete(0))),
-                Err(err) => return Some(Err(GongDBError::from(err))),
+                Err(StorageError::NotFound(_)) => return Ok(DBOutput::StatementComplete(0)),
+                Err(err) => return Err(GongDBError::from(err)),
             };
             let mut new_row = row.clone();
             let balance = match row.get(c_balance_idx) {
@@ -1974,14 +2031,14 @@ impl GongDB {
             new_row[c_balance_idx] = Value::Real(balance + sum_amount);
             new_row[c_delivery_cnt_idx] = Value::Integer(delivery_cnt + 1);
             if let Err(err) = self.storage.update_rows_at(&[(customer_location, new_row)]) {
-                return Some(Err(GongDBError::from(err)));
+                return Err(GongDBError::from(err));
             }
         }
         if applied || fallback_needed {
             self.invalidate_table_stats("customer");
             self.select_cache.borrow_mut().clear();
         }
-        Some(Ok(DBOutput::StatementComplete(0)))
+        Ok(DBOutput::StatementComplete(0))
     }
 
     fn try_fast_update(
@@ -2950,40 +3007,79 @@ impl GongDB {
         sql: &str,
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let (w_id, d_id, next_o_id, threshold) = parse_fast_stock_level(sql)?;
-        let order_line = match self.storage.get_table("order_line") {
-            Some(table) => table.clone(),
-            None => return None,
-        };
-        let stock = match self.storage.get_table("stock") {
-            Some(table) => table.clone(),
-            None => return None,
-        };
+        Some(self.apply_fast_stock_level(w_id, d_id, next_o_id, threshold))
+    }
+
+    fn try_fast_stock_level_params(
+        &mut self,
+        sql: &str,
+        params: &[Literal],
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let trimmed = sql.trim();
+        if trimmed.eq_ignore_ascii_case(
+            "SELECT COUNT(DISTINCT ol_i_id) FROM order_line, stock WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id >= ? - 20 AND ol_o_id < ? AND s_w_id = ol_w_id AND s_i_id = ol_i_id AND s_quantity < ?",
+        ) {
+            if params.len() != 5 {
+                return Some(Err(GongDBError::new("parameter count mismatch")));
+            }
+            let w_id = literal_to_i64(&params[0])?;
+            let d_id = literal_to_i64(&params[1])?;
+            let next_o_id = literal_to_i64(&params[2])?;
+            let upper_o_id = literal_to_i64(&params[3])?;
+            let threshold = literal_to_i64(&params[4])?;
+            if next_o_id != upper_o_id {
+                return None;
+            }
+            return Some(self.apply_fast_stock_level(w_id, d_id, next_o_id, threshold));
+        }
+        None
+    }
+
+    fn apply_fast_stock_level(
+        &mut self,
+        w_id: i64,
+        d_id: i64,
+        next_o_id: i64,
+        threshold: i64,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        let order_line = self
+            .storage
+            .get_table("order_line")
+            .ok_or_else(|| GongDBError::new("no such table: order_line"))?
+            .clone();
+        let stock = self
+            .storage
+            .get_table("stock")
+            .ok_or_else(|| GongDBError::new("no such table: stock"))?
+            .clone();
 
         let order_line_idx = self.column_index_map_cached(&order_line);
-        let ol_i_id_idx = *order_line_idx.get("ol_i_id")?;
+        let ol_i_id_idx = *order_line_idx
+            .get("ol_i_id")
+            .ok_or_else(|| GongDBError::new("no such column: ol_i_id"))?;
 
         let order_indexes = self.table_indexes_cached(&order_line.name);
         let stock_indexes = self.table_indexes_cached(&stock.name);
 
-        let order_index = fast_find_index_prefix(
-            &order_indexes,
-            &["ol_w_id", "ol_d_id", "ol_o_id"],
-        )?;
-        let stock_index = fast_find_index_prefix(&stock_indexes, &["s_w_id", "s_i_id"])?;
+        let order_index =
+            fast_find_index_prefix(&order_indexes, &["ol_w_id", "ol_d_id", "ol_o_id"])
+                .ok_or_else(|| GongDBError::new("missing order_line index"))?;
+        let stock_index = fast_find_index_prefix(&stock_indexes, &["s_w_id", "s_i_id"])
+            .ok_or_else(|| GongDBError::new("missing stock index"))?;
 
         let lower_o = next_o_id.saturating_sub(20);
         if next_o_id == 0 || next_o_id <= lower_o {
-            return Some(Ok(DBOutput::Rows {
+            return Ok(DBOutput::Rows {
                 types: vec![DefaultColumnType::Text],
                 rows: vec![vec![value_to_string(&Value::Integer(0))]],
-            }));
+            });
         }
         let upper_o = next_o_id.saturating_sub(1);
         if upper_o < lower_o {
-            return Some(Ok(DBOutput::Rows {
+            return Ok(DBOutput::Rows {
                 types: vec![DefaultColumnType::Text],
                 rows: vec![vec![value_to_string(&Value::Integer(0))]],
-            }));
+            });
         }
 
         let lower_key = build_index_bound(
@@ -2999,19 +3095,15 @@ impl GongDB {
             Value::Blob(Vec::new()),
         );
 
-        let locations = match self
+        let locations = self
             .storage
-            .scan_index_range(&order_index.name, Some(&lower_key), Some(&upper_key))
-        {
-            Ok(locations) => locations,
-            Err(err) => return Some(Err(GongDBError::from(err))),
-        };
+            .scan_index_range(&order_index.name, Some(&lower_key), Some(&upper_key))?;
         let mut distinct_items: HashSet<i64> = HashSet::new();
         for location in locations {
             let row = match self.storage.read_row_at(&location) {
                 Ok(row) => row,
                 Err(StorageError::NotFound(_)) => continue,
-                Err(err) => return Some(Err(GongDBError::from(err))),
+                Err(err) => return Err(GongDBError::from(err)),
             };
             if let Some(Value::Integer(value)) = row.get(ol_i_id_idx) {
                 distinct_items.insert(*value);
@@ -3022,10 +3114,7 @@ impl GongDB {
         let mut cache_update: Option<FastStockOffsetsCache> = None;
         let mut count = 0i64;
         for item_id in distinct_items {
-            let location = match self.lookup_stock_location(&stock_index, w_id, item_id) {
-                Ok(location) => location,
-                Err(err) => return Some(Err(err)),
-            };
+            let location = self.lookup_stock_location(&stock_index, w_id, item_id)?;
             let Some(location) = location else {
                 continue;
             };
@@ -3063,7 +3152,7 @@ impl GongDB {
                 Ok(Some(value)) => value,
                 Ok(None) => continue,
                 Err(StorageError::NotFound(_)) => continue,
-                Err(err) => return Some(Err(GongDBError::from(err))),
+                Err(err) => return Err(GongDBError::from(err)),
             };
             if qty_value < threshold {
                 count += 1;
@@ -3073,10 +3162,10 @@ impl GongDB {
             self.fast_stock_offsets_cache.borrow_mut().replace(update);
         }
 
-        Some(Ok(DBOutput::Rows {
+        Ok(DBOutput::Rows {
             types: vec![DefaultColumnType::Text],
             rows: vec![vec![value_to_string(&Value::Integer(count))]],
-        }))
+        })
     }
 
     fn try_fast_select(
@@ -3084,6 +3173,72 @@ impl GongDB {
         sql: &str,
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let plan = parse_fast_select(sql)?;
+        self.execute_fast_select_plan(plan)
+    }
+
+    fn try_fast_select_params(
+        &mut self,
+        sql: &str,
+        params: &[Literal],
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let trimmed = sql.trim();
+        if trimmed.eq_ignore_ascii_case(
+            "SELECT c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+        ) {
+            if params.len() != 3 {
+                return Some(Err(GongDBError::new("parameter count mismatch")));
+            }
+            let plan = FastSelectPlan {
+                table: "customer".to_string(),
+                columns: vec![
+                    "c_balance".to_string(),
+                    "c_first".to_string(),
+                    "c_middle".to_string(),
+                    "c_last".to_string(),
+                ],
+                predicates: vec![
+                    ("c_w_id".to_string(), literal_to_value(&params[0])),
+                    ("c_d_id".to_string(), literal_to_value(&params[1])),
+                    ("c_id".to_string(), literal_to_value(&params[2])),
+                ],
+                order_by: None,
+                limit: None,
+            };
+            return self.execute_fast_select_plan(plan);
+        }
+        if trimmed.eq_ignore_ascii_case(
+            "SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_c_id = ? ORDER BY o_id DESC LIMIT 1",
+        ) {
+            if params.len() != 3 {
+                return Some(Err(GongDBError::new("parameter count mismatch")));
+            }
+            let plan = FastSelectPlan {
+                table: "orders".to_string(),
+                columns: vec![
+                    "o_id".to_string(),
+                    "o_entry_d".to_string(),
+                    "o_carrier_id".to_string(),
+                ],
+                predicates: vec![
+                    ("o_w_id".to_string(), literal_to_value(&params[0])),
+                    ("o_d_id".to_string(), literal_to_value(&params[1])),
+                    ("o_c_id".to_string(), literal_to_value(&params[2])),
+                ],
+                order_by: Some(FastOrderBy {
+                    column: "o_id".to_string(),
+                    desc: true,
+                }),
+                limit: Some(1),
+            };
+            return self.execute_fast_select_plan(plan);
+        }
+        None
+    }
+
+    fn execute_fast_select_plan(
+        &mut self,
+        plan: FastSelectPlan,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let table = match self.storage.get_table(&plan.table) {
             Some(table) => table.clone(),
             None => {
