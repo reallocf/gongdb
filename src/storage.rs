@@ -81,6 +81,42 @@ struct IndexEqRowCacheKey {
     ordered: bool,
 }
 
+#[derive(Debug, Clone)]
+struct UniqueAppendState {
+    last_key: Option<Vec<Value>>,
+    disabled: bool,
+}
+
+impl UniqueAppendState {
+    fn new(last_key: Option<Vec<Value>>) -> Self {
+        Self {
+            last_key,
+            disabled: false,
+        }
+    }
+
+    fn should_check_index(&mut self, key: &[Value]) -> bool {
+        if self.disabled {
+            return true;
+        }
+        match self.last_key.as_ref() {
+            Some(last_key) => {
+                if compare_index_keys(key, last_key) == std::cmp::Ordering::Greater {
+                    self.last_key = Some(key.to_vec());
+                    false
+                } else {
+                    self.disabled = true;
+                    true
+                }
+            }
+            None => {
+                self.last_key = Some(key.to_vec());
+                false
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct IndexEntry {
     key: Vec<Value>,
@@ -1092,6 +1128,20 @@ impl StorageEngine {
                 }
             })
             .collect();
+        let mut unique_append_keys: Vec<Option<UniqueAppendState>> = indexes
+            .iter()
+            .map(|index| {
+                if index.unique && !table_empty {
+                    match self.index_last_key(index) {
+                        Ok(Some(key)) => Some(UniqueAppendState::new(Some(key))),
+                        Ok(None) => None,
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut page_id = table.last_page;
         let mut page = self.read_page(page_id)?;
         let mut index_entries: Vec<Vec<IndexEntry>> =
@@ -1106,6 +1156,12 @@ impl StorageEngine {
                         let encoded_key = encode_index_key(&key)?;
                         if !unique_keys.insert(encoded_key) {
                             return Err(unique_violation(index));
+                        }
+                    } else if let Some(state) = unique_append_keys[idx].as_mut() {
+                        if state.should_check_index(&key) {
+                            if self.index_contains_key(index, &key)? {
+                                return Err(unique_violation(index));
+                            }
                         }
                     } else if self.index_contains_key(index, &key)? {
                         return Err(unique_violation(index));
@@ -1143,6 +1199,34 @@ impl StorageEngine {
         }
         self.write_catalog()?;
         Ok(())
+    }
+
+    fn index_last_key(&mut self, index: &IndexMeta) -> Result<Option<Vec<Value>>, StorageError> {
+        let mut page_id = if index.last_page == 0 {
+            index.first_page
+        } else {
+            index.last_page
+        };
+        let mut page = self.read_page(page_id)?;
+        match page_type(&page) {
+            PAGE_TYPE_BTREE_INTERNAL => {
+                page_id = self.btree_rightmost_leaf(index.first_page)?;
+                page = self.read_page(page_id)?;
+            }
+            PAGE_TYPE_BTREE_LEAF => {}
+            _ => {
+                return Err(StorageError::Corrupt(
+                    "invalid btree page type".to_string(),
+                ))
+            }
+        }
+        let mut next = get_next_page_id(&page);
+        while next != 0 {
+            page_id = next;
+            page = self.read_page(page_id)?;
+            next = get_next_page_id(&page);
+        }
+        Ok(read_last_leaf_entry(&page)?.map(|entry| entry.key))
     }
 
     fn insert_row_with_location_internal(
