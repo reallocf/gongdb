@@ -453,7 +453,7 @@ impl GongDB {
     }
 
     fn table_indexes_cached(&self, table_name: &str) -> Vec<IndexMeta> {
-        if self.storage.index_updates_deferred(table_name) {
+        if !self.storage.index_reads_allowed(table_name) {
             return Vec::new();
         }
         let key = table_name.to_ascii_lowercase();
@@ -1992,7 +1992,11 @@ impl GongDB {
                         if update.assignments.iter().any(|assignment| {
                             indexed_columns.contains(&assignment.column.value.to_ascii_lowercase())
                         }) {
-                            self.storage.reindex(Some(&table_name))?;
+                            if self.storage.index_updates_deferred(&table_name) {
+                                self.storage.mark_pending_reindex(&table_name)?;
+                            } else {
+                                self.storage.reindex(Some(&table_name))?;
+                            }
                         }
                     }
                 }
@@ -6163,7 +6167,7 @@ fn choose_index_scan_plan_with_stats(
     table_scope: &TableScope,
     stats: Option<&TableStats>,
 ) -> Option<IndexScanPlan> {
-    if db.storage.index_updates_deferred(&table.name) {
+    if !db.storage.index_reads_allowed(&table.name) {
         return None;
     }
     let indexes: Vec<IndexMeta> = db
@@ -7376,7 +7380,7 @@ fn index_lookup_plan_for_pairs(
     join_pairs: &[(usize, usize)],
 ) -> Option<IndexLookupPlan> {
     let table_name = right_scope.table_name.as_ref()?;
-    if db.storage.index_updates_deferred(table_name) {
+    if !db.storage.index_reads_allowed(table_name) {
         return None;
     }
     let mut indexes: Vec<IndexMeta> = db

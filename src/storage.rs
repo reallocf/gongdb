@@ -1179,6 +1179,27 @@ impl StorageEngine {
             .contains(&table_name.to_ascii_lowercase())
     }
 
+    pub fn index_reads_allowed(&self, table_name: &str) -> bool {
+        if !self.index_updates_deferred(table_name) {
+            return true;
+        }
+        !self.index_updates_dirty(table_name)
+    }
+
+    pub fn mark_pending_reindex(&mut self, table_name: &str) -> Result<(), StorageError> {
+        let key = table_name.to_ascii_lowercase();
+        if self.find_table_name(table_name).is_none() {
+            return Err(StorageError::NotFound(format!(
+                "table not found: {}",
+                table_name
+            )));
+        }
+        self.pending_reindex_tables.insert(key);
+        self.clear_index_eq_cache();
+        self.clear_unique_index_cache_for_table(table_name);
+        Ok(())
+    }
+
     pub fn defer_index_updates(&mut self, table_name: &str) -> Result<(), StorageError> {
         let key = table_name.to_ascii_lowercase();
         if self.find_table_name(table_name).is_none() {
@@ -1191,6 +1212,24 @@ impl StorageEngine {
         self.clear_index_eq_cache();
         self.clear_unique_index_cache_for_table(table_name);
         Ok(())
+    }
+
+    fn index_updates_dirty(&self, table_name: &str) -> bool {
+        let key = table_name.to_ascii_lowercase();
+        if self.pending_reindex_tables.contains(&key) {
+            return true;
+        }
+        for (index_name, entries) in &self.pending_index_entries {
+            if entries.is_empty() {
+                continue;
+            }
+            if let Some(index) = self.indexes.get(index_name) {
+                if index.table.eq_ignore_ascii_case(table_name) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn resume_index_updates(&mut self, table_name: &str) -> Result<(), StorageError> {
