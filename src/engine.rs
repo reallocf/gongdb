@@ -1307,44 +1307,44 @@ impl GongDB {
                     Err(err) => return Some(Err(err.into())),
                 };
                 if let Some(location) = location {
-                    let record = match self.storage.read_record_at(&location) {
-                        Ok(record) => record,
+                    let outcome = match self.storage.with_record_at(&location, |record| {
+                        let matches = if index_plan.all_predicates_covered {
+                            true
+                        } else {
+                            match fast_record_matches_predicates(record, &predicate_indices) {
+                                Ok(matches) => matches,
+                                Err(err) => {
+                                    return Err(StorageError::Invalid(err.to_string()))
+                                }
+                            }
+                        };
+                        if !matches {
+                            return Ok(None);
+                        }
+                        let outcome =
+                            match build_fast_update_outcome(&table.columns, record, &assignment_indices)
+                            {
+                                Ok(outcome) => outcome,
+                                Err(err) => {
+                                    return Err(StorageError::Invalid(err.to_string()))
+                                }
+                            };
+                        Ok(Some(outcome))
+                    }) {
+                        Ok(outcome) => outcome,
                         Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
                             return Some(Ok(DBOutput::StatementComplete(0)))
                         }
                         Err(err) => return Some(Err(err.into())),
                     };
-                    let matches = if index_plan.all_predicates_covered {
-                        true
-                    } else {
-                        match fast_record_matches_predicates(&record, &predicate_indices) {
-                            Ok(matches) => matches,
-                            Err(err) => return Some(Err(err)),
-                        }
-                    };
-                    if matches {
-                        match apply_fast_update_record_bytes(
-                            &table.columns,
-                            &record,
-                            &assignment_indices,
-                        ) {
-                            Ok(Some(fields)) => in_place_updates.push((location, fields)),
-                            Ok(None) => {
-                                let row = match crate::storage::decode_row_from_record(&record) {
-                                    Ok(row) => row,
-                                    Err(err) => return Some(Err(err.into())),
-                                };
-                                let new_row = match apply_fast_update_assignments(
-                                    &table.columns,
-                                    &row,
-                                    &assignment_indices,
-                                ) {
-                                    Ok(new_row) => new_row,
-                                    Err(err) => return Some(Err(err)),
-                                };
+                    if let Some(outcome) = outcome {
+                        match outcome {
+                            FastUpdateOutcome::InPlace(fields) => {
+                                in_place_updates.push((location, fields));
+                            }
+                            FastUpdateOutcome::Row(new_row) => {
                                 updates.push((location, new_row));
                             }
-                            Err(err) => return Some(Err(err)),
                         }
                     }
                 }
@@ -1358,40 +1358,38 @@ impl GongDB {
                     Err(err) => return Some(Err(err.into())),
                 };
                 for location in locations {
-                    let record = match self.storage.read_record_at(&location) {
-                        Ok(record) => record,
+                    let outcome = match self.storage.with_record_at(&location, |record| {
+                        let matches = match fast_record_matches_predicates(record, &predicate_indices)
+                        {
+                            Ok(matches) => matches,
+                            Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                        };
+                        if !matches {
+                            return Ok(None);
+                        }
+                        let outcome =
+                            match build_fast_update_outcome(&table.columns, record, &assignment_indices)
+                            {
+                                Ok(outcome) => outcome,
+                                Err(err) => {
+                                    return Err(StorageError::Invalid(err.to_string()))
+                                }
+                            };
+                        Ok(Some(outcome))
+                    }) {
+                        Ok(outcome) => outcome,
                         Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
                         Err(err) => return Some(Err(err.into())),
                     };
-                    let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
-                        Ok(matches) => matches,
-                        Err(err) => return Some(Err(err)),
-                    };
-                    if !matches {
-                        continue;
-                    }
-                    match apply_fast_update_record_bytes(
-                        &table.columns,
-                        &record,
-                        &assignment_indices,
-                    ) {
-                        Ok(Some(fields)) => in_place_updates.push((location, fields)),
-                        Ok(None) => {
-                            let row = match crate::storage::decode_row_from_record(&record) {
-                                Ok(row) => row,
-                                Err(err) => return Some(Err(err.into())),
-                            };
-                            let new_row = match apply_fast_update_assignments(
-                                &table.columns,
-                                &row,
-                                &assignment_indices,
-                            ) {
-                                Ok(new_row) => new_row,
-                                Err(err) => return Some(Err(err)),
-                            };
-                            updates.push((location, new_row));
+                    if let Some(outcome) = outcome {
+                        match outcome {
+                            FastUpdateOutcome::InPlace(fields) => {
+                                in_place_updates.push((location, fields));
+                            }
+                            FastUpdateOutcome::Row(new_row) => {
+                                updates.push((location, new_row));
+                            }
                         }
-                        Err(err) => return Some(Err(err)),
                     }
                 }
             }
@@ -1420,40 +1418,35 @@ impl GongDB {
                 Err(err) => return Some(Err(err.into())),
             };
             for location in locations {
-                let record = match self.storage.read_record_at(&location) {
-                    Ok(record) => record,
+                let outcome = match self.storage.with_record_at(&location, |record| {
+                    let matches = match fast_record_matches_predicates(record, &predicate_indices) {
+                        Ok(matches) => matches,
+                        Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                    };
+                    if !matches {
+                        return Ok(None);
+                    }
+                    let outcome =
+                        match build_fast_update_outcome(&table.columns, record, &assignment_indices)
+                        {
+                            Ok(outcome) => outcome,
+                            Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                        };
+                    Ok(Some(outcome))
+                }) {
+                    Ok(outcome) => outcome,
                     Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
                     Err(err) => return Some(Err(err.into())),
                 };
-                let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
-                    Ok(matches) => matches,
-                    Err(err) => return Some(Err(err)),
-                };
-                if !matches {
-                    continue;
-                }
-                match apply_fast_update_record_bytes(
-                    &table.columns,
-                    &record,
-                    &assignment_indices,
-                ) {
-                    Ok(Some(fields)) => in_place_updates.push((location, fields)),
-                    Ok(None) => {
-                        let row = match crate::storage::decode_row_from_record(&record) {
-                            Ok(row) => row,
-                            Err(err) => return Some(Err(err.into())),
-                        };
-                        let new_row = match apply_fast_update_assignments(
-                            &table.columns,
-                            &row,
-                            &assignment_indices,
-                        ) {
-                            Ok(new_row) => new_row,
-                            Err(err) => return Some(Err(err)),
-                        };
-                        updates.push((location, new_row));
+                if let Some(outcome) = outcome {
+                    match outcome {
+                        FastUpdateOutcome::InPlace(fields) => {
+                            in_place_updates.push((location, fields));
+                        }
+                        FastUpdateOutcome::Row(new_row) => {
+                            updates.push((location, new_row));
+                        }
                     }
-                    Err(err) => return Some(Err(err)),
                 }
             }
         } else {
@@ -6368,6 +6361,11 @@ enum FastUpdateAction {
     Sub(Value),
 }
 
+enum FastUpdateOutcome {
+    InPlace(Vec<crate::storage::FieldUpdate>),
+    Row(Vec<Value>),
+}
+
 struct FastUpdatePlan {
     table: String,
     assignments: Vec<FastUpdateAssignment>,
@@ -7059,6 +7057,21 @@ fn apply_fast_update_record_bytes(
         return Ok(None);
     }
     Ok(Some(updates))
+}
+
+fn build_fast_update_outcome(
+    columns: &[Column],
+    record: &[u8],
+    assignments: &[(usize, FastUpdateAssignment)],
+) -> Result<FastUpdateOutcome, GongDBError> {
+    match apply_fast_update_record_bytes(columns, record, assignments)? {
+        Some(fields) => Ok(FastUpdateOutcome::InPlace(fields)),
+        None => {
+            let row = crate::storage::decode_row_from_record(record).map_err(GongDBError::Storage)?;
+            let new_row = apply_fast_update_assignments(columns, &row, assignments)?;
+            Ok(FastUpdateOutcome::Row(new_row))
+        }
+    }
 }
 
 fn fast_numeric_update_bytes(

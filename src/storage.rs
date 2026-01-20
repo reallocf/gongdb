@@ -1483,6 +1483,17 @@ impl StorageEngine {
         }
     }
 
+    pub(crate) fn with_record_at<R>(
+        &self,
+        location: &RowLocation,
+        f: impl FnOnce(&[u8]) -> Result<R, StorageError>,
+    ) -> Result<R, StorageError> {
+        self.with_page(location.page_id, |page| match record_slice_at_slot(page, location.slot)? {
+            Some(record) => f(record),
+            None => Err(StorageError::NotFound("row deleted".to_string())),
+        })
+    }
+
     pub(crate) fn update_rows_at(
         &mut self,
         updates: &[(RowLocation, Vec<Value>)],
