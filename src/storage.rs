@@ -1059,15 +1059,33 @@ impl StorageEngine {
             .filter(|index| index.table == table_name)
             .cloned()
             .collect();
+        let table_empty = table.row_count == 0;
+        let mut unique_batch_keys: Vec<Option<HashSet<Vec<u8>>>> = indexes
+            .iter()
+            .map(|index| {
+                if index.unique && table_empty {
+                    Some(HashSet::new())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut page_id = table.last_page;
         let mut page = self.read_page(page_id)?;
 
         for row in rows {
             let mut index_keys = Vec::with_capacity(indexes.len());
-            for index in &indexes {
+            for (idx, index) in indexes.iter().enumerate() {
                 let key = index_key_from_row(index, &column_map, row)?;
-                if index.unique && !key_has_null(&key) && self.index_contains_key(index, &key)? {
-                    return Err(unique_violation(index));
+                if index.unique && !key_has_null(&key) {
+                    if let Some(unique_keys) = unique_batch_keys[idx].as_mut() {
+                        let encoded_key = encode_index_key(&key)?;
+                        if !unique_keys.insert(encoded_key) {
+                            return Err(unique_violation(index));
+                        }
+                    } else if self.index_contains_key(index, &key)? {
+                        return Err(unique_violation(index));
+                    }
                 }
                 index_keys.push((index.name.clone(), key));
             }
@@ -1112,6 +1130,7 @@ impl StorageEngine {
             .get(table_name)
             .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
             .clone();
+        let table_empty = table.row_count == 0;
         let mut page_id = table.last_page;
         let column_map = column_index_map(&table.columns);
         let index_names: Vec<String> = self
@@ -1129,8 +1148,10 @@ impl StorageEngine {
                 .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?
                 .clone();
             let key = index_key_from_row(&index, &column_map, row)?;
-            if index.unique && !key_has_null(&key) && self.index_contains_key(&index, &key)? {
-                return Err(unique_violation(&index));
+            if index.unique && !key_has_null(&key) {
+                if !table_empty && self.index_contains_key(&index, &key)? {
+                    return Err(unique_violation(&index));
+                }
             }
             index_keys.push((index.name, key));
         }
@@ -1512,7 +1533,9 @@ impl StorageEngine {
             .indexes
             .remove(index_name)
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
-        self.insert_index_record_btree(&mut index, entry)?;
+        if !self.try_append_index_entry(&mut index, entry)? {
+            self.insert_index_record_btree(&mut index, entry)?;
+        }
         self.indexes.insert(index_name.to_string(), index);
         Ok(())
     }
@@ -1619,6 +1642,81 @@ impl StorageEngine {
         Ok(())
     }
 
+    fn try_append_index_entry(
+        &mut self,
+        index: &mut IndexMeta,
+        entry: &IndexEntry,
+    ) -> Result<bool, StorageError> {
+        let last_leaf = self.ensure_index_last_leaf(index)?;
+        let mut page = self.read_page(last_leaf)?;
+        if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+            return Ok(false);
+        }
+        if let Some(last) = read_last_leaf_entry(&page)? {
+            if compare_index_keys(&entry.key, &last.key) == std::cmp::Ordering::Less {
+                return Ok(false);
+            }
+        }
+        let record = encode_index_entry(entry)?;
+        match insert_record(&mut page, &record) {
+            Ok(_) => {
+                self.write_page(last_leaf, &page)?;
+                Ok(true)
+            }
+            Err(StorageError::Invalid(msg)) if msg == "page full" => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn ensure_index_last_leaf(&mut self, index: &mut IndexMeta) -> Result<u32, StorageError> {
+        let mut page_id = if index.last_page == 0 {
+            index.first_page
+        } else {
+            index.last_page
+        };
+        let mut page = self.read_page(page_id)?;
+        match page_type(&page) {
+            PAGE_TYPE_BTREE_LEAF => {
+                let mut next = get_next_page_id(&page);
+                while next != 0 {
+                    page_id = next;
+                    page = self.read_page(page_id)?;
+                    next = get_next_page_id(&page);
+                }
+                index.last_page = page_id;
+                Ok(page_id)
+            }
+            PAGE_TYPE_BTREE_INTERNAL => {
+                let rightmost = self.btree_rightmost_leaf(index.first_page)?;
+                index.last_page = rightmost;
+                Ok(rightmost)
+            }
+            _ => Err(StorageError::Corrupt(
+                "invalid btree page type".to_string(),
+            )),
+        }
+    }
+
+    fn btree_rightmost_leaf(&self, root: u32) -> Result<u32, StorageError> {
+        let mut page_id = root;
+        loop {
+            let page = self.read_page(page_id)?;
+            match page_type(&page) {
+                PAGE_TYPE_BTREE_LEAF => return Ok(page_id),
+                PAGE_TYPE_BTREE_INTERNAL => {
+                    let leftmost = get_next_page_id(&page);
+                    let cells = read_internal_cells(&page)?;
+                    page_id = cells.last().map(|cell| cell.right_child).unwrap_or(leftmost);
+                }
+                _ => {
+                    return Err(StorageError::Corrupt(
+                        "invalid btree page type".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn btree_scan_range(
         &self,
@@ -1635,8 +1733,20 @@ impl StorageEngine {
                     "invalid btree leaf page".to_string(),
                 ));
             }
-            let records = read_record_slices(&page);
-            for record in records {
+            let slot_count = read_u16(&page, 1) as usize;
+            for idx in 0..slot_count {
+                let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    continue;
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt(
+                        "invalid index record bounds".to_string(),
+                    ));
+                }
+                let record = &page[record_offset..record_offset + record_len];
                 let entry = decode_index_entry(record)?;
                 if let Some(low) = lower {
                     if compare_index_keys(&entry.key, low) == std::cmp::Ordering::Less {
@@ -1674,8 +1784,20 @@ impl StorageEngine {
                     "invalid btree leaf page".to_string(),
                 ));
             }
-            let records = read_record_slices(&page);
-            for record in records {
+            let slot_count = read_u16(&page, 1) as usize;
+            for idx in 0..slot_count {
+                let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    continue;
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt(
+                        "invalid index record bounds".to_string(),
+                    ));
+                }
+                let record = &page[record_offset..record_offset + record_len];
                 let (value, row) = decode_index_entry_single(record)?;
                 match compare_index_value(&value, target) {
                     std::cmp::Ordering::Less => continue,
@@ -2642,6 +2764,29 @@ fn read_leaf_entries(page: &[u8]) -> Result<Vec<IndexEntry>, StorageError> {
         entries.push(decode_index_entry(record)?);
     }
     Ok(entries)
+}
+
+fn read_last_leaf_entry(page: &[u8]) -> Result<Option<IndexEntry>, StorageError> {
+    let slot_count = read_u16(page, 1) as usize;
+    if slot_count == 0 {
+        return Ok(None);
+    }
+    for idx in (1..=slot_count).rev() {
+        let slot_offset = PAGE_SIZE - idx * 4;
+        let record_offset = read_u16(page, slot_offset) as usize;
+        let record_len = read_u16(page, slot_offset + 2) as usize;
+        if record_len == 0 {
+            continue;
+        }
+        if record_offset + record_len > PAGE_SIZE {
+            return Err(StorageError::Corrupt(
+                "invalid leaf record bounds".to_string(),
+            ));
+        }
+        let record = &page[record_offset..record_offset + record_len];
+        return Ok(Some(decode_index_entry(record)?));
+    }
+    Ok(None)
 }
 
 fn read_internal_cells(page: &[u8]) -> Result<Vec<InternalCell>, StorageError> {
