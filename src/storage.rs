@@ -2662,6 +2662,7 @@ impl StorageEngine {
         let index_positions = index_column_positions(&index, &column_map)?;
         let mut unique_keys = HashSet::new();
         let rows = self.scan_table_with_locations(&table.name)?;
+        let mut entries = Vec::with_capacity(rows.len());
         for (location, row) in rows {
             let key = index_key_from_row_positions(&index_positions, &row);
             if index.unique && !key_has_null(&key) {
@@ -2670,9 +2671,105 @@ impl StorageEngine {
                     return Err(unique_violation(&index));
                 }
             }
-            let entry = IndexEntry { key, row: location };
-            self.insert_index_record(index_name, &entry)?;
+            entries.push(IndexEntry { key, row: location });
         }
+        entries.sort_by(compare_index_entry);
+        self.build_index_from_entries(index_name, &entries)?;
+        Ok(())
+    }
+
+    fn build_index_from_entries(
+        &mut self,
+        index_name: &str,
+        entries: &[IndexEntry],
+    ) -> Result<(), StorageError> {
+        let mut index = self
+            .indexes
+            .remove(index_name)
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
+
+        if entries.is_empty() {
+            self.write_page(index.first_page, &init_btree_page(PAGE_TYPE_BTREE_LEAF))?;
+            index.last_page = index.first_page;
+            self.indexes.insert(index_name.to_string(), index);
+            return Ok(());
+        }
+
+        let mut leaf_pages: Vec<(u32, Vec<Value>)> = Vec::new();
+        let mut page_id = index.first_page;
+        let mut page = init_btree_page(PAGE_TYPE_BTREE_LEAF);
+        let mut first_key: Option<Vec<Value>> = None;
+
+        for entry in entries {
+            let record = encode_index_entry(entry)?;
+            if !has_space_for_record(&page, record.len()) {
+                let next_page_id = self.allocate_btree_page(PAGE_TYPE_BTREE_LEAF)?;
+                set_next_page_id(&mut page, next_page_id);
+                self.write_page(page_id, &page)?;
+                let first = first_key
+                    .take()
+                    .ok_or_else(|| StorageError::Corrupt("missing leaf key".to_string()))?;
+                leaf_pages.push((page_id, first));
+                page_id = next_page_id;
+                page = init_btree_page(PAGE_TYPE_BTREE_LEAF);
+            }
+            if first_key.is_none() {
+                first_key = Some(entry.key.clone());
+            }
+            insert_record(&mut page, &record)?;
+        }
+
+        set_next_page_id(&mut page, 0);
+        self.write_page(page_id, &page)?;
+        let first = first_key
+            .take()
+            .ok_or_else(|| StorageError::Corrupt("missing leaf key".to_string()))?;
+        leaf_pages.push((page_id, first));
+        index.last_page = page_id;
+
+        if leaf_pages.len() == 1 {
+            index.first_page = leaf_pages[0].0;
+            self.indexes.insert(index_name.to_string(), index);
+            return Ok(());
+        }
+
+        let mut current_level = leaf_pages;
+        loop {
+            let mut next_level: Vec<(u32, Vec<Value>)> = Vec::new();
+            let mut idx = 0usize;
+            while idx < current_level.len() {
+                let (leftmost_child, page_first_key) = current_level[idx].clone();
+                let mut page = init_btree_page(PAGE_TYPE_BTREE_INTERNAL);
+                set_next_page_id(&mut page, leftmost_child);
+                let page_id = self.allocate_btree_page(PAGE_TYPE_BTREE_INTERNAL)?;
+                idx += 1;
+
+                while idx < current_level.len() {
+                    let (child_id, child_key) = &current_level[idx];
+                    let cell = InternalCell {
+                        key: child_key.clone(),
+                        right_child: *child_id,
+                    };
+                    let record = encode_internal_cell(&cell)?;
+                    if !has_space_for_record(&page, record.len()) {
+                        break;
+                    }
+                    insert_record(&mut page, &record)?;
+                    idx += 1;
+                }
+
+                self.write_page(page_id, &page)?;
+                next_level.push((page_id, page_first_key));
+            }
+
+            if next_level.len() == 1 {
+                index.first_page = next_level[0].0;
+                break;
+            }
+            current_level = next_level;
+        }
+
+        self.indexes.insert(index_name.to_string(), index);
         Ok(())
     }
 
