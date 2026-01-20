@@ -302,6 +302,18 @@ impl GongDB {
         })
     }
 
+    pub fn defer_index_updates(&mut self, table_name: &str) -> Result<(), GongDBError> {
+        self.storage.defer_index_updates(table_name)?;
+        self.invalidate_schema_caches();
+        Ok(())
+    }
+
+    pub fn resume_index_updates(&mut self, table_name: &str) -> Result<(), GongDBError> {
+        self.storage.resume_index_updates(table_name)?;
+        self.invalidate_schema_caches();
+        Ok(())
+    }
+
     fn invalidate_schema_caches(&self) {
         self.fast_update_cache.borrow_mut().clear();
         self.index_cache.borrow_mut().clear();
@@ -318,6 +330,9 @@ impl GongDB {
     }
 
     fn table_indexes_cached(&self, table_name: &str) -> Vec<IndexMeta> {
+        if self.storage.index_updates_deferred(table_name) {
+            return Vec::new();
+        }
         let key = table_name.to_ascii_lowercase();
         if let Some(indexes) = self.index_cache.borrow().get(&key) {
             return indexes.clone();
@@ -5146,6 +5161,9 @@ fn choose_index_scan_plan_with_stats(
     table_scope: &TableScope,
     stats: Option<&TableStats>,
 ) -> Option<IndexScanPlan> {
+    if db.storage.index_updates_deferred(&table.name) {
+        return None;
+    }
     let indexes: Vec<IndexMeta> = db
         .storage
         .list_indexes()
@@ -6356,6 +6374,9 @@ fn index_lookup_plan_for_pairs(
     join_pairs: &[(usize, usize)],
 ) -> Option<IndexLookupPlan> {
     let table_name = right_scope.table_name.as_ref()?;
+    if db.storage.index_updates_deferred(table_name) {
+        return None;
+    }
     let mut indexes: Vec<IndexMeta> = db
         .storage
         .list_indexes()
@@ -9400,6 +9421,9 @@ fn column_index_map(columns: &[Column]) -> HashMap<String, usize> {
 }
 
 fn unique_indexes_for_table(storage: &StorageEngine, table_name: &str) -> Vec<IndexMeta> {
+    if storage.index_updates_deferred(table_name) {
+        return Vec::new();
+    }
     storage
         .list_indexes()
         .into_iter()

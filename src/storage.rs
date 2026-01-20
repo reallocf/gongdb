@@ -477,6 +477,8 @@ pub struct StorageEngine {
     pending_sync_writes: usize,
     in_memory_txn_log: Option<HashMap<u32, Option<Vec<u8>>>>,
     in_memory_txn_base_len: Option<usize>,
+    deferred_index_tables: HashSet<String>,
+    pending_reindex_tables: HashSet<String>,
 }
 
 /// Streaming table scan iterator.
@@ -575,6 +577,8 @@ impl StorageEngine {
             pending_sync_writes: 0,
             in_memory_txn_log: None,
             in_memory_txn_base_len: None,
+            deferred_index_tables: HashSet::new(),
+            pending_reindex_tables: HashSet::new(),
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -677,6 +681,8 @@ impl StorageEngine {
             pending_sync_writes: 0,
             in_memory_txn_log: None,
             in_memory_txn_base_len: None,
+            deferred_index_tables: HashSet::new(),
+            pending_reindex_tables: HashSet::new(),
         };
         if needs_row_count_rebuild {
             engine.recompute_table_row_counts()?;
@@ -1146,6 +1152,40 @@ impl StorageEngine {
         self.schema_version
     }
 
+    pub fn index_updates_deferred(&self, table_name: &str) -> bool {
+        self.deferred_index_tables
+            .contains(&table_name.to_ascii_lowercase())
+    }
+
+    pub fn defer_index_updates(&mut self, table_name: &str) -> Result<(), StorageError> {
+        let key = table_name.to_ascii_lowercase();
+        if self.find_table_name(table_name).is_none() {
+            return Err(StorageError::NotFound(format!(
+                "table not found: {}",
+                table_name
+            )));
+        }
+        self.deferred_index_tables.insert(key);
+        self.clear_index_eq_cache();
+        self.clear_unique_index_cache_for_table(table_name);
+        Ok(())
+    }
+
+    pub fn resume_index_updates(&mut self, table_name: &str) -> Result<(), StorageError> {
+        let key = table_name.to_ascii_lowercase();
+        if self.find_table_name(table_name).is_none() {
+            return Err(StorageError::NotFound(format!(
+                "table not found: {}",
+                table_name
+            )));
+        }
+        self.deferred_index_tables.remove(&key);
+        if self.pending_reindex_tables.remove(&key) {
+            self.reindex(Some(table_name))?;
+        }
+        Ok(())
+    }
+
     /// Insert a row into a table.
     pub fn insert_row(&mut self, table_name: &str, row: &[Value]) -> Result<(), StorageError> {
         let _ = self.insert_row_with_location_internal(table_name, row, true)?;
@@ -1176,6 +1216,9 @@ impl StorageEngine {
     ) -> Result<(), StorageError> {
         if rows.is_empty() {
             return Ok(());
+        }
+        if self.index_updates_deferred(table_name) {
+            return self.insert_rows_without_indexes(table_name, rows);
         }
         self.clear_index_eq_cache();
         let table = self
@@ -1286,6 +1329,45 @@ impl StorageEngine {
         Ok(())
     }
 
+    fn insert_rows_without_indexes(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
+        self.pending_reindex_tables
+            .insert(table_name.to_ascii_lowercase());
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
+            .clone();
+        let mut page_id = table.last_page;
+        let mut page = self.read_page(page_id)?;
+
+        for row in rows {
+            let record = encode_row(row)?;
+            if !has_space_for_record(&page, record.len()) {
+                let new_page_id = self.allocate_data_page()?;
+                set_next_page_id(&mut page, new_page_id);
+                self.write_page(page_id, &page)?;
+                page_id = new_page_id;
+                page = init_data_page();
+                if let Some(table) = self.tables.get_mut(table_name) {
+                    table.last_page = new_page_id;
+                }
+            }
+            let _ = insert_record(&mut page, &record)?;
+        }
+
+        self.write_page(page_id, &page)?;
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.row_count = table.row_count.saturating_add(rows.len() as u64);
+        }
+        self.write_catalog()?;
+        Ok(())
+    }
+
     fn index_last_key(&mut self, index: &IndexMeta) -> Result<Option<Vec<Value>>, StorageError> {
         let mut page_id = if index.last_page == 0 {
             index.first_page
@@ -1320,6 +1402,9 @@ impl StorageEngine {
         row: &[Value],
         write_catalog: bool,
     ) -> Result<RowLocation, StorageError> {
+        if self.index_updates_deferred(table_name) {
+            return self.insert_row_without_indexes(table_name, row, write_catalog);
+        }
         self.clear_index_eq_cache();
         let table = self
             .tables
@@ -1381,6 +1466,46 @@ impl StorageEngine {
             self.write_catalog()?;
         }
         Ok(location)
+    }
+
+    fn insert_row_without_indexes(
+        &mut self,
+        table_name: &str,
+        row: &[Value],
+        write_catalog: bool,
+    ) -> Result<RowLocation, StorageError> {
+        self.clear_index_eq_cache();
+        self.pending_reindex_tables
+            .insert(table_name.to_ascii_lowercase());
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
+            .clone();
+        let mut page_id = table.last_page;
+        let record = encode_row(row)?;
+        let mut page = self.read_page(page_id)?;
+        if !has_space_for_record(&page, record.len()) {
+            let new_page_id = self.allocate_data_page()?;
+            let new_page = init_data_page();
+            set_next_page_id(&mut page, new_page_id);
+            self.write_page(page_id, &page)?;
+            page_id = new_page_id;
+            page = new_page;
+            if let Some(table) = self.tables.get_mut(table_name) {
+                table.last_page = new_page_id;
+            }
+        }
+
+        let slot = insert_record(&mut page, &record)?;
+        self.write_page(page_id, &page)?;
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.row_count = table.row_count.saturating_add(1);
+        }
+        if write_catalog {
+            self.write_catalog()?;
+        }
+        Ok(RowLocation { page_id, slot })
     }
 
     /// Create an index and populate it from existing table rows.

@@ -418,6 +418,7 @@ fn load_tpcc_data(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch_size = 100;
     // Load warehouses
+    db.defer_index_updates("warehouse")?;
     let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         batch.push(format!(
@@ -435,8 +436,10 @@ fn load_tpcc_data(
         db.run_statement(sql)?;
         Ok(())
     })?;
+    db.resume_index_updates("warehouse")?;
     
     // Load districts
+    db.defer_index_updates("district")?;
     let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
@@ -456,8 +459,10 @@ fn load_tpcc_data(
         db.run_statement(sql)?;
         Ok(())
     })?;
+    db.resume_index_updates("district")?;
     
     // Load customers
+    db.defer_index_updates("customer")?;
     let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
@@ -479,8 +484,10 @@ fn load_tpcc_data(
         db.run_statement(sql)?;
         Ok(())
     })?;
+    db.resume_index_updates("customer")?;
     
     // Load items
+    db.defer_index_updates("item")?;
     let mut batch = Vec::with_capacity(batch_size);
     for i_id in 1..=items {
         batch.push(format!(
@@ -502,8 +509,10 @@ fn load_tpcc_data(
         db.run_statement(sql)?;
         Ok(())
     })?;
+    db.resume_index_updates("item")?;
     
     // Load stock
+    db.defer_index_updates("stock")?;
     let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for i_id in 1..=items {
@@ -525,6 +534,7 @@ fn load_tpcc_data(
         db.run_statement(sql)?;
         Ok(())
     })?;
+    db.resume_index_updates("stock")?;
     
     Ok(())
 }
