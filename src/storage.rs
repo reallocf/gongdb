@@ -1705,6 +1705,55 @@ impl StorageEngine {
         }
     }
 
+    pub(crate) fn update_record_at_with(
+        &mut self,
+        location: RowLocation,
+        f: impl FnOnce(&mut [u8]) -> Result<bool, StorageError>,
+    ) -> Result<bool, StorageError> {
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return self.with_page_mut(location.page_id, |page| {
+                let slot_count = read_u16(page, 1) as usize;
+                let slot = location.slot as usize;
+                if slot >= slot_count {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(page, slot_offset) as usize;
+                let record_len = read_u16(page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    return Err(StorageError::NotFound("row deleted".to_string()));
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let record = &mut page[record_offset..record_offset + record_len];
+                f(record)
+            });
+        }
+
+        let mut page = self.read_page(location.page_id)?;
+        let slot_count = read_u16(&page, 1) as usize;
+        let slot = location.slot as usize;
+        if slot >= slot_count {
+            return Err(StorageError::Corrupt("invalid row location".to_string()));
+        }
+        let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+        let record_offset = read_u16(&page, slot_offset) as usize;
+        let record_len = read_u16(&page, slot_offset + 2) as usize;
+        if record_len == 0 {
+            return Err(StorageError::NotFound("row deleted".to_string()));
+        }
+        if record_offset + record_len > PAGE_SIZE {
+            return Err(StorageError::Corrupt("invalid row location".to_string()));
+        }
+        let result = {
+            let record = &mut page[record_offset..record_offset + record_len];
+            f(record)?
+        };
+        self.write_page(location.page_id, &page)?;
+        Ok(result)
+    }
+
     fn update_record_fields_at_internal(
         &mut self,
         updates: &[(RowLocation, Vec<FieldUpdate>)],

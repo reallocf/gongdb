@@ -120,6 +120,9 @@ pub struct GongDB {
     statement_cache: RefCell<HashMap<String, CachedStatement>>,
     select_cache: RefCell<HashMap<String, CachedSelect>>,
     fast_update_cache: RefCell<HashMap<String, FastUpdateTemplate>>,
+    index_cache: RefCell<HashMap<String, Vec<IndexMeta>>>,
+    column_index_cache: RefCell<HashMap<String, HashMap<String, usize>>>,
+    fast_stock_offsets_cache: RefCell<Option<FastStockOffsetsCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +157,12 @@ struct FastSelectPlan {
     limit: Option<usize>,
 }
 
+#[derive(Clone)]
+struct FastStockOffsetsCache {
+    record_len: usize,
+    offsets: FastStockUpdateOffsets,
+}
+
 impl GongDB {
     const STATEMENT_CACHE_LIMIT: usize = 128;
 
@@ -178,6 +187,9 @@ impl GongDB {
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
             fast_update_cache: RefCell::new(HashMap::new()),
+            index_cache: RefCell::new(HashMap::new()),
+            column_index_cache: RefCell::new(HashMap::new()),
+            fast_stock_offsets_cache: RefCell::new(None),
         })
     }
 
@@ -202,7 +214,42 @@ impl GongDB {
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
             fast_update_cache: RefCell::new(HashMap::new()),
+            index_cache: RefCell::new(HashMap::new()),
+            column_index_cache: RefCell::new(HashMap::new()),
+            fast_stock_offsets_cache: RefCell::new(None),
         })
+    }
+
+    fn invalidate_schema_caches(&self) {
+        self.fast_update_cache.borrow_mut().clear();
+        self.index_cache.borrow_mut().clear();
+        self.column_index_cache.borrow_mut().clear();
+        self.fast_stock_offsets_cache.borrow_mut().take();
+    }
+
+    fn table_indexes_cached(&self, table_name: &str) -> Vec<IndexMeta> {
+        let key = table_name.to_ascii_lowercase();
+        if let Some(indexes) = self.index_cache.borrow().get(&key) {
+            return indexes.clone();
+        }
+        let indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(table_name))
+            .collect();
+        self.index_cache.borrow_mut().insert(key, indexes.clone());
+        indexes
+    }
+
+    fn column_index_map_cached(&self, table: &TableMeta) -> HashMap<String, usize> {
+        let key = table.name.to_ascii_lowercase();
+        if let Some(map) = self.column_index_cache.borrow().get(&key) {
+            return map.clone();
+        }
+        let map = column_index_map_fast(&table.columns);
+        self.column_index_cache.borrow_mut().insert(key, map.clone());
+        map
     }
 
     /// Execute a single SQL statement and return the result.
@@ -443,7 +490,7 @@ impl GongDB {
                 };
                 self.storage.create_table(meta)?;
                 self.invalidate_table_stats(&name);
-                self.fast_update_cache.borrow_mut().clear();
+                self.invalidate_schema_caches();
 
                 let mut counter = 1;
                 let mut used_names = HashSet::new();
@@ -502,7 +549,7 @@ impl GongDB {
                     self.storage.create_index(meta)?;
                 }
                 self.invalidate_table_stats(&table_name);
-                self.fast_update_cache.borrow_mut().clear();
+                self.invalidate_schema_caches();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::CreateTrigger(create) => {
@@ -543,7 +590,7 @@ impl GongDB {
                 if self.storage.get_index(&name).is_some() {
                     self.storage.drop_index(&name)?;
                 }
-                self.fast_update_cache.borrow_mut().clear();
+                self.invalidate_schema_caches();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::DropTrigger(drop) => {
@@ -560,7 +607,7 @@ impl GongDB {
             Statement::Reindex(reindex) => {
                 let target = reindex.name.as_ref().map(object_name);
                 self.storage.reindex(target.as_deref())?;
-                self.fast_update_cache.borrow_mut().clear();
+                self.invalidate_schema_caches();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::DropTable(drop) => {
@@ -577,7 +624,7 @@ impl GongDB {
                 self.triggers
                     .retain(|_, trigger| !trigger.table.eq_ignore_ascii_case(&name));
                 self.invalidate_table_stats(&name);
-                self.fast_update_cache.borrow_mut().clear();
+                self.invalidate_schema_caches();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::CreateView(create) => {
@@ -1108,32 +1155,17 @@ impl GongDB {
         let order_line = self.storage.get_table("order_line")?.clone();
         let customer = self.storage.get_table("customer")?.clone();
 
-        let orders_idx = column_index_map_fast(&orders.columns);
-        let order_line_idx = column_index_map_fast(&order_line.columns);
-        let customer_idx = column_index_map_fast(&customer.columns);
+        let orders_idx = self.column_index_map_cached(&orders);
+        let order_line_idx = self.column_index_map_cached(&order_line);
+        let customer_idx = self.column_index_map_cached(&customer);
         let o_c_id_idx = *orders_idx.get("o_c_id")?;
         let ol_amount_idx = *order_line_idx.get("ol_amount")?;
         let c_balance_idx = *customer_idx.get("c_balance")?;
         let c_delivery_cnt_idx = *customer_idx.get("c_delivery_cnt")?;
 
-        let orders_indexes: Vec<IndexMeta> = self
-            .storage
-            .list_indexes()
-            .into_iter()
-            .filter(|index| index.table.eq_ignore_ascii_case(&orders.name))
-            .collect();
-        let order_line_indexes: Vec<IndexMeta> = self
-            .storage
-            .list_indexes()
-            .into_iter()
-            .filter(|index| index.table.eq_ignore_ascii_case(&order_line.name))
-            .collect();
-        let customer_indexes: Vec<IndexMeta> = self
-            .storage
-            .list_indexes()
-            .into_iter()
-            .filter(|index| index.table.eq_ignore_ascii_case(&customer.name))
-            .collect();
+        let orders_indexes = self.table_indexes_cached(&orders.name);
+        let order_line_indexes = self.table_indexes_cached(&order_line.name);
+        let customer_indexes = self.table_indexes_cached(&customer.name);
 
         let orders_index = fast_find_index_prefix(&orders_indexes, &["o_w_id", "o_d_id", "o_id"])?;
         let order_line_index =
@@ -1527,7 +1559,7 @@ impl GongDB {
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let plan = parse_fast_stock_update(sql)?;
         let mut target_index: Option<IndexMeta> = None;
-        for index in self.storage.list_indexes() {
+        for index in self.table_indexes_cached("stock") {
             if !index.table.eq_ignore_ascii_case("stock") || !index.unique {
                 continue;
             }
@@ -1554,35 +1586,55 @@ impl GongDB {
             Some(location) => location,
             None => return Some(Ok(DBOutput::StatementComplete(0))),
         };
+        let cached_offsets = self.fast_stock_offsets_cache.borrow().clone();
+        let mut cache_update: Option<FastStockOffsetsCache> = None;
         let mut fallback_needed = false;
-        let applied = match self.storage.update_record_fields_at_with(location, |record| {
-            let offsets = match fast_stock_update_offsets(record, plan.remote) {
-                Ok(Some(offsets)) => offsets,
-                Ok(None) => {
-                    fallback_needed = true;
-                    return Ok(None);
+        let applied = match self.storage.update_record_at_with(location, |record| {
+            let cached = cached_offsets.as_ref().and_then(|cache| {
+                if cache.record_len == record.len()
+                    && (!plan.remote || cache.offsets.remote_cnt.is_some())
+                {
+                    Some(cache.offsets.clone())
+                } else {
+                    None
                 }
-                Err(err) => return Err(StorageError::Invalid(err.to_string())),
+            });
+            let offsets = match cached {
+                Some(offsets) => offsets,
+                None => match fast_stock_update_offsets(record, plan.remote) {
+                    Ok(Some(offsets)) => {
+                        cache_update = Some(FastStockOffsetsCache {
+                            record_len: record.len(),
+                            offsets: offsets.clone(),
+                        });
+                        offsets
+                    }
+                    Ok(None) => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                },
             };
             let quantity = match read_i64_at(record, offsets.quantity + 1) {
                 Some(value) => value,
                 None => {
                     fallback_needed = true;
-                    return Ok(None);
+                    return Ok(false);
                 }
             };
             let ytd = match read_i64_at(record, offsets.ytd + 1) {
                 Some(value) => value,
                 None => {
                     fallback_needed = true;
-                    return Ok(None);
+                    return Ok(false);
                 }
             };
             let order_cnt = match read_i64_at(record, offsets.order_cnt + 1) {
                 Some(value) => value,
                 None => {
                     fallback_needed = true;
-                    return Ok(None);
+                    return Ok(false);
                 }
             };
             let remote_cnt = if let Some(offset) = offsets.remote_cnt {
@@ -1590,7 +1642,7 @@ impl GongDB {
                     Some(value) => Some(value),
                     None => {
                         fallback_needed = true;
-                        return Ok(None);
+                        return Ok(false);
                     }
                 }
             } else {
@@ -1606,32 +1658,26 @@ impl GongDB {
                 || !remote_ok
             {
                 fallback_needed = true;
-                return Ok(None);
+                return Ok(false);
             }
             let next_quantity = quantity.wrapping_sub(plan.quantity);
             let next_ytd = ytd.wrapping_add(plan.ytd);
             let next_order_cnt = order_cnt.wrapping_add(1);
             let next_remote_cnt = remote_cnt.map(|value| value.wrapping_add(1));
-            let mut updates = Vec::with_capacity(if offsets.remote_cnt.is_some() { 4 } else { 3 });
-            updates.push(crate::storage::FieldUpdate {
-                offset: offsets.quantity,
-                bytes: encode_i64_field(next_quantity),
-            });
-            updates.push(crate::storage::FieldUpdate {
-                offset: offsets.ytd,
-                bytes: encode_i64_field(next_ytd),
-            });
-            updates.push(crate::storage::FieldUpdate {
-                offset: offsets.order_cnt,
-                bytes: encode_i64_field(next_order_cnt),
-            });
-            if let (Some(offset), Some(next)) = (offsets.remote_cnt, next_remote_cnt) {
-                updates.push(crate::storage::FieldUpdate {
-                    offset,
-                    bytes: encode_i64_field(next),
-                });
+            if write_i64_at(record, offsets.quantity + 1, next_quantity).is_none()
+                || write_i64_at(record, offsets.ytd + 1, next_ytd).is_none()
+                || write_i64_at(record, offsets.order_cnt + 1, next_order_cnt).is_none()
+            {
+                fallback_needed = true;
+                return Ok(false);
             }
-            Ok(Some(updates))
+            if let (Some(offset), Some(next)) = (offsets.remote_cnt, next_remote_cnt) {
+                if write_i64_at(record, offset + 1, next).is_none() {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }) {
             Ok(applied) => applied,
             Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
@@ -1641,6 +1687,11 @@ impl GongDB {
         };
         if fallback_needed {
             return None;
+        }
+        if let Some(cache_update) = cache_update {
+            self.fast_stock_offsets_cache
+                .borrow_mut()
+                .replace(cache_update);
         }
         if applied {
             self.select_cache.borrow_mut().clear();
@@ -1663,23 +1714,13 @@ impl GongDB {
             None => return None,
         };
 
-        let order_line_idx = column_index_map_fast(&order_line.columns);
-        let stock_idx = column_index_map_fast(&stock.columns);
+        let order_line_idx = self.column_index_map_cached(&order_line);
+        let stock_idx = self.column_index_map_cached(&stock);
         let ol_i_id_idx = *order_line_idx.get("ol_i_id")?;
         let s_quantity_idx = *stock_idx.get("s_quantity")?;
 
-        let order_indexes: Vec<IndexMeta> = self
-            .storage
-            .list_indexes()
-            .into_iter()
-            .filter(|index| index.table.eq_ignore_ascii_case(&order_line.name))
-            .collect();
-        let stock_indexes: Vec<IndexMeta> = self
-            .storage
-            .list_indexes()
-            .into_iter()
-            .filter(|index| index.table.eq_ignore_ascii_case(&stock.name))
-            .collect();
+        let order_indexes = self.table_indexes_cached(&order_line.name);
+        let stock_indexes = self.table_indexes_cached(&stock.name);
 
         let order_index = fast_find_index_prefix(
             &order_indexes,
@@ -1780,10 +1821,7 @@ impl GongDB {
                 ))))
             }
         };
-        let mut column_map: HashMap<String, usize> = HashMap::new();
-        for (idx, col) in table.columns.iter().enumerate() {
-            column_map.insert(col.name.to_lowercase(), idx);
-        }
+        let column_map = self.column_index_map_cached(&table);
         let mut predicate_indices = Vec::with_capacity(plan.predicates.len());
         let mut predicate_values: HashMap<String, Value> = HashMap::new();
         for (name, value) in plan.predicates {
@@ -1820,12 +1858,7 @@ impl GongDB {
             indices
         };
 
-        let indexes: Vec<IndexMeta> = self
-            .storage
-            .list_indexes()
-            .into_iter()
-            .filter(|index| index.table.eq_ignore_ascii_case(&table.name))
-            .collect();
+        let indexes = self.table_indexes_cached(&table.name);
 
         let rows = if let Some((index, key)) =
             fast_select_eq_index(&indexes, &predicate_values)
@@ -6606,6 +6639,7 @@ struct FastStockUpdatePlan {
     remote: bool,
 }
 
+#[derive(Clone)]
 struct FastStockUpdateOffsets {
     quantity: usize,
     ytd: usize,
@@ -7435,11 +7469,13 @@ fn read_i64_at(record: &[u8], pos: usize) -> Option<i64> {
     Some(i64::from_le_bytes(buf))
 }
 
-fn encode_i64_field(value: i64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(9);
-    encoded.push(1);
-    encoded.extend_from_slice(&value.to_le_bytes());
-    encoded
+fn write_i64_at(record: &mut [u8], pos: usize, value: i64) -> Option<()> {
+    let end = pos.checked_add(8)?;
+    if end > record.len() {
+        return None;
+    }
+    record[pos..end].copy_from_slice(&value.to_le_bytes());
+    Some(())
 }
 
 fn read_f64_at(record: &[u8], pos: usize) -> Option<f64> {
