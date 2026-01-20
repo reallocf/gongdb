@@ -68,6 +68,12 @@ pub(crate) struct RowLocation {
     slot: u16,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct FieldUpdate {
+    pub(crate) offset: usize,
+    pub(crate) bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct IndexEqCacheKey {
     index_name: String,
@@ -1601,6 +1607,101 @@ impl StorageEngine {
         Ok(())
     }
 
+    pub(crate) fn update_record_fields_at(
+        &mut self,
+        updates: &[(RowLocation, Vec<FieldUpdate>)],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.clear_index_eq_cache();
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return self.update_record_fields_at_in_memory(updates);
+        }
+        if updates.len() == 1 {
+            let (location, fields) = &updates[0];
+            let mut page = self.read_page(location.page_id)?;
+            let slot_count = read_u16(&page, 1) as usize;
+            let slot = location.slot as usize;
+            if slot >= slot_count {
+                return Err(StorageError::Corrupt("invalid row location".to_string()));
+            }
+            let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+            let record_offset = read_u16(&page, slot_offset) as usize;
+            let record_len = read_u16(&page, slot_offset + 2) as usize;
+            if record_offset + record_len > PAGE_SIZE {
+                return Err(StorageError::Corrupt("invalid row location".to_string()));
+            }
+            for update in fields {
+                let end = update
+                    .offset
+                    .checked_add(update.bytes.len())
+                    .ok_or_else(|| StorageError::Corrupt("invalid row update".to_string()))?;
+                if end > record_len {
+                    return Err(StorageError::Corrupt("invalid row update".to_string()));
+                }
+                let start = record_offset + update.offset;
+                let end = start + update.bytes.len();
+                page[start..end].copy_from_slice(&update.bytes);
+            }
+            self.write_page(location.page_id, &page)?;
+            return Ok(());
+        }
+        let mut updates_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, (location, _)) in updates.iter().enumerate() {
+            updates_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push(idx);
+        }
+        let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (page_id, page_updates) in updates_by_page.iter() {
+            let page = self.read_page(*page_id)?;
+            let slot_count = read_u16(&page, 1) as usize;
+            for &update_idx in page_updates {
+                let (location, fields) = &updates[update_idx];
+                let slot = location.slot as usize;
+                if slot >= slot_count {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                for update in fields {
+                    let end = update
+                        .offset
+                        .checked_add(update.bytes.len())
+                        .ok_or_else(|| StorageError::Corrupt("invalid row update".to_string()))?;
+                    if end > record_len {
+                        return Err(StorageError::Corrupt("invalid row update".to_string()));
+                    }
+                }
+            }
+            pages.insert(*page_id, page);
+        }
+        for (page_id, page_updates) in updates_by_page {
+            let mut page = pages
+                .remove(&page_id)
+                .ok_or_else(|| StorageError::Corrupt("missing page buffer".to_string()))?;
+            for update_idx in page_updates {
+                let (location, fields) = &updates[update_idx];
+                let slot = location.slot as usize;
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                for update in fields {
+                    let start = record_offset + update.offset;
+                    let end = start + update.bytes.len();
+                    page[start..end].copy_from_slice(&update.bytes);
+                }
+            }
+            self.write_page(page_id, &page)?;
+        }
+        Ok(())
+    }
+
     fn update_encoded_rows_at_in_memory(
         &mut self,
         updates: &[(RowLocation, Vec<u8>)],
@@ -1668,6 +1769,64 @@ impl StorageEngine {
             })?;
         }
 
+        Ok(())
+    }
+
+    fn update_record_fields_at_in_memory(
+        &mut self,
+        updates: &[(RowLocation, Vec<FieldUpdate>)],
+    ) -> Result<(), StorageError> {
+        let mut updates_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, (location, _)) in updates.iter().enumerate() {
+            updates_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push(idx);
+        }
+        for (page_id, page_updates) in updates_by_page.iter() {
+            self.with_page(*page_id, |page| {
+                let slot_count = read_u16(page, 1) as usize;
+                for &update_idx in page_updates {
+                    let (location, fields) = &updates[update_idx];
+                    let slot = location.slot as usize;
+                    if slot >= slot_count {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                    let record_offset = read_u16(page, slot_offset) as usize;
+                    let record_len = read_u16(page, slot_offset + 2) as usize;
+                    if record_offset + record_len > PAGE_SIZE {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    for update in fields {
+                        let end = update
+                            .offset
+                            .checked_add(update.bytes.len())
+                            .ok_or_else(|| StorageError::Corrupt("invalid row update".to_string()))?;
+                        if end > record_len {
+                            return Err(StorageError::Corrupt("invalid row update".to_string()));
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        for (page_id, page_updates) in updates_by_page {
+            self.with_page_mut(page_id, |page| {
+                for update_idx in page_updates {
+                    let (location, fields) = &updates[update_idx];
+                    let slot = location.slot as usize;
+                    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                    let record_offset = read_u16(page, slot_offset) as usize;
+                    for update in fields {
+                        let start = record_offset + update.offset;
+                        let end = start + update.bytes.len();
+                        page[start..end].copy_from_slice(&update.bytes);
+                    }
+                }
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 

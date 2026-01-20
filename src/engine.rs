@@ -1331,7 +1331,7 @@ impl GongDB {
             }
         }
         let mut updates = Vec::new();
-        let mut encoded_updates = Vec::new();
+        let mut in_place_updates = Vec::new();
         if let Some(index) = best_index {
             let mut key = Vec::with_capacity(index.columns.len());
             for column in &index.columns {
@@ -1364,7 +1364,7 @@ impl GongDB {
                             &record,
                             &assignment_indices,
                         ) {
-                            Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                            Ok(Some(fields)) => in_place_updates.push((location, fields)),
                             Ok(None) => {
                                 let row = match crate::storage::decode_row_from_record(&record) {
                                     Ok(row) => row,
@@ -1411,7 +1411,7 @@ impl GongDB {
                         &record,
                         &assignment_indices,
                     ) {
-                        Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                        Ok(Some(fields)) => in_place_updates.push((location, fields)),
                         Ok(None) => {
                             let row = match crate::storage::decode_row_from_record(&record) {
                                 Ok(row) => row,
@@ -1472,7 +1472,7 @@ impl GongDB {
                     &record,
                     &assignment_indices,
                 ) {
-                    Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                    Ok(Some(fields)) => in_place_updates.push((location, fields)),
                     Ok(None) => {
                         let row = match crate::storage::decode_row_from_record(&record) {
                             Ok(row) => row,
@@ -1511,14 +1511,9 @@ impl GongDB {
                 updates.push((location, new_row));
             }
         }
-        if !encoded_updates.is_empty() {
-            match self.storage.update_encoded_rows_at(&encoded_updates) {
+        if !in_place_updates.is_empty() {
+            match self.storage.update_record_fields_at(&in_place_updates) {
                 Ok(()) => {}
-                Err(StorageError::Invalid(msg)) if msg == "page full" => {
-                    return Some(Err(GongDBError::new(
-                        "page full during fast update".to_string(),
-                    )))
-                }
                 Err(err) => return Some(Err(err.into())),
             }
         }
@@ -6863,7 +6858,7 @@ fn apply_fast_update_record_bytes(
     columns: &[Column],
     record: &[u8],
     assignments: &[(usize, FastUpdateAssignment)],
-) -> Result<Option<Vec<u8>>, GongDBError> {
+) -> Result<Option<Vec<crate::storage::FieldUpdate>>, GongDBError> {
     if assignments.is_empty() {
         return Ok(None);
     }
@@ -6876,7 +6871,7 @@ fn apply_fast_update_record_bytes(
     if sorted.last().map_or(false, |(idx, _)| *idx >= count) {
         return Err(GongDBError::new("assignment column out of bounds".to_string()));
     }
-    let mut updates: Vec<(usize, Vec<u8>, usize)> = Vec::with_capacity(sorted.len());
+    let mut updates: Vec<crate::storage::FieldUpdate> = Vec::with_capacity(sorted.len());
     let mut pos = 2usize;
     let mut assign_idx = 0usize;
     for col_idx in 0..count {
@@ -6896,7 +6891,10 @@ fn apply_fast_update_record_bytes(
                 record,
                 pos,
             ) {
-                updates.push((pos, encoded, len));
+                updates.push(crate::storage::FieldUpdate {
+                    offset: pos,
+                    bytes: encoded,
+                });
                 pos = pos.saturating_add(len);
             } else {
                 let (current, new_pos) = match crate::storage::decode_value_at(record, pos) {
@@ -6923,7 +6921,10 @@ fn apply_fast_update_record_bytes(
                 if encoded.len() != len {
                     return Ok(None);
                 }
-                updates.push((pos, encoded, len));
+                updates.push(crate::storage::FieldUpdate {
+                    offset: pos,
+                    bytes: encoded,
+                });
                 pos = new_pos;
             }
             assign_idx += 1;
@@ -6934,11 +6935,7 @@ fn apply_fast_update_record_bytes(
     if updates.is_empty() {
         return Ok(None);
     }
-    let mut new_record = record.to_vec();
-    for (offset, encoded, len) in updates {
-        new_record[offset..offset + len].copy_from_slice(&encoded);
-    }
-    Ok(Some(new_record))
+    Ok(Some(updates))
 }
 
 fn fast_numeric_update_bytes(
