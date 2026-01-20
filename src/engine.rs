@@ -4010,7 +4010,7 @@ fn join_sources_with_predicates(
     };
     let mut rows = Vec::new();
     if join_pairs.is_empty() {
-        for left_row in left_rows {
+        for left_row in &left_rows {
             for right_row in &right_rows {
                 let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
                 combined.extend(left_row.iter().cloned());
@@ -4041,120 +4041,235 @@ fn join_sources_with_predicates(
         }
     } else if join_pairs.len() == 1 {
         let (left_idx, right_idx) = join_pairs[0];
-        let mut right_map: HashMap<DistinctKey, Vec<usize>> =
-            HashMap::with_capacity(right_rows.len());
-        for (idx, row) in right_rows.iter().enumerate() {
-            let value = &row[right_idx];
-            if matches!(value, Value::Null) {
-                continue;
+        if left_rows.len() <= right_rows.len() {
+            let mut left_map: HashMap<DistinctKey, Vec<usize>> =
+                HashMap::with_capacity(left_rows.len());
+            for (idx, row) in left_rows.iter().enumerate() {
+                let value = &row[left_idx];
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                left_map.entry(distinct_key(value)).or_default().push(idx);
             }
-            right_map.entry(distinct_key(value)).or_default().push(idx);
-        }
-
-        for left_row in left_rows {
-            let value = &left_row[left_idx];
-            if matches!(value, Value::Null) {
-                continue;
-            }
-            let Some(matches) = right_map.get(&distinct_key(value)) else {
-                continue;
-            };
-            for right_idx in matches {
-                let right_row = &right_rows[*right_idx];
-                let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-                combined.extend(left_row.iter().cloned());
-                combined.extend(right_row.iter().cloned());
-                if !remaining_predicates.is_empty() {
-                    let scope = EvalScope {
-                        columns: &columns,
-                        column_scopes: &column_scopes,
-                        row: &combined,
-                        table_scope: &table_scope,
-                        cte_context,
-                        column_lookup: column_lookup.as_ref(),
-                    };
-                    let mut keep = true;
-                    for predicate in &remaining_predicates {
-                        let value = eval_expr(db, predicate, &scope, outer)?;
-                        if !value_to_bool(&value) {
-                            keep = false;
-                            break;
+            for right_row in &right_rows {
+                let value = &right_row[right_idx];
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                let Some(matches) = left_map.get(&distinct_key(value)) else {
+                    continue;
+                };
+                for left_idx in matches {
+                    let left_row = &left_rows[*left_idx];
+                    let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(right_row.iter().cloned());
+                    if !remaining_predicates.is_empty() {
+                        let scope = EvalScope {
+                            columns: &columns,
+                            column_scopes: &column_scopes,
+                            row: &combined,
+                            table_scope: &table_scope,
+                            cte_context,
+                            column_lookup: column_lookup.as_ref(),
+                        };
+                        let mut keep = true;
+                        for predicate in &remaining_predicates {
+                            let value = eval_expr(db, predicate, &scope, outer)?;
+                            if !value_to_bool(&value) {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        if !keep {
+                            continue;
                         }
                     }
-                    if !keep {
-                        continue;
-                    }
+                    rows.push(combined);
                 }
-                rows.push(combined);
+            }
+        } else {
+            let mut right_map: HashMap<DistinctKey, Vec<usize>> =
+                HashMap::with_capacity(right_rows.len());
+            for (idx, row) in right_rows.iter().enumerate() {
+                let value = &row[right_idx];
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                right_map.entry(distinct_key(value)).or_default().push(idx);
+            }
+            for left_row in &left_rows {
+                let value = &left_row[left_idx];
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                let Some(matches) = right_map.get(&distinct_key(value)) else {
+                    continue;
+                };
+                for right_idx in matches {
+                    let right_row = &right_rows[*right_idx];
+                    let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(right_row.iter().cloned());
+                    if !remaining_predicates.is_empty() {
+                        let scope = EvalScope {
+                            columns: &columns,
+                            column_scopes: &column_scopes,
+                            row: &combined,
+                            table_scope: &table_scope,
+                            cte_context,
+                            column_lookup: column_lookup.as_ref(),
+                        };
+                        let mut keep = true;
+                        for predicate in &remaining_predicates {
+                            let value = eval_expr(db, predicate, &scope, outer)?;
+                            if !value_to_bool(&value) {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        if !keep {
+                            continue;
+                        }
+                    }
+                    rows.push(combined);
+                }
             }
         }
     } else {
         let left_key_indices: Vec<usize> = join_pairs.iter().map(|(l, _)| *l).collect();
         let right_key_indices: Vec<usize> = join_pairs.iter().map(|(_, r)| *r).collect();
-        let mut right_map: HashMap<Vec<DistinctKey>, Vec<usize>> =
-            HashMap::with_capacity(right_rows.len());
-        for (idx, row) in right_rows.iter().enumerate() {
-            let mut key = Vec::with_capacity(right_key_indices.len());
-            let mut has_null = false;
-            for col_idx in &right_key_indices {
-                let value = &row[*col_idx];
-                if matches!(value, Value::Null) {
-                    has_null = true;
-                    break;
+        if left_rows.len() <= right_rows.len() {
+            let mut left_map: HashMap<Vec<DistinctKey>, Vec<usize>> =
+                HashMap::with_capacity(left_rows.len());
+            for (idx, row) in left_rows.iter().enumerate() {
+                let mut key = Vec::with_capacity(left_key_indices.len());
+                let mut has_null = false;
+                for col_idx in &left_key_indices {
+                    let value = &row[*col_idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    key.push(distinct_key(value));
                 }
-                key.push(distinct_key(value));
-            }
-            if has_null {
-                continue;
-            }
-            right_map.entry(key).or_default().push(idx);
-        }
-
-        let mut left_key = Vec::with_capacity(left_key_indices.len());
-        for left_row in left_rows {
-            left_key.clear();
-            let mut has_null = false;
-            for col_idx in &left_key_indices {
-                let value = &left_row[*col_idx];
-                if matches!(value, Value::Null) {
-                    has_null = true;
-                    break;
+                if has_null {
+                    continue;
                 }
-                left_key.push(distinct_key(value));
+                left_map.entry(key).or_default().push(idx);
             }
-            if has_null {
-                continue;
-            }
-            let Some(matches) = right_map.get(&left_key) else {
-                continue;
-            };
-            for right_idx in matches {
-                let right_row = &right_rows[*right_idx];
-                let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
-                combined.extend(left_row.iter().cloned());
-                combined.extend(right_row.iter().cloned());
-                if !remaining_predicates.is_empty() {
-                    let scope = EvalScope {
-                        columns: &columns,
-                        column_scopes: &column_scopes,
-                        row: &combined,
-                        table_scope: &table_scope,
-                        cte_context,
-                        column_lookup: column_lookup.as_ref(),
-                    };
-                    let mut keep = true;
-                    for predicate in &remaining_predicates {
-                        let value = eval_expr(db, predicate, &scope, outer)?;
-                        if !value_to_bool(&value) {
-                            keep = false;
-                            break;
+            let mut right_key = Vec::with_capacity(right_key_indices.len());
+            for right_row in &right_rows {
+                right_key.clear();
+                let mut has_null = false;
+                for col_idx in &right_key_indices {
+                    let value = &right_row[*col_idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    right_key.push(distinct_key(value));
+                }
+                if has_null {
+                    continue;
+                }
+                let Some(matches) = left_map.get(&right_key) else {
+                    continue;
+                };
+                for left_idx in matches {
+                    let left_row = &left_rows[*left_idx];
+                    let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(right_row.iter().cloned());
+                    if !remaining_predicates.is_empty() {
+                        let scope = EvalScope {
+                            columns: &columns,
+                            column_scopes: &column_scopes,
+                            row: &combined,
+                            table_scope: &table_scope,
+                            cte_context,
+                            column_lookup: column_lookup.as_ref(),
+                        };
+                        let mut keep = true;
+                        for predicate in &remaining_predicates {
+                            let value = eval_expr(db, predicate, &scope, outer)?;
+                            if !value_to_bool(&value) {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        if !keep {
+                            continue;
                         }
                     }
-                    if !keep {
-                        continue;
-                    }
+                    rows.push(combined);
                 }
-                rows.push(combined);
+            }
+        } else {
+            let mut right_map: HashMap<Vec<DistinctKey>, Vec<usize>> =
+                HashMap::with_capacity(right_rows.len());
+            for (idx, row) in right_rows.iter().enumerate() {
+                let mut key = Vec::with_capacity(right_key_indices.len());
+                let mut has_null = false;
+                for col_idx in &right_key_indices {
+                    let value = &row[*col_idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    key.push(distinct_key(value));
+                }
+                if has_null {
+                    continue;
+                }
+                right_map.entry(key).or_default().push(idx);
+            }
+            let mut left_key = Vec::with_capacity(left_key_indices.len());
+            for left_row in &left_rows {
+                left_key.clear();
+                let mut has_null = false;
+                for col_idx in &left_key_indices {
+                    let value = &left_row[*col_idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    left_key.push(distinct_key(value));
+                }
+                if has_null {
+                    continue;
+                }
+                let Some(matches) = right_map.get(&left_key) else {
+                    continue;
+                };
+                for right_idx in matches {
+                    let right_row = &right_rows[*right_idx];
+                    let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(right_row.iter().cloned());
+                    if !remaining_predicates.is_empty() {
+                        let scope = EvalScope {
+                            columns: &columns,
+                            column_scopes: &column_scopes,
+                            row: &combined,
+                            table_scope: &table_scope,
+                            cte_context,
+                            column_lookup: column_lookup.as_ref(),
+                        };
+                        let mut keep = true;
+                        for predicate in &remaining_predicates {
+                            let value = eval_expr(db, predicate, &scope, outer)?;
+                            if !value_to_bool(&value) {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        if !keep {
+                            continue;
+                        }
+                    }
+                    rows.push(combined);
+                }
             }
         }
     }
@@ -7277,23 +7392,40 @@ fn compute_aggregates(
                     } else {
                         None
                     };
-                    for row in rows {
-                        let scope = EvalScope {
-                            columns,
-                            column_scopes,
-                            row,
-                            table_scope,
-                            cte_context,
-                            column_lookup: Some(&column_lookup),
-                        };
-                        let value = eval_expr(db, expr, &scope, outer)?;
-                        if !matches!(value, Value::Null) {
+                    if let Some(idx) =
+                        resolve_expr_column_index(expr, &column_lookup, columns, column_scopes)
+                    {
+                        for row in rows {
+                            let value = &row[idx];
+                            if matches!(value, Value::Null) {
+                                continue;
+                            }
                             if agg.distinct {
-                                if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
+                                if !seen.as_mut().unwrap().insert(distinct_key(value)) {
                                     continue;
                                 }
                             }
                             tally += 1;
+                        }
+                    } else {
+                        for row in rows {
+                            let scope = EvalScope {
+                                columns,
+                                column_scopes,
+                                row,
+                                table_scope,
+                                cte_context,
+                                column_lookup: Some(&column_lookup),
+                            };
+                            let value = eval_expr(db, expr, &scope, outer)?;
+                            if !matches!(value, Value::Null) {
+                                if agg.distinct {
+                                    if !seen.as_mut().unwrap().insert(distinct_key(&value)) {
+                                        continue;
+                                    }
+                                }
+                                tally += 1;
+                            }
                         }
                     }
                     tally
