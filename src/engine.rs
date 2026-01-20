@@ -116,7 +116,7 @@ pub struct GongDB {
     in_list_cache: RefCell<InListCache>,
     in_subquery_cache: RefCell<InSubqueryCache>,
     subquery_cache: RefCell<SubqueryCache>,
-    statement_cache: RefCell<HashMap<String, Statement>>,
+    statement_cache: RefCell<HashMap<String, CachedStatement>>,
     select_cache: RefCell<HashMap<String, CachedSelect>>,
 }
 
@@ -129,6 +129,12 @@ struct TriggerMeta {
 struct CachedSelect {
     types: Vec<DefaultColumnType>,
     rows: Vec<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct CachedStatement {
+    statement: Statement,
+    param_count: usize,
 }
 
 impl GongDB {
@@ -206,19 +212,30 @@ impl GongDB {
                 rows: cached.rows.clone(),
             });
         }
-        let cached = { self.statement_cache.borrow().get(sql).cloned() };
-        let stmt = if let Some(stmt) = cached {
+        let normalized = parser::normalize_statement(sql)
+            .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
+        let cache_key = normalized.normalized_sql;
+        let cached = { self.statement_cache.borrow().get(&cache_key).cloned() };
+        let template = if let Some(stmt) = cached {
             stmt
         } else {
-            let parsed = parser::parse_statement(sql)
+            let parsed = parser::parse_statement_with_params(&cache_key)
                 .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
             let mut cache = self.statement_cache.borrow_mut();
-            cache.insert(sql.to_string(), parsed.clone());
+            let cached = CachedStatement {
+                statement: parsed.statement.clone(),
+                param_count: parsed.param_count,
+            };
+            cache.insert(cache_key.clone(), cached.clone());
             if cache.len() > Self::STATEMENT_CACHE_LIMIT {
                 cache.clear();
             }
-            parsed
+            cached
         };
+        if template.param_count != normalized.params.len() {
+            return Err(GongDBError::new("parameter count mismatch"));
+        }
+        let stmt = bind_statement_params(&template.statement, &normalized.params)?;
         self.in_list_cache.replace(InListCache::new());
         self.in_subquery_cache.replace(InSubqueryCache::new());
         self.subquery_cache.replace(SubqueryCache::new());
@@ -3605,7 +3622,7 @@ fn apply_limit_offset_rows(
 
 fn expr_is_constant(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_) => true,
+        Expr::Literal(_) | Expr::Parameter(_) => true,
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Wildcard => false,
         Expr::BinaryOp { left, right, .. } => {
             expr_is_constant(left) && expr_is_constant(right)
@@ -3927,7 +3944,7 @@ fn collect_predicate_tables(expr: &Expr, tables: &[TableInfo], refs: &mut HashSe
             refs.insert(matches[0]);
             true
         }
-        Expr::Literal(_) | Expr::Wildcard => true,
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Wildcard => true,
         Expr::BinaryOp { left, right, .. } => {
             collect_predicate_tables(left, tables, refs)
                 && collect_predicate_tables(right, tables, refs)
@@ -4023,7 +4040,11 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
         Expr::IsNull { expr, .. } => expr_contains_subquery(expr),
         Expr::Cast { expr, .. } => expr_contains_subquery(expr),
         Expr::Nested(expr) => expr_contains_subquery(expr),
-        Expr::Literal(_) | Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Wildcard => {
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Wildcard => {
             false
         }
     }
@@ -5164,6 +5185,211 @@ fn is_write_statement(stmt: &Statement) -> bool {
             | Statement::Update(_)
             | Statement::Delete(_)
     )
+}
+
+fn bind_statement_params(
+    statement: &Statement,
+    params: &[Literal],
+) -> Result<Statement, GongDBError> {
+    let mut stmt = statement.clone();
+    let mut binder = ParamBinder { params };
+    binder.bind_statement(&mut stmt)?;
+    Ok(stmt)
+}
+
+struct ParamBinder<'a> {
+    params: &'a [Literal],
+}
+
+impl<'a> ParamBinder<'a> {
+    fn bind_statement(&mut self, stmt: &mut Statement) -> Result<(), GongDBError> {
+        match stmt {
+            Statement::CreateTable(create) => {
+                for column in &mut create.columns {
+                    for constraint in &mut column.constraints {
+                        if let ColumnConstraint::Default(expr) = constraint {
+                            self.bind_expr(expr)?;
+                        }
+                    }
+                }
+                for constraint in &mut create.constraints {
+                    if let TableConstraint::Check(expr) = constraint {
+                        self.bind_expr(expr)?;
+                    }
+                }
+            }
+            Statement::CreateView(create) => {
+                self.bind_select(&mut create.query)?;
+            }
+            Statement::Insert(insert) => {
+                match &mut insert.source {
+                    InsertSource::Values(rows) => {
+                        for row in rows {
+                            for expr in row {
+                                self.bind_expr(expr)?;
+                            }
+                        }
+                    }
+                    InsertSource::Select(select) => self.bind_select(select)?,
+                }
+            }
+            Statement::Update(update) => {
+                for assignment in &mut update.assignments {
+                    self.bind_expr(&mut assignment.value)?;
+                }
+                if let Some(expr) = &mut update.selection {
+                    self.bind_expr(expr)?;
+                }
+            }
+            Statement::Delete(delete) => {
+                if let Some(expr) = &mut delete.selection {
+                    self.bind_expr(expr)?;
+                }
+            }
+            Statement::Select(select) => {
+                self.bind_select(select)?;
+            }
+            Statement::BeginTransaction(_)
+            | Statement::Commit
+            | Statement::Rollback
+            | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::Reindex(_)
+            | Statement::DropView(_)
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger(_) => {}
+        }
+        Ok(())
+    }
+
+    fn bind_select(&mut self, select: &mut Select) -> Result<(), GongDBError> {
+        if let Some(with) = &mut select.with {
+            for cte in &mut with.ctes {
+                self.bind_select(cte.query.as_mut())?;
+            }
+        }
+        for item in &mut select.projection {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.bind_expr(expr)?;
+            }
+        }
+        for table_ref in &mut select.from {
+            self.bind_table_ref(table_ref)?;
+        }
+        if let Some(expr) = &mut select.selection {
+            self.bind_expr(expr)?;
+        }
+        for expr in &mut select.group_by {
+            self.bind_expr(expr)?;
+        }
+        if let Some(expr) = &mut select.having {
+            self.bind_expr(expr)?;
+        }
+        for order in &mut select.order_by {
+            self.bind_expr(&mut order.expr)?;
+        }
+        if let Some(expr) = &mut select.limit {
+            self.bind_expr(expr)?;
+        }
+        if let Some(expr) = &mut select.offset {
+            self.bind_expr(expr)?;
+        }
+        for compound in &mut select.compounds {
+            self.bind_select(compound.select.as_mut())?;
+        }
+        Ok(())
+    }
+
+    fn bind_table_ref(&mut self, table_ref: &mut TableRef) -> Result<(), GongDBError> {
+        match table_ref {
+            TableRef::Named { .. } => {}
+            TableRef::Subquery { subquery, .. } => self.bind_select(subquery.as_mut())?,
+            TableRef::Join {
+                left,
+                right,
+                constraint,
+                ..
+            } => {
+                self.bind_table_ref(left)?;
+                self.bind_table_ref(right)?;
+                if let Some(JoinConstraint::On(expr)) = constraint {
+                    self.bind_expr(expr)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_expr(&mut self, expr: &mut Expr) -> Result<(), GongDBError> {
+        match expr {
+            Expr::Parameter(idx) => {
+                let literal = self
+                    .params
+                    .get(*idx)
+                    .ok_or_else(|| GongDBError::new("missing bound parameter"))?
+                    .clone();
+                *expr = Expr::Literal(literal);
+                Ok(())
+            }
+            Expr::Literal(_)
+            | Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Wildcard => Ok(()),
+            Expr::BinaryOp { left, right, .. } => {
+                self.bind_expr(left)?;
+                self.bind_expr(right)?;
+                Ok(())
+            }
+            Expr::UnaryOp { expr, .. } => self.bind_expr(expr),
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    self.bind_expr(arg)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_result,
+            } => {
+                if let Some(expr) = operand {
+                    self.bind_expr(expr)?;
+                }
+                for (when_expr, then_expr) in when_then {
+                    self.bind_expr(when_expr)?;
+                    self.bind_expr(then_expr)?;
+                }
+                if let Some(expr) = else_result {
+                    self.bind_expr(expr)?;
+                }
+                Ok(())
+            }
+            Expr::Between { expr, low, high, .. } => {
+                self.bind_expr(expr)?;
+                self.bind_expr(low)?;
+                self.bind_expr(high)?;
+                Ok(())
+            }
+            Expr::InList { expr, list, .. } => {
+                self.bind_expr(expr)?;
+                for item in list {
+                    self.bind_expr(item)?;
+                }
+                Ok(())
+            }
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.bind_expr(expr)?;
+                self.bind_select(subquery.as_mut())?;
+                Ok(())
+            }
+            Expr::Exists(subquery) => self.bind_select(subquery.as_mut()),
+            Expr::Subquery(subquery) => self.bind_select(subquery.as_mut()),
+            Expr::IsNull { expr, .. } => self.bind_expr(expr),
+            Expr::Cast { expr, .. } => self.bind_expr(expr),
+            Expr::Nested(expr) => self.bind_expr(expr),
+        }
+    }
 }
 
 fn object_name(name: &crate::ast::ObjectName) -> String {

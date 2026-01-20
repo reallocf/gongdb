@@ -380,6 +380,8 @@ pub enum Expr {
     CompoundIdentifier(Vec<Ident>),
     /// Literal value.
     Literal(Literal),
+    /// Bound parameter placeholder.
+    Parameter(usize),
     /// Binary operator expression.
     BinaryOp {
         left: Box<Expr>,

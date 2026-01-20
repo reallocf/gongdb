@@ -3425,6 +3425,11 @@ fn encode_expr(expr: &Expr, buf: &mut Vec<u8>) -> Result<(), StorageError> {
             buf.push(3);
             encode_literal(literal, buf)?;
         }
+        Expr::Parameter(_) => {
+            return Err(StorageError::Invalid(
+                "parameters are not supported in stored expressions".to_string(),
+            ));
+        }
         Expr::BinaryOp { left, op, right } => {
             buf.push(4);
             encode_binary_operator(op, buf);

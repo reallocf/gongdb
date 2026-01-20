@@ -82,6 +82,7 @@ fn token_hint(token: &TokenKind) -> (Option<String>, bool) {
         TokenKind::Blob(_) => (Some("blob".to_string()), false),
         TokenKind::Operator(value) => (Some(value.clone()), false),
         TokenKind::Symbol(value) => (Some(value.to_string()), false),
+        TokenKind::Parameter => (Some("?".to_string()), false),
         TokenKind::Eof => (None, true),
     }
 }
@@ -95,6 +96,7 @@ enum TokenKind {
     Blob(Vec<u8>),
     Operator(String),
     Symbol(char),
+    Parameter,
     Eof,
 }
 
@@ -205,6 +207,7 @@ impl<'a> Lexer<'a> {
         self.pos += ch.len_utf8();
         let token = match ch {
             '(' | ')' | ',' | '.' | ';' => TokenKind::Symbol(ch),
+            '?' => TokenKind::Parameter,
             '*' => TokenKind::Operator(ch.to_string()),
             '+' | '-' | '/' | '%' | '=' | '<' | '>' => {
                 TokenKind::Operator(ch.to_string())
@@ -434,11 +437,22 @@ fn is_keyword(word: &str) -> bool {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    param_counter: usize,
 }
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            param_counter: 0,
+        }
+    }
+
+    fn next_param_index(&mut self) -> usize {
+        let idx = self.param_counter;
+        self.param_counter += 1;
+        idx
     }
 
     fn current(&self) -> &TokenKind {
@@ -1481,6 +1495,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Literal::Blob(value)))
             }
+            TokenKind::Parameter => {
+                self.advance();
+                Ok(Expr::Parameter(self.next_param_index()))
+            }
             TokenKind::Symbol('(') => self.parse_paren_expr_or_subquery(),
             TokenKind::Operator(op) if op == "*" => {
                 self.advance();
@@ -1921,6 +1939,80 @@ impl Parser {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NormalizedStatement {
+    pub normalized_sql: String,
+    pub params: Vec<Literal>,
+}
+
+fn parse_number_literal(text: &str) -> Result<Literal, ParserError> {
+    if text.contains('.') {
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| ParserError::new("invalid float literal"))?;
+        Ok(Literal::Float(value))
+    } else {
+        let value = text
+            .parse::<i64>()
+            .map_err(|_| ParserError::new("invalid integer literal"))?;
+        Ok(Literal::Integer(value))
+    }
+}
+
+fn emit_ident(value: &str, quoted: bool) -> String {
+    if !quoted {
+        return value.to_string();
+    }
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
+}
+
+pub fn normalize_statement(input: &str) -> Result<NormalizedStatement, ParserError> {
+    let mut lexer = Lexer::new(input);
+    let mut parts = Vec::new();
+    let mut params = Vec::new();
+    loop {
+        let token = lexer.next_token()?;
+        match token.kind {
+            TokenKind::Number(value) => {
+                params.push(parse_number_literal(&value)?);
+                parts.push("?".to_string());
+            }
+            TokenKind::String(value) => {
+                params.push(Literal::String(value));
+                parts.push("?".to_string());
+            }
+            TokenKind::Blob(value) => {
+                params.push(Literal::Blob(value));
+                parts.push("?".to_string());
+            }
+            TokenKind::Keyword(value) if value == "NULL" => {
+                params.push(Literal::Null);
+                parts.push("?".to_string());
+            }
+            TokenKind::Keyword(value) => parts.push(value),
+            TokenKind::Ident(value, quoted) => parts.push(emit_ident(&value, quoted)),
+            TokenKind::Operator(value) => parts.push(value),
+            TokenKind::Symbol(';') => {}
+            TokenKind::Symbol(value) => parts.push(value.to_string()),
+            TokenKind::Parameter => {
+                return Err(ParserError::new("parameter markers are not supported"));
+            }
+            TokenKind::Eof => break,
+        }
+    }
+    Ok(NormalizedStatement {
+        normalized_sql: parts.join(" "),
+        params,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedStatement {
+    pub statement: Statement,
+    pub param_count: usize,
+}
+
 /// Parse a SQL string into a [`Statement`].
 ///
 /// # Examples
@@ -1931,6 +2023,11 @@ impl Parser {
 /// println!("{:?}", stmt);
 /// ```
 pub fn parse_statement(input: &str) -> Result<Statement, ParserError> {
+    let parsed = parse_statement_with_params(input)?;
+    Ok(parsed.statement)
+}
+
+pub fn parse_statement_with_params(input: &str) -> Result<ParsedStatement, ParserError> {
     let mut lexer = Lexer::new(input);
     let mut tokens = Vec::new();
     loop {
@@ -1952,7 +2049,10 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParserError> {
             parser.current_token(),
         ));
     }
-    Ok(stmt)
+    Ok(ParsedStatement {
+        statement: stmt,
+        param_count: parser.param_counter,
+    })
 }
 
 #[cfg(test)]
