@@ -29,6 +29,7 @@
 
 use gongdb::ast::Literal;
 use gongdb::engine::GongDB;
+use gongdb::storage::Value;
 use rusqlite::Connection;
 use duckdb::Connection as DuckDBConnection;
 use std::time::Instant;
@@ -813,30 +814,32 @@ fn run_new_order(
     }
     
     // Create order with correct o_all_local flag
-    db.run_statement_with_params(
-        "INSERT INTO orders VALUES (?, ?, ?, ?, '2024-01-01', NULL, ?, ?)",
-        &[
-            Literal::Integer(o_id as i64),
-            Literal::Integer(d_id as i64),
-            Literal::Integer(w_id as i64),
-            Literal::Integer(c_id as i64),
-            Literal::Integer(ol_cnt as i64),
-            Literal::Integer(all_local as i64),
-        ],
+    db.run_fast_insert_rows(
+        "orders",
+        vec![vec![
+            Value::Integer(o_id as i64),
+            Value::Integer(d_id as i64),
+            Value::Integer(w_id as i64),
+            Value::Integer(c_id as i64),
+            Value::Text("2024-01-01".to_string()),
+            Value::Null,
+            Value::Integer(ol_cnt as i64),
+            Value::Integer(all_local as i64),
+        ]],
     )?;
     
     // Create new_order entry
-    db.run_statement_with_params(
-        "INSERT INTO new_order VALUES (?, ?, ?)",
-        &[
-            Literal::Integer(o_id as i64),
-            Literal::Integer(d_id as i64),
-            Literal::Integer(w_id as i64),
-        ],
+    db.run_fast_insert_rows(
+        "new_order",
+        vec![vec![
+            Value::Integer(o_id as i64),
+            Value::Integer(d_id as i64),
+            Value::Integer(w_id as i64),
+        ]],
     )?;
     
     // Create order lines
-    let mut order_line_values = Vec::with_capacity(ol_cnt);
+    let mut order_line_rows = Vec::with_capacity(ol_cnt);
     for ol_number in 1..=ol_cnt {
         let ol_i_id = (txn_id * ol_number) % items + 1;
         let ol_quantity = 1 + (txn_id % 10);
@@ -857,10 +860,18 @@ fn run_new_order(
         // Get district info from stock (s_dist_XX where XX = d_id)
         let dist_info = format!("S_DIST_{:02}", d_id);
 
-        order_line_values.push(format!(
-            "({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
-            o_id, d_id, w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, dist_info
-        ));
+        order_line_rows.push(vec![
+            Value::Integer(o_id as i64),
+            Value::Integer(d_id as i64),
+            Value::Integer(w_id as i64),
+            Value::Integer(ol_number as i64),
+            Value::Integer(ol_i_id as i64),
+            Value::Integer(ol_supply_w_id as i64),
+            Value::Null,
+            Value::Integer(ol_quantity as i64),
+            Value::Real(ol_amount),
+            Value::Text(dist_info),
+        ]);
         
         // Update stock (TPC-C spec: update s_quantity, s_ytd, s_order_cnt, s_remote_cnt)
         let remote = ol_supply_w_id != w_id;
@@ -873,11 +884,8 @@ fn run_new_order(
         )?;
     }
 
-    if !order_line_values.is_empty() {
-        db.run_statement(&format!(
-            "INSERT INTO order_line VALUES {}",
-            order_line_values.join(",")
-        ))?;
+    if !order_line_rows.is_empty() {
+        db.run_fast_insert_rows("order_line", order_line_rows)?;
     }
     
     db.run_statement("COMMIT")?;

@@ -480,6 +480,38 @@ impl GongDB {
         self.run_statement_with_params(sql, &params)
     }
 
+    /// Fast path for inserting already-materialized rows without SQL parsing.
+    pub fn run_fast_insert_rows(
+        &mut self,
+        table_name: &str,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if rows.is_empty() {
+            return Ok(DBOutput::StatementComplete(0));
+        }
+        if self.storage.get_view(table_name).is_some() {
+            return Err(GongDBError::new(format!(
+                "cannot modify view {}",
+                table_name
+            )));
+        }
+        let table = self
+            .storage
+            .get_table(table_name)
+            .ok_or_else(|| GongDBError::new(format!("no such table: {}", table_name)))?
+            .clone();
+        let mut built_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            built_rows.push(build_insert_row_from_owned_values_no_columns(
+                self, &table, row,
+            )?);
+        }
+        self.storage.insert_rows(table_name, &built_rows)?;
+        self.select_cache.borrow_mut().clear();
+        self.invalidate_table_stats(table_name);
+        Ok(DBOutput::StatementComplete(built_rows.len() as u64))
+    }
+
     fn begin_transaction(
         &mut self,
         begin: BeginTransaction,
