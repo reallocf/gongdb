@@ -3370,6 +3370,9 @@ impl StorageEngine {
     }
 
     fn write_header(&mut self) -> Result<(), StorageError> {
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return Ok(());
+        }
         let mut header = vec![0; PAGE_SIZE];
         header[..8].copy_from_slice(&FILE_MAGIC);
         write_u32(&mut header, HEADER_PAGE_SIZE_OFFSET, PAGE_SIZE as u32);
@@ -3385,6 +3388,9 @@ impl StorageEngine {
     }
 
     fn write_catalog(&mut self) -> Result<(), StorageError> {
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return Ok(());
+        }
         let mut records = Vec::new();
         for table in self.tables.values() {
             if self.catalog_format_version >= 2 {
