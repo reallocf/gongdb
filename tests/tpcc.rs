@@ -135,6 +135,8 @@ fn test_tpcc_benchmark() {
     // New Order transaction (45% of workload)
     let new_order_count = (transactions as f64 * 0.45) as usize;
     let (gongdb_time, _) = time_it(|| {
+        gongdb.defer_index_updates("order_line")?;
+        gongdb.defer_index_updates("new_order")?;
         for i in 0..new_order_count {
             run_new_order(&mut gongdb, warehouses, districts_per_warehouse, items, i)?;
         }
@@ -207,6 +209,13 @@ fn test_tpcc_benchmark() {
     
     format_result("Order Status Transaction", gongdb_time, rusqlite_time, duckdb_time);
     
+    gongdb
+        .resume_index_updates("order_line")
+        .expect("resume order_line indexes");
+    gongdb
+        .resume_index_updates("new_order")
+        .expect("resume new_order indexes");
+
     // Stock Level transaction (4% of workload)
     let stock_level_count = (transactions as f64 * 0.04) as usize;
     let (gongdb_time, _) = time_it(|| {

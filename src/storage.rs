@@ -479,6 +479,7 @@ pub struct StorageEngine {
     in_memory_txn_base_len: Option<usize>,
     deferred_index_tables: HashSet<String>,
     pending_reindex_tables: HashSet<String>,
+    pending_index_entries: HashMap<String, Vec<IndexEntry>>,
 }
 
 /// Streaming table scan iterator.
@@ -579,6 +580,7 @@ impl StorageEngine {
             in_memory_txn_base_len: None,
             deferred_index_tables: HashSet::new(),
             pending_reindex_tables: HashSet::new(),
+            pending_index_entries: HashMap::new(),
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -683,6 +685,7 @@ impl StorageEngine {
             in_memory_txn_base_len: None,
             deferred_index_tables: HashSet::new(),
             pending_reindex_tables: HashSet::new(),
+            pending_index_entries: HashMap::new(),
         };
         if needs_row_count_rebuild {
             engine.recompute_table_row_counts()?;
@@ -1182,6 +1185,29 @@ impl StorageEngine {
         self.deferred_index_tables.remove(&key);
         if self.pending_reindex_tables.remove(&key) {
             self.reindex(Some(table_name))?;
+            self.pending_index_entries
+                .retain(|index_name, _| match self.indexes.get(index_name) {
+                    Some(index) => !index.table.eq_ignore_ascii_case(table_name),
+                    None => true,
+                });
+            return Ok(());
+        }
+        let index_names: Vec<String> = self
+            .indexes
+            .values()
+            .filter(|index| index.table.eq_ignore_ascii_case(table_name))
+            .map(|index| index.name.clone())
+            .collect();
+        if index_names.is_empty() {
+            return Ok(());
+        }
+        self.clear_index_eq_cache();
+        for index_name in index_names {
+            if let Some(entries) = self.pending_index_entries.remove(&index_name) {
+                if !entries.is_empty() {
+                    self.insert_index_entries_batch(&index_name, &entries)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1218,7 +1244,7 @@ impl StorageEngine {
             return Ok(());
         }
         if self.index_updates_deferred(table_name) {
-            return self.insert_rows_without_indexes(table_name, rows);
+            return self.insert_rows_deferred_indexes(table_name, rows);
         }
         self.clear_index_eq_cache();
         let table = self
@@ -1329,6 +1355,71 @@ impl StorageEngine {
         Ok(())
     }
 
+    fn insert_rows_deferred_indexes(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<(), StorageError> {
+        self.clear_index_eq_cache();
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
+            .clone();
+        let column_map = column_index_map(&table.columns);
+        let indexes: Vec<IndexMeta> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == table_name)
+            .cloned()
+            .collect();
+        let index_positions: Vec<Vec<usize>> = indexes
+            .iter()
+            .map(|index| index_column_positions(index, &column_map))
+            .collect::<Result<_, _>>()?;
+        let mut index_entries: Vec<Vec<IndexEntry>> =
+            (0..indexes.len()).map(|_| Vec::with_capacity(rows.len())).collect();
+        let mut page_id = table.last_page;
+        let mut page = self.read_page(page_id)?;
+
+        for row in rows {
+            let record = encode_row(row)?;
+            if !has_space_for_record(&page, record.len()) {
+                let new_page_id = self.allocate_data_page()?;
+                set_next_page_id(&mut page, new_page_id);
+                self.write_page(page_id, &page)?;
+                page_id = new_page_id;
+                page = init_data_page();
+                if let Some(table) = self.tables.get_mut(table_name) {
+                    table.last_page = new_page_id;
+                }
+            }
+            let slot = insert_record(&mut page, &record)?;
+            let location = RowLocation { page_id, slot };
+            for (idx, positions) in index_positions.iter().enumerate() {
+                let key = index_key_from_row_positions(positions, row);
+                index_entries[idx].push(IndexEntry { key, row: location });
+            }
+        }
+
+        self.write_page(page_id, &page)?;
+        for (index, entries) in indexes.iter().zip(index_entries) {
+            if entries.is_empty() {
+                continue;
+            }
+            self.pending_index_entries
+                .entry(index.name.clone())
+                .or_default()
+                .extend(entries);
+        }
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.row_count = table.row_count.saturating_add(rows.len() as u64);
+        }
+        self.write_catalog()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn insert_rows_without_indexes(
         &mut self,
         table_name: &str,
@@ -1403,7 +1494,7 @@ impl StorageEngine {
         write_catalog: bool,
     ) -> Result<RowLocation, StorageError> {
         if self.index_updates_deferred(table_name) {
-            return self.insert_row_without_indexes(table_name, row, write_catalog);
+            return self.insert_row_deferred_indexes(table_name, row, write_catalog);
         }
         self.clear_index_eq_cache();
         let table = self
@@ -1468,6 +1559,65 @@ impl StorageEngine {
         Ok(location)
     }
 
+    fn insert_row_deferred_indexes(
+        &mut self,
+        table_name: &str,
+        row: &[Value],
+        write_catalog: bool,
+    ) -> Result<RowLocation, StorageError> {
+        self.clear_index_eq_cache();
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
+            .clone();
+        let column_map = column_index_map(&table.columns);
+        let indexes: Vec<IndexMeta> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == table_name)
+            .cloned()
+            .collect();
+        let index_positions: Vec<Vec<usize>> = indexes
+            .iter()
+            .map(|index| index_column_positions(index, &column_map))
+            .collect::<Result<_, _>>()?;
+        let mut page_id = table.last_page;
+        let record = encode_row(row)?;
+        let mut page = self.read_page(page_id)?;
+        if !has_space_for_record(&page, record.len()) {
+            let new_page_id = self.allocate_data_page()?;
+            let new_page = init_data_page();
+            set_next_page_id(&mut page, new_page_id);
+            self.write_page(page_id, &page)?;
+            page_id = new_page_id;
+            page = new_page;
+            if let Some(table) = self.tables.get_mut(table_name) {
+                table.last_page = new_page_id;
+            }
+        }
+
+        let slot = insert_record(&mut page, &record)?;
+        self.write_page(page_id, &page)?;
+        let location = RowLocation { page_id, slot };
+        for (index, positions) in indexes.iter().zip(index_positions.iter()) {
+            let key = index_key_from_row_positions(positions, row);
+            let entry = IndexEntry { key, row: location };
+            self.pending_index_entries
+                .entry(index.name.clone())
+                .or_default()
+                .push(entry);
+        }
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.row_count = table.row_count.saturating_add(1);
+        }
+        if write_catalog {
+            self.write_catalog()?;
+        }
+        Ok(location)
+    }
+
+    #[allow(dead_code)]
     fn insert_row_without_indexes(
         &mut self,
         table_name: &str,
@@ -1679,6 +1829,7 @@ impl StorageEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn read_record_at(
         &self,
         location: &RowLocation,
