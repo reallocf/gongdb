@@ -1077,6 +1077,10 @@ impl StorageEngine {
             .filter(|index| index.table == table_name)
             .cloned()
             .collect();
+        let index_positions: Vec<Vec<usize>> = indexes
+            .iter()
+            .map(|index| index_column_positions(index, &column_map))
+            .collect::<Result<_, _>>()?;
         let table_empty = table.row_count == 0;
         let mut unique_batch_keys: Vec<Option<HashSet<Vec<u8>>>> = indexes
             .iter()
@@ -1096,7 +1100,7 @@ impl StorageEngine {
         for row in rows {
             let mut index_keys = Vec::with_capacity(indexes.len());
             for (idx, index) in indexes.iter().enumerate() {
-                let key = index_key_from_row(index, &column_map, row)?;
+                let key = index_key_from_row_positions(&index_positions[idx], row);
                 if index.unique && !key_has_null(&key) {
                     if let Some(unique_keys) = unique_batch_keys[idx].as_mut() {
                         let encoded_key = encode_index_key(&key)?;
@@ -1156,27 +1160,26 @@ impl StorageEngine {
         let table_empty = table.row_count == 0;
         let mut page_id = table.last_page;
         let column_map = column_index_map(&table.columns);
-        let index_names: Vec<String> = self
+        let indexes: Vec<IndexMeta> = self
             .indexes
             .values()
             .filter(|index| index.table == table_name)
-            .map(|index| index.name.clone())
+            .cloned()
             .collect();
+        let index_positions: Vec<Vec<usize>> = indexes
+            .iter()
+            .map(|index| index_column_positions(index, &column_map))
+            .collect::<Result<_, _>>()?;
 
         let mut index_keys = Vec::new();
-        for index_name in &index_names {
-            let index = self
-                .indexes
-                .get(index_name)
-                .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?
-                .clone();
-            let key = index_key_from_row(&index, &column_map, row)?;
+        for (index, positions) in indexes.iter().zip(index_positions.iter()) {
+            let key = index_key_from_row_positions(positions, row);
             if index.unique && !key_has_null(&key) {
                 if !table_empty && self.index_contains_key(&index, &key)? {
                     return Err(unique_violation(&index));
                 }
             }
-            index_keys.push((index.name, key));
+            index_keys.push((index.name.clone(), key));
         }
 
         let record = encode_row(row)?;
@@ -1227,6 +1230,7 @@ impl StorageEngine {
             .clone();
 
         let column_map = column_index_map(&table.columns);
+        let index_positions = index_column_positions(&index, &column_map)?;
         let mut unique_keys = HashSet::new();
 
         self.write_page(index.first_page, &init_btree_page(PAGE_TYPE_BTREE_LEAF))?;
@@ -1234,7 +1238,7 @@ impl StorageEngine {
 
         let rows = self.scan_table_with_locations(&table.name)?;
         for (location, row) in rows {
-            let key = index_key_from_row(&index, &column_map, &row)?;
+            let key = index_key_from_row_positions(&index_positions, &row);
             if index.unique && !key_has_null(&key) {
                 let encoded_key = encode_index_key(&key)?;
                 if !unique_keys.insert(encoded_key) {
@@ -1635,10 +1639,11 @@ impl StorageEngine {
         self.indexes.insert(index_name.to_string(), updated_index);
 
         let column_map = column_index_map(&table.columns);
+        let index_positions = index_column_positions(&index, &column_map)?;
         let mut unique_keys = HashSet::new();
         let rows = self.scan_table_with_locations(&table.name)?;
         for (location, row) in rows {
-            let key = index_key_from_row(&index, &column_map, &row)?;
+            let key = index_key_from_row_positions(&index_positions, &row);
             if index.unique && !key_has_null(&key) {
                 let encoded_key = encode_index_key(&key)?;
                 if !unique_keys.insert(encoded_key) {
@@ -3366,19 +3371,26 @@ fn column_index_map(columns: &[Column]) -> HashMap<String, usize> {
     map
 }
 
-fn index_key_from_row(
+fn index_column_positions(
     index: &IndexMeta,
     column_map: &HashMap<String, usize>,
-    row: &[Value],
-) -> Result<Vec<Value>, StorageError> {
-    let mut key = Vec::with_capacity(index.columns.len());
+) -> Result<Vec<usize>, StorageError> {
+    let mut positions = Vec::with_capacity(index.columns.len());
     for column in &index.columns {
         let idx = column_map.get(&column.name.value.to_lowercase()).ok_or_else(|| {
             StorageError::Invalid(format!("unknown column in index {}", column.name.value))
         })?;
+        positions.push(*idx);
+    }
+    Ok(positions)
+}
+
+fn index_key_from_row_positions(positions: &[usize], row: &[Value]) -> Vec<Value> {
+    let mut key = Vec::with_capacity(positions.len());
+    for idx in positions {
         key.push(row[*idx].clone());
     }
-    Ok(key)
+    key
 }
 
 fn key_has_null(values: &[Value]) -> bool {
