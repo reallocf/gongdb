@@ -472,7 +472,8 @@ pub struct StorageEngine {
     page_cache: RefCell<PageCache>,
     index_eq_cache: RefCell<HashMap<IndexEqCacheKey, Vec<RowLocation>>>,
     index_eq_row_cache: RefCell<HashMap<IndexEqRowCacheKey, Vec<Vec<Value>>>>,
-    unique_index_cache: RefCell<HashMap<IndexEqCacheKey, RowLocation>>,
+    unique_index_cache: RefCell<HashMap<String, HashMap<Vec<u8>, RowLocation>>>,
+    unique_index_lookup_buf: RefCell<Vec<u8>>,
     pending_sync_writes: usize,
     in_memory_txn_log: Option<HashMap<u32, Option<Vec<u8>>>>,
     in_memory_txn_base_len: Option<usize>,
@@ -570,6 +571,7 @@ impl StorageEngine {
             index_eq_cache: RefCell::new(HashMap::new()),
             index_eq_row_cache: RefCell::new(HashMap::new()),
             unique_index_cache: RefCell::new(HashMap::new()),
+            unique_index_lookup_buf: RefCell::new(Vec::new()),
             pending_sync_writes: 0,
             in_memory_txn_log: None,
             in_memory_txn_base_len: None,
@@ -671,6 +673,7 @@ impl StorageEngine {
             index_eq_cache: RefCell::new(HashMap::new()),
             index_eq_row_cache: RefCell::new(HashMap::new()),
             unique_index_cache: RefCell::new(HashMap::new()),
+            unique_index_lookup_buf: RefCell::new(Vec::new()),
             pending_sync_writes: 0,
             in_memory_txn_log: None,
             in_memory_txn_base_len: None,
@@ -788,12 +791,16 @@ impl StorageEngine {
             return;
         }
         let mut cache = self.unique_index_cache.borrow_mut();
-        cache.retain(|key, _| !index_names.iter().any(|name| name.eq_ignore_ascii_case(&key.index_name)));
+        cache.retain(|name, _| {
+            !index_names
+                .iter()
+                .any(|index_name| index_name.eq_ignore_ascii_case(name))
+        });
     }
 
     fn clear_unique_index_cache_for_index(&self, index_name: &str) {
         let mut cache = self.unique_index_cache.borrow_mut();
-        cache.retain(|key, _| !key.index_name.eq_ignore_ascii_case(index_name));
+        cache.retain(|name, _| !name.eq_ignore_ascii_case(index_name));
     }
 
     fn cache_unique_index_entry(
@@ -808,11 +815,11 @@ impl StorageEngine {
             return Ok(());
         }
         let encoded_key = encode_index_key(&entry.key)?;
-        let key = IndexEqCacheKey {
-            index_name: index.name.clone(),
-            encoded_key,
-        };
-        self.unique_index_cache.borrow_mut().insert(key, entry.row);
+        self.unique_index_cache
+            .borrow_mut()
+            .entry(index.name.clone())
+            .or_default()
+            .insert(encoded_key, entry.row);
         Ok(())
     }
 
@@ -1838,6 +1845,95 @@ impl StorageEngine {
         if updates.is_empty() {
             return Ok(0);
         }
+        if updates.len() <= 32 {
+            let mut order: Vec<usize> = (0..updates.len()).collect();
+            order.sort_by_key(|&idx| updates[idx].0.page_id);
+            let mut applied_total = 0usize;
+            if matches!(self.mode, StorageMode::InMemory { .. }) {
+                let mut start = 0usize;
+                while start < order.len() {
+                    let page_id = updates[order[start]].0.page_id;
+                    let mut end = start + 1;
+                    while end < order.len() && updates[order[end]].0.page_id == page_id {
+                        end += 1;
+                    }
+                    let applied = self.with_page_mut(page_id, |page| {
+                        let slot_count = read_u16(page, 1) as usize;
+                        let mut applied = 0usize;
+                        for idx in start..end {
+                            let (location, data) = &updates[order[idx]];
+                            let slot = location.slot as usize;
+                            if slot >= slot_count {
+                                return Err(StorageError::Corrupt(
+                                    "invalid row location".to_string(),
+                                ));
+                            }
+                            let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                            let record_offset = read_u16(page, slot_offset) as usize;
+                            let record_len = read_u16(page, slot_offset + 2) as usize;
+                            if record_len == 0 {
+                                return Err(StorageError::NotFound("row deleted".to_string()));
+                            }
+                            if record_offset + record_len > PAGE_SIZE {
+                                return Err(StorageError::Corrupt(
+                                    "invalid row location".to_string(),
+                                ));
+                            }
+                            let record = &mut page[record_offset..record_offset + record_len];
+                            if f(record, data)? {
+                                applied = applied.saturating_add(1);
+                            }
+                        }
+                        Ok(applied)
+                    })?;
+                    applied_total = applied_total.saturating_add(applied);
+                    start = end;
+                }
+                return Ok(applied_total);
+            }
+            let mut idx = 0usize;
+            let mut current_page_id = updates[order[0]].0.page_id;
+            let mut page = self.read_page(current_page_id)?;
+            let mut modified = false;
+            while idx < order.len() {
+                let page_id = updates[order[idx]].0.page_id;
+                if page_id != current_page_id {
+                    if modified {
+                        self.write_page(current_page_id, &page)?;
+                    }
+                    current_page_id = page_id;
+                    page = self.read_page(current_page_id)?;
+                    modified = false;
+                }
+                let slot_count = read_u16(&page, 1) as usize;
+                while idx < order.len() && updates[order[idx]].0.page_id == current_page_id {
+                    let (location, data) = &updates[order[idx]];
+                    let slot = location.slot as usize;
+                    if slot >= slot_count {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                    let record_offset = read_u16(&page, slot_offset) as usize;
+                    let record_len = read_u16(&page, slot_offset + 2) as usize;
+                    if record_len == 0 {
+                        return Err(StorageError::NotFound("row deleted".to_string()));
+                    }
+                    if record_offset + record_len > PAGE_SIZE {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    let record = &mut page[record_offset..record_offset + record_len];
+                    if f(record, data)? {
+                        applied_total = applied_total.saturating_add(1);
+                        modified = true;
+                    }
+                    idx += 1;
+                }
+            }
+            if modified {
+                self.write_page(current_page_id, &page)?;
+            }
+            return Ok(applied_total);
+        }
         let mut updates_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
         for (idx, (location, _)) in updates.iter().enumerate() {
             updates_by_page
@@ -2536,8 +2632,9 @@ impl StorageEngine {
             if !can_append {
                 return Ok(false);
             }
-            let record = encode_index_entry(entry)?;
-            return self.with_page_mut(last_leaf, |page| match insert_record(page, &record) {
+            let mut buf = Vec::new();
+            encode_index_entry_into(entry, &mut buf)?;
+            return self.with_page_mut(last_leaf, |page| match insert_record(page, &buf) {
                 Ok(_) => Ok(true),
                 Err(StorageError::Invalid(msg)) if msg == "page full" => Ok(false),
                 Err(err) => Err(err),
@@ -2552,8 +2649,9 @@ impl StorageEngine {
                 return Ok(false);
             }
         }
-        let record = encode_index_entry(entry)?;
-        match insert_record(&mut page, &record) {
+        let mut buf = Vec::new();
+        encode_index_entry_into(entry, &mut buf)?;
+        match insert_record(&mut page, &buf) {
             Ok(_) => {
                 self.write_page(last_leaf, &page)?;
                 Ok(true)
@@ -2579,10 +2677,7 @@ impl StorageEngine {
             let Some(mut last_key) = last_key else {
                 return Ok(Some(0));
             };
-            let mut encoded_entries = Vec::with_capacity(entries.len());
-            for entry in entries {
-                encoded_entries.push(encode_index_entry(entry)?);
-            }
+            let mut record_buf = Vec::new();
             return self.with_page_mut(last_leaf, |page| {
                 for (idx, entry) in entries.iter().enumerate() {
                     if let Some(ref key) = last_key {
@@ -2590,8 +2685,9 @@ impl StorageEngine {
                             return Ok(Some(idx));
                         }
                     }
-                    let record = &encoded_entries[idx];
-                    match insert_record(page, record) {
+                    record_buf.clear();
+                    encode_index_entry_into(entry, &mut record_buf)?;
+                    match insert_record(page, &record_buf) {
                         Ok(_) => {
                             last_key = Some(entry.key.clone());
                         }
@@ -2613,6 +2709,7 @@ impl StorageEngine {
             None => None,
         };
         let mut modified = false;
+        let mut record_buf = Vec::new();
         for (idx, entry) in entries.iter().enumerate() {
             if let Some(ref key) = last_key {
                 if compare_index_keys(&entry.key, key) == std::cmp::Ordering::Less {
@@ -2622,8 +2719,9 @@ impl StorageEngine {
                     return Ok(Some(idx));
                 }
             }
-            let record = encode_index_entry(entry)?;
-            match insert_record(&mut page, &record) {
+            record_buf.clear();
+            encode_index_entry_into(entry, &mut record_buf)?;
+            match insert_record(&mut page, &record_buf) {
                 Ok(_) => {
                     last_key = Some(entry.key.clone());
                     modified = true;
@@ -2850,16 +2948,15 @@ impl StorageEngine {
         if key.is_empty() {
             return Ok(None);
         }
-        if matches!(self.mode, StorageMode::InMemory { .. })
+        let use_unique_cache = matches!(self.mode, StorageMode::InMemory { .. })
             && index.unique
-            && !key_has_null(key)
-        {
-            if let Ok(encoded_key) = encode_index_key(key) {
-                let cache_key = IndexEqCacheKey {
-                    index_name: index.name.clone(),
-                    encoded_key,
-                };
-                if let Some(location) = self.unique_index_cache.borrow().get(&cache_key) {
+            && !key_has_null(key);
+        if use_unique_cache {
+            let mut buf = self.unique_index_lookup_buf.borrow_mut();
+            buf.clear();
+            encode_index_key_into(key, &mut buf)?;
+            if let Some(index_cache) = self.unique_index_cache.borrow().get(&index.name) {
+                if let Some(location) = index_cache.get(buf.as_slice()) {
                     return Ok(Some(*location));
                 }
             }
@@ -2868,18 +2965,16 @@ impl StorageEngine {
             1 => self.btree_scan_eq_single_first(index.first_page, &key[0]),
             _ => self.btree_scan_eq_multi_first(index.first_page, key),
         }?;
-        if matches!(self.mode, StorageMode::InMemory { .. })
-            && index.unique
-            && !key_has_null(key)
-        {
-            if let (Some(location), Ok(encoded_key)) = (result, encode_index_key(key)) {
-                let cache_key = IndexEqCacheKey {
-                    index_name: index.name.clone(),
-                    encoded_key,
-                };
+        if use_unique_cache {
+            if let Some(location) = result {
+                let mut buf = self.unique_index_lookup_buf.borrow_mut();
+                buf.clear();
+                encode_index_key_into(key, &mut buf)?;
                 self.unique_index_cache
                     .borrow_mut()
-                    .insert(cache_key, location);
+                    .entry(index.name.clone())
+                    .or_default()
+                    .insert(buf.clone(), location);
             }
         }
         Ok(result)
@@ -3913,11 +4008,30 @@ fn encode_index_key(values: &[Value]) -> Result<Vec<u8>, StorageError> {
     Ok(buf)
 }
 
+fn encode_index_key_into(values: &[Value], buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    buf.clear();
+    if values.len() > u16::MAX as usize {
+        return Err(StorageError::Invalid("index key too wide".to_string()));
+    }
+    buf.extend_from_slice(&(values.len() as u16).to_le_bytes());
+    for value in values {
+        encode_value(value, buf)?;
+    }
+    Ok(())
+}
+
 fn encode_index_entry(entry: &IndexEntry) -> Result<Vec<u8>, StorageError> {
     let mut buf = encode_index_key(&entry.key)?;
     buf.extend_from_slice(&entry.row.page_id.to_le_bytes());
     buf.extend_from_slice(&entry.row.slot.to_le_bytes());
     Ok(buf)
+}
+
+fn encode_index_entry_into(entry: &IndexEntry, buf: &mut Vec<u8>) -> Result<(), StorageError> {
+    encode_index_key_into(&entry.key, buf)?;
+    buf.extend_from_slice(&entry.row.page_id.to_le_bytes());
+    buf.extend_from_slice(&entry.row.slot.to_le_bytes());
+    Ok(())
 }
 
 fn decode_index_entry(record: &[u8]) -> Result<IndexEntry, StorageError> {
