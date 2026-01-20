@@ -215,6 +215,7 @@ struct FastStockQuantityCache {
     generation: u64,
     quantities: HashMap<(i64, i64), i64>,
     quantities_by_warehouse: HashMap<i64, Vec<i64>>,
+    full: bool,
 }
 
 struct FastStockCaches {
@@ -506,6 +507,7 @@ impl GongDB {
                         generation: caches.generation,
                         quantities: caches.quantities,
                         quantities_by_warehouse: caches.quantities_by_warehouse,
+                        full: true,
                     },
                 );
             }
@@ -526,29 +528,26 @@ impl GongDB {
         Ok(None)
     }
 
-    fn ensure_fast_stock_caches(&mut self) -> Result<(), GongDBError> {
-        let generation = self.stock_change_counter.get();
-        let needs_refresh = self
-            .fast_stock_quantity_cache
-            .borrow()
-            .as_ref()
-            .map(|cache| cache.generation != generation)
-            .unwrap_or(true);
-        if self.fast_stock_location_cache.borrow().is_none() || needs_refresh {
-            if let Some(caches) = self.build_fast_stock_caches()? {
-                self.fast_stock_location_cache
-                    .borrow_mut()
-                    .replace(caches.locations);
-                self.fast_stock_quantity_cache.borrow_mut().replace(
-                    FastStockQuantityCache {
-                        generation: caches.generation,
-                        quantities: caches.quantities,
-                        quantities_by_warehouse: caches.quantities_by_warehouse,
-                    },
-                );
+    fn lookup_stock_location_index_only(
+        &self,
+        index: &IndexMeta,
+        w_id: i64,
+        i_id: i64,
+    ) -> Result<Option<RowLocation>, GongDBError> {
+        if let Some(cache) = self.fast_stock_location_cache.borrow().as_ref() {
+            if let Some(location) = cache.get(&(w_id, i_id)) {
+                return Ok(Some(*location));
             }
         }
-        Ok(())
+        let key = vec![Value::Integer(w_id), Value::Integer(i_id)];
+        let location = self.storage.scan_index_first_location(&index.name, &key)?;
+        if let Some(location) = location {
+            if let Some(cache) = self.fast_stock_location_cache.borrow_mut().as_mut() {
+                cache.insert((w_id, i_id), location);
+            }
+            return Ok(Some(location));
+        }
+        Ok(None)
     }
 
     fn update_fast_order_line_items_cache(&mut self, table: &TableMeta, rows: &[Vec<Value>]) {
@@ -639,40 +638,47 @@ impl GongDB {
         }
     }
 
-    fn collect_cached_order_line_items(
+    fn visit_cached_order_line_items<F>(
         &self,
         w_id: i64,
         d_id: i64,
         lower_o: i64,
         upper_o: i64,
-    ) -> Option<Vec<i64>> {
+        mut visit: F,
+    ) -> bool
+    where
+        F: FnMut(i64),
+    {
         let cache = self.fast_order_line_items_cache.borrow();
-        let cache = cache.as_ref()?;
-        let district = cache.per_district.get(&(w_id, d_id))?;
-        let mut items = Vec::new();
+        let Some(cache) = cache.as_ref() else {
+            return false;
+        };
+        let Some(district) = cache.per_district.get(&(w_id, d_id)) else {
+            return false;
+        };
         for o_id in lower_o..=upper_o {
             if o_id > 0 && (o_id as usize) <= FAST_ORDER_LINE_DENSE_MAX_O_ID {
                 let idx = o_id as usize;
                 match district.dense_orders.get(idx).and_then(|entry| entry.as_ref()) {
-                    Some(item_list) => items.extend(item_list.iter().copied()),
+                    Some(item_list) => item_list.iter().for_each(|item| visit(*item)),
                     None => {
                         if district.evicted {
-                            return None;
+                            return false;
                         }
                     }
                 }
             } else {
                 match district.orders.get(&o_id) {
-                    Some(item_list) => items.extend(item_list.iter().copied()),
+                    Some(item_list) => item_list.iter().for_each(|item| visit(*item)),
                     None => {
                         if district.evicted {
-                            return None;
+                            return false;
                         }
                     }
                 }
             }
         }
-        Some(items)
+        true
     }
 
     fn get_cached_stock_quantity(&self, w_id: i64, i_id: i64) -> Option<i64> {
@@ -3377,7 +3383,7 @@ impl GongDB {
     }
 
     fn fast_stock_quantity_for_item(
-        &mut self,
+        &self,
         stock_index: &IndexMeta,
         w_id: i64,
         item_id: i64,
@@ -3388,7 +3394,7 @@ impl GongDB {
         if let Some(qty_value) = self.get_cached_stock_quantity(w_id, item_id) {
             return Ok(Some(qty_value));
         }
-        let location = self.lookup_stock_location(stock_index, w_id, item_id)?;
+        let location = self.lookup_stock_location_index_only(stock_index, w_id, item_id)?;
         let Some(location) = location else {
             return Ok(None);
         };
@@ -3501,7 +3507,6 @@ impl GongDB {
             });
         }
 
-        self.ensure_fast_stock_caches()?;
         let mut count = 0i64;
         let generation = self.stock_change_counter.get();
         let mut fallback_seen: Option<HashSet<i64>> = None;
@@ -3524,7 +3529,7 @@ impl GongDB {
             .fast_stock_quantity_cache
             .borrow()
             .as_ref()
-            .map(|cache| cache.generation == generation)
+            .map(|cache| cache.full && cache.generation == generation)
             .unwrap_or(false);
 
         if use_qty_cache {
@@ -3546,19 +3551,22 @@ impl GongDB {
                 }
                 qty_map.get(&(w_id, item_id)).copied()
             };
-            if let Some(cached_items) =
-                self.collect_cached_order_line_items(w_id, d_id, lower_o, upper_o)
-            {
-                for item_id in cached_items {
+            if self.visit_cached_order_line_items(
+                w_id,
+                d_id,
+                lower_o,
+                upper_o,
+                |item_id| {
                     if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
-                        continue;
+                        return;
                     }
                     if let Some(qty_value) = lookup_qty(item_id) {
                         if qty_value < threshold {
                             count += 1;
                         }
                     }
-                }
+                },
+            ) {
             } else {
                 let lower_key = build_index_bound(
                     order_index.columns.len(),
@@ -3573,14 +3581,15 @@ impl GongDB {
                     Value::Blob(Vec::new()),
                 );
 
-                let locations = self
-                    .storage
-                    .scan_index_range(&order_index.name, Some(&lower_key), Some(&upper_key))?;
                 let mut item_cache = self.fast_order_line_item_offsets_cache.borrow().clone();
                 let mut item_cache_update: Option<FastOrderLineItemOffsetsCache> = None;
 
-                for location in locations {
-                    let item_id = match self.storage.with_record_at(&location, |record| {
+                self.storage.scan_index_range_visit(
+                    &order_index.name,
+                    Some(&lower_key),
+                    Some(&upper_key),
+                    |location| {
+                        let item_id = match self.storage.with_record_at(&location, |record| {
                         let cached = item_cache.as_ref().and_then(|cache| {
                             if cache.record_len == record.len() {
                                 Some(cache.item)
@@ -3614,20 +3623,22 @@ impl GongDB {
                         };
                         Ok(item)
                     }) {
-                        Ok(Some(item)) => item,
-                        Ok(None) => continue,
-                        Err(StorageError::NotFound(_)) => continue,
-                        Err(err) => return Err(GongDBError::from(err)),
-                    };
-                    if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
-                        continue;
-                    }
-                    if let Some(qty_value) = lookup_qty(item_id) {
-                        if qty_value < threshold {
-                            count += 1;
+                            Ok(Some(item)) => item,
+                            Ok(None) => return Ok(()),
+                            Err(StorageError::NotFound(_)) => return Ok(()),
+                            Err(err) => return Err(GongDBError::from(err)),
+                        };
+                        if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
+                            return Ok(());
                         }
-                    }
-                }
+                        if let Some(qty_value) = lookup_qty(item_id) {
+                            if qty_value < threshold {
+                                count += 1;
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
                 if let Some(update) = item_cache_update {
                     self.fast_order_line_item_offsets_cache
                         .borrow_mut()
@@ -3638,27 +3649,46 @@ impl GongDB {
             let mut cached_offsets = self.fast_stock_offsets_cache.borrow().clone();
             let mut cache_update: Option<FastStockOffsetsCache> = None;
 
-            if let Some(cached_items) =
-                self.collect_cached_order_line_items(w_id, d_id, lower_o, upper_o)
-            {
-                for item_id in cached_items {
-                    if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
-                        continue;
+            let mut cache_error: Option<GongDBError> = None;
+            if self.visit_cached_order_line_items(
+                w_id,
+                d_id,
+                lower_o,
+                upper_o,
+                |item_id| {
+                    if cache_error.is_some() {
+                        return;
                     }
-                    if let Some(qty_value) = self.fast_stock_quantity_for_item(
+                    if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
+                        return;
+                    }
+                    match self.fast_stock_quantity_for_item(
                         &stock_index,
                         w_id,
                         item_id,
                         &mut cached_offsets,
                         &mut cache_update,
                         generation,
-                    )? {
-                        if qty_value < threshold {
-                            count += 1;
+                    ) {
+                        Ok(Some(qty_value)) => {
+                            if qty_value < threshold {
+                                count += 1;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            cache_error = Some(err);
                         }
                     }
+                },
+            ) {
+                if let Some(err) = cache_error {
+                    return Err(err);
                 }
             } else {
+                if let Some(err) = cache_error {
+                    return Err(err);
+                }
                 let lower_key = build_index_bound(
                     order_index.columns.len(),
                     &[Value::Integer(w_id), Value::Integer(d_id)],
@@ -3672,14 +3702,15 @@ impl GongDB {
                     Value::Blob(Vec::new()),
                 );
 
-                let locations = self
-                    .storage
-                    .scan_index_range(&order_index.name, Some(&lower_key), Some(&upper_key))?;
                 let mut item_cache = self.fast_order_line_item_offsets_cache.borrow().clone();
                 let mut item_cache_update: Option<FastOrderLineItemOffsetsCache> = None;
 
-                for location in locations {
-                    let item_id = match self.storage.with_record_at(&location, |record| {
+                self.storage.scan_index_range_visit(
+                    &order_index.name,
+                    Some(&lower_key),
+                    Some(&upper_key),
+                    |location| {
+                        let item_id = match self.storage.with_record_at(&location, |record| {
                         let cached = item_cache.as_ref().and_then(|cache| {
                             if cache.record_len == record.len() {
                                 Some(cache.item)
@@ -3713,27 +3744,29 @@ impl GongDB {
                         };
                         Ok(item)
                     }) {
-                        Ok(Some(item)) => item,
-                        Ok(None) => continue,
-                        Err(StorageError::NotFound(_)) => continue,
-                        Err(err) => return Err(GongDBError::from(err)),
-                    };
-                    if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
-                        continue;
-                    }
-                    if let Some(qty_value) = self.fast_stock_quantity_for_item(
-                        &stock_index,
-                        w_id,
-                        item_id,
-                        &mut cached_offsets,
-                        &mut cache_update,
-                        generation,
-                    )? {
-                        if qty_value < threshold {
-                            count += 1;
+                            Ok(Some(item)) => item,
+                            Ok(None) => return Ok(()),
+                            Err(StorageError::NotFound(_)) => return Ok(()),
+                            Err(err) => return Err(GongDBError::from(err)),
+                        };
+                        if !self.mark_fast_stock_seen(w_id, epoch, item_id, &mut fallback_seen) {
+                            return Ok(());
                         }
-                    }
-                }
+                        if let Some(qty_value) = self.fast_stock_quantity_for_item(
+                            &stock_index,
+                            w_id,
+                            item_id,
+                            &mut cached_offsets,
+                            &mut cache_update,
+                            generation,
+                        )? {
+                            if qty_value < threshold {
+                                count += 1;
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
                 if let Some(update) = item_cache_update {
                     self.fast_order_line_item_offsets_cache
                         .borrow_mut()

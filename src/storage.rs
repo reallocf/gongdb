@@ -1081,6 +1081,25 @@ impl StorageEngine {
         Ok(rows)
     }
 
+    pub(crate) fn scan_index_range_visit<F, E>(
+        &self,
+        index_name: &str,
+        lower: Option<&[Value]>,
+        upper: Option<&[Value]>,
+        mut visit: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(RowLocation) -> Result<(), E>,
+        E: From<StorageError>,
+    {
+        let index = self
+            .indexes
+            .get(index_name)
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))
+            .map_err(E::from)?;
+        self.btree_scan_range_visit(index.first_page, lower, upper, &mut visit)
+    }
+
     pub(crate) fn scan_index_first_location(
         &self,
         index_name: &str,
@@ -3215,6 +3234,69 @@ impl StorageEngine {
         Ok(rows)
     }
 
+    fn btree_scan_range_visit<F, E>(
+        &self,
+        root: u32,
+        lower: Option<&[Value]>,
+        upper: Option<&[Value]>,
+        visit: &mut F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(RowLocation) -> Result<(), E>,
+        E: From<StorageError>,
+    {
+        let mut page_id = self.btree_find_leaf(root, lower).map_err(E::from)?;
+        loop {
+            let page = self.read_page(page_id).map_err(E::from)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(E::from(StorageError::Corrupt(
+                    "invalid btree leaf page".to_string(),
+                )));
+            }
+            let slot_count = read_u16(&page, 1) as usize;
+            for idx in 0..slot_count {
+                let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    continue;
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(E::from(StorageError::Corrupt(
+                        "invalid index record bounds".to_string(),
+                    )));
+                }
+                let record = &page[record_offset..record_offset + record_len];
+                let (lower_ordering, upper_ordering, key_end) =
+                    compare_index_record_key_range(record, lower, upper).map_err(E::from)?;
+                if let Some(_) = lower {
+                    if lower_ordering == std::cmp::Ordering::Less {
+                        continue;
+                    }
+                }
+                if let Some(_) = upper {
+                    if upper_ordering == std::cmp::Ordering::Greater {
+                        return Ok(());
+                    }
+                }
+                if key_end + 6 > record.len() {
+                    return Err(E::from(StorageError::Corrupt(
+                        "invalid index entry location".to_string(),
+                    )));
+                }
+                let page_id = read_u32(record, key_end);
+                let slot = read_u16(record, key_end + 4);
+                visit(RowLocation { page_id, slot })?;
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(())
+    }
+
     fn btree_scan_eq_multi(
         &self,
         root: u32,
@@ -4675,6 +4757,62 @@ fn compare_index_record_key(
         return Ok((std::cmp::Ordering::Less, pos));
     }
     Ok((std::cmp::Ordering::Equal, pos))
+}
+
+fn compare_index_record_key_range(
+    record: &[u8],
+    lower: Option<&[Value]>,
+    upper: Option<&[Value]>,
+) -> Result<(std::cmp::Ordering, std::cmp::Ordering, usize), StorageError> {
+    if record.len() < 2 {
+        return Err(StorageError::Corrupt("invalid index entry".to_string()));
+    }
+    let mut pos = 0;
+    let count = read_u16(record, pos) as usize;
+    pos += 2;
+    let mut lower_ord = std::cmp::Ordering::Equal;
+    let mut upper_ord = std::cmp::Ordering::Equal;
+    for idx in 0..count {
+        let (value, new_pos) = decode_value(record, pos)?;
+        pos = new_pos;
+        if let Some(low) = lower {
+            if lower_ord == std::cmp::Ordering::Equal {
+                if idx >= low.len() {
+                    lower_ord = std::cmp::Ordering::Greater;
+                } else {
+                    lower_ord = compare_index_value(&value, &low[idx]);
+                }
+            }
+        }
+        if let Some(up) = upper {
+            if upper_ord == std::cmp::Ordering::Equal {
+                if idx >= up.len() {
+                    upper_ord = std::cmp::Ordering::Greater;
+                } else {
+                    upper_ord = compare_index_value(&value, &up[idx]);
+                }
+            }
+        }
+    }
+    if let Some(low) = lower {
+        if lower_ord == std::cmp::Ordering::Equal {
+            if count < low.len() {
+                lower_ord = std::cmp::Ordering::Less;
+            } else if count > low.len() {
+                lower_ord = std::cmp::Ordering::Greater;
+            }
+        }
+    }
+    if let Some(up) = upper {
+        if upper_ord == std::cmp::Ordering::Equal {
+            if count < up.len() {
+                upper_ord = std::cmp::Ordering::Less;
+            } else if count > up.len() {
+                upper_ord = std::cmp::Ordering::Greater;
+            }
+        }
+    }
+    Ok((lower_ord, upper_ord, pos))
 }
 
 fn compare_index_value(a: &Value, b: &Value) -> std::cmp::Ordering {
