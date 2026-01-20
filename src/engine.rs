@@ -123,6 +123,8 @@ pub struct GongDB {
     statement_cache: RefCell<HashMap<String, CachedStatement>>,
     select_cache: RefCell<HashMap<String, CachedSelect>>,
     fast_update_cache: RefCell<HashMap<String, FastUpdateTemplate>>,
+    fast_select_template_cache: RefCell<HashMap<String, FastSelectTemplate>>,
+    fast_update_statement_cache: RefCell<HashMap<String, FastUpdateStatementTemplate>>,
     index_cache: RefCell<HashMap<String, Vec<IndexMeta>>>,
     column_index_cache: RefCell<HashMap<String, HashMap<String, usize>>>,
     insert_validation_cache: RefCell<HashMap<String, InsertValidationInfo>>,
@@ -177,6 +179,43 @@ struct FastSelectPlan {
     predicates: Vec<(String, Value)>,
     order_by: Option<FastOrderBy>,
     limit: Option<usize>,
+}
+
+#[derive(Clone)]
+enum FastValueSource {
+    Literal(Value),
+    Param(usize),
+}
+
+#[derive(Clone)]
+struct FastSelectTemplate {
+    table: String,
+    columns: Vec<String>,
+    predicates: Vec<(String, FastValueSource)>,
+    order_by: Option<FastOrderBy>,
+    limit: Option<FastValueSource>,
+    param_count: usize,
+}
+
+#[derive(Clone)]
+struct FastUpdateStatementTemplate {
+    table: String,
+    assignments: Vec<FastUpdateAssignmentTemplate>,
+    predicates: Vec<(String, FastValueSource)>,
+    param_count: usize,
+}
+
+#[derive(Clone)]
+struct FastUpdateAssignmentTemplate {
+    column: String,
+    action: FastUpdateActionTemplate,
+}
+
+#[derive(Clone)]
+enum FastUpdateActionTemplate {
+    Set(FastValueSource),
+    Add(FastValueSource),
+    Sub(FastValueSource),
 }
 
 #[derive(Clone)]
@@ -301,6 +340,8 @@ impl GongDB {
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
             fast_update_cache: RefCell::new(HashMap::new()),
+            fast_select_template_cache: RefCell::new(HashMap::new()),
+            fast_update_statement_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(HashMap::new()),
             column_index_cache: RefCell::new(HashMap::new()),
             insert_validation_cache: RefCell::new(HashMap::new()),
@@ -344,6 +385,8 @@ impl GongDB {
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
             fast_update_cache: RefCell::new(HashMap::new()),
+            fast_select_template_cache: RefCell::new(HashMap::new()),
+            fast_update_statement_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(HashMap::new()),
             column_index_cache: RefCell::new(HashMap::new()),
             insert_validation_cache: RefCell::new(HashMap::new()),
@@ -380,6 +423,8 @@ impl GongDB {
 
     fn invalidate_schema_caches(&self) {
         self.fast_update_cache.borrow_mut().clear();
+        self.fast_select_template_cache.borrow_mut().clear();
+        self.fast_update_statement_cache.borrow_mut().clear();
         self.index_cache.borrow_mut().clear();
         self.column_index_cache.borrow_mut().clear();
         self.insert_validation_cache.borrow_mut().clear();
@@ -2379,13 +2424,41 @@ impl GongDB {
         sql: &str,
         params: &[Literal],
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
-        match parse_fast_update_with_params(sql, params) {
-            Ok(Some(plan)) => match self.execute_fast_update_plan(plan) {
+        let trimmed = sql.trim();
+        let cached = {
+            self.fast_update_statement_cache
+                .borrow()
+                .get(trimmed)
+                .cloned()
+        };
+        let template = if let Some(template) = cached {
+            template
+        } else if let Some(template) = parse_fast_update_template(trimmed) {
+            let mut cache = self.fast_update_statement_cache.borrow_mut();
+            cache.insert(trimmed.to_string(), template.clone());
+            if cache.len() > Self::STATEMENT_CACHE_LIMIT {
+                cache.clear();
+            }
+            template
+        } else {
+            match parse_fast_update_with_params(sql, params) {
+                Ok(Some(plan)) => {
+                    return match self.execute_fast_update_plan(plan) {
+                        Ok(Some(output)) => Some(Ok(output)),
+                        Ok(None) => None,
+                        Err(err) => Some(Err(err)),
+                    }
+                }
+                Ok(None) => return None,
+                Err(err) => return Some(Err(err)),
+            }
+        };
+        match build_fast_update_plan_from_template(&template, params) {
+            Ok(plan) => match self.execute_fast_update_plan(plan) {
                 Ok(Some(output)) => Some(Ok(output)),
                 Ok(None) => None,
                 Err(err) => Some(Err(err)),
             },
-            Ok(None) => None,
             Err(err) => Some(Err(err)),
         }
     }
@@ -3824,12 +3897,33 @@ impl GongDB {
             };
             return self.execute_fast_select_plan(plan);
         }
-        match parse_fast_select_with_params(sql, params) {
-            Ok(Some(plan)) => return self.execute_fast_select_plan(plan),
-            Ok(None) => {}
+        let cached = {
+            self.fast_select_template_cache
+                .borrow()
+                .get(trimmed)
+                .cloned()
+        };
+        let template = if let Some(template) = cached {
+            template
+        } else if let Some(template) = parse_fast_select_template(trimmed) {
+            let mut cache = self.fast_select_template_cache.borrow_mut();
+            cache.insert(trimmed.to_string(), template.clone());
+            if cache.len() > Self::STATEMENT_CACHE_LIMIT {
+                cache.clear();
+            }
+            template
+        } else {
+            match parse_fast_select_with_params(sql, params) {
+                Ok(Some(plan)) => return self.execute_fast_select_plan(plan),
+                Ok(None) => {}
+                Err(err) => return Some(Err(err)),
+            }
+            return None;
+        };
+        match build_fast_select_plan_from_template(&template, params) {
+            Ok(plan) => return self.execute_fast_select_plan(plan),
             Err(err) => return Some(Err(err)),
         }
-        None
     }
 
     fn execute_fast_select_plan(
@@ -8531,6 +8625,73 @@ fn parse_fast_select(sql: &str) -> Option<FastSelectPlan> {
     })
 }
 
+fn parse_fast_select_template(sql: &str) -> Option<FastSelectTemplate> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = consume_fast_keyword(input, "SELECT")?;
+    let lower = rest.to_ascii_lowercase();
+    let from_idx = lower.find(" from ")?;
+    let columns_str = rest[..from_idx].trim();
+    if columns_str.is_empty() {
+        return None;
+    }
+    let columns = parse_fast_ident_list(columns_str)?;
+    let mut rest = &rest[from_idx + 6..];
+    let (table, remainder) = parse_fast_ident(rest)?;
+    rest = remainder;
+    let mut order_by = None;
+    let mut limit = None;
+    let rest = consume_fast_keyword(rest, "WHERE")?;
+    let mut rest = rest;
+    let lower_rest = rest.to_ascii_lowercase();
+    let mut where_end = rest.len();
+    if let Some(idx) = lower_rest.find(" order by ") {
+        where_end = where_end.min(idx);
+    }
+    if let Some(idx) = lower_rest.find(" limit ") {
+        where_end = where_end.min(idx);
+    }
+    let (where_part, remainder) = rest.split_at(where_end);
+    let mut param_pos = 0usize;
+    let predicates = parse_fast_predicates_template(where_part, &mut param_pos)?;
+    rest = remainder;
+    if let Some(after_order) = consume_fast_keyword(rest, "ORDER") {
+        let after_by = consume_fast_keyword(after_order, "BY")?;
+        let (order_col, after_col) = parse_fast_ident(after_by)?;
+        let mut desc = false;
+        let mut after_col = after_col;
+        if let Some(after_desc) = consume_fast_keyword(after_col, "DESC") {
+            desc = true;
+            after_col = after_desc;
+        } else if let Some(after_asc) = consume_fast_keyword(after_col, "ASC") {
+            after_col = after_asc;
+        }
+        order_by = Some(FastOrderBy {
+            column: order_col.to_string(),
+            desc,
+        });
+        rest = after_col;
+    }
+    if let Some(after_limit) = consume_fast_keyword(rest, "LIMIT") {
+        let (value, after_value) = parse_fast_param_literal_source(after_limit, &mut param_pos)?;
+        limit = Some(value);
+        rest = after_value;
+    }
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(FastSelectTemplate {
+        table: table.to_string(),
+        columns,
+        predicates,
+        order_by,
+        limit,
+        param_count: param_pos,
+    })
+}
+
 fn parse_fast_select_with_params(
     sql: &str,
     params: &[Literal],
@@ -8584,6 +8745,84 @@ fn parse_fast_select_with_params(
         order_by: None,
         limit: None,
     }))
+}
+
+fn bind_fast_value_source(
+    source: &FastValueSource,
+    params: &[Literal],
+) -> Result<Value, GongDBError> {
+    match source {
+        FastValueSource::Literal(value) => Ok(value.clone()),
+        FastValueSource::Param(idx) => params
+            .get(*idx)
+            .map(literal_to_value)
+            .ok_or_else(|| GongDBError::new("parameter count mismatch")),
+    }
+}
+
+fn build_fast_select_plan_from_template(
+    template: &FastSelectTemplate,
+    params: &[Literal],
+) -> Result<FastSelectPlan, GongDBError> {
+    if params.len() != template.param_count {
+        return Err(GongDBError::new("parameter count mismatch"));
+    }
+    let mut predicates = Vec::with_capacity(template.predicates.len());
+    for (column, source) in &template.predicates {
+        let value = bind_fast_value_source(source, params)?;
+        predicates.push((column.clone(), value));
+    }
+    let limit = match template.limit.as_ref() {
+        Some(source) => match bind_fast_value_source(source, params)? {
+            Value::Integer(value) if value >= 0 => Some(value as usize),
+            _ => return Err(GongDBError::new("invalid LIMIT value")),
+        },
+        None => None,
+    };
+    Ok(FastSelectPlan {
+        table: template.table.clone(),
+        columns: template.columns.clone(),
+        predicates,
+        order_by: template.order_by.clone(),
+        limit,
+    })
+}
+
+fn build_fast_update_plan_from_template(
+    template: &FastUpdateStatementTemplate,
+    params: &[Literal],
+) -> Result<FastUpdatePlan, GongDBError> {
+    if params.len() != template.param_count {
+        return Err(GongDBError::new("parameter count mismatch"));
+    }
+    let mut assignments = Vec::with_capacity(template.assignments.len());
+    for assignment in &template.assignments {
+        let action = match &assignment.action {
+            FastUpdateActionTemplate::Set(source) => {
+                FastUpdateAction::Set(bind_fast_value_source(source, params)?)
+            }
+            FastUpdateActionTemplate::Add(source) => {
+                FastUpdateAction::Add(bind_fast_value_source(source, params)?)
+            }
+            FastUpdateActionTemplate::Sub(source) => {
+                FastUpdateAction::Sub(bind_fast_value_source(source, params)?)
+            }
+        };
+        assignments.push(FastUpdateAssignment {
+            column: assignment.column.clone(),
+            action,
+        });
+    }
+    let mut predicates = Vec::with_capacity(template.predicates.len());
+    for (column, source) in &template.predicates {
+        let value = bind_fast_value_source(source, params)?;
+        predicates.push((column.clone(), value));
+    }
+    Ok(FastUpdatePlan {
+        table: template.table.clone(),
+        assignments,
+        predicates,
+    })
 }
 
 fn parse_fast_stock_level(sql: &str) -> Option<(i64, i64, i64, i64)> {
@@ -8898,6 +9137,49 @@ fn parse_fast_update(sql: &str) -> Option<FastUpdatePlan> {
         table: table_name,
         assignments,
         predicates,
+    })
+}
+
+fn parse_fast_update_template(sql: &str) -> Option<FastUpdateStatementTemplate> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = strip_prefix_ci(input, "UPDATE")?.trim_start();
+    let table_end = rest
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or_else(|| rest.len());
+    if table_end == 0 {
+        return None;
+    }
+    let table_name = rest[..table_end].trim().to_string();
+    let mut rest = rest[table_end..].trim_start();
+    rest = strip_prefix_ci(rest, "SET")?.trim_start();
+    let (assignments_str, predicates_str) = split_where_clause(rest)?;
+    let assignment_parts = split_commas_outside_quotes(assignments_str)?;
+    let mut assignments = Vec::with_capacity(assignment_parts.len());
+    let mut param_pos = 0usize;
+    for part in assignment_parts {
+        let assignment = parse_fast_update_assignment_template(part, &mut param_pos)?;
+        assignments.push(assignment);
+    }
+    if assignments.is_empty() {
+        return None;
+    }
+    let predicate_parts = split_and_outside_quotes(predicates_str)?;
+    let mut predicates = Vec::with_capacity(predicate_parts.len());
+    for part in predicate_parts {
+        let predicate = parse_fast_update_predicate_template(part, &mut param_pos)?;
+        predicates.push(predicate);
+    }
+    if predicates.is_empty() {
+        return None;
+    }
+    Some(FastUpdateStatementTemplate {
+        table: table_name,
+        assignments,
+        predicates,
+        param_count: param_pos,
     })
 }
 
@@ -9286,6 +9568,50 @@ fn parse_fast_update_assignment(input: &str) -> Option<FastUpdateAssignment> {
     })
 }
 
+fn parse_fast_update_assignment_template(
+    input: &str,
+    param_pos: &mut usize,
+) -> Option<FastUpdateAssignmentTemplate> {
+    let mut iter = input.splitn(2, '=');
+    let column = iter.next()?.trim();
+    let expr = iter.next()?.trim();
+    if column.is_empty() || expr.is_empty() {
+        return None;
+    }
+    if expr.len() >= column.len() && expr[..column.len()].eq_ignore_ascii_case(column) {
+        let after = &expr[column.len()..];
+        if !after.chars().next().map_or(false, |c| c.is_whitespace()) {
+            return None;
+        }
+        let mut rest = expr[column.len()..].trim_start();
+        let op = rest.chars().next()?;
+        if op == '+' || op == '-' {
+            rest = rest[op.len_utf8()..].trim_start();
+            let (value, remainder) = parse_fast_param_value_source(rest, param_pos)?;
+            if !remainder.trim().is_empty() {
+                return None;
+            }
+            let action = if op == '+' {
+                FastUpdateActionTemplate::Add(value)
+            } else {
+                FastUpdateActionTemplate::Sub(value)
+            };
+            return Some(FastUpdateAssignmentTemplate {
+                column: column.to_ascii_lowercase(),
+                action,
+            });
+        }
+    }
+    let (value, remainder) = parse_fast_param_value_source(expr, param_pos)?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+    Some(FastUpdateAssignmentTemplate {
+        column: column.to_ascii_lowercase(),
+        action: FastUpdateActionTemplate::Set(value),
+    })
+}
+
 fn parse_fast_update_assignment_with_params(
     input: &str,
     params: &[Literal],
@@ -9339,6 +9665,23 @@ fn parse_fast_update_predicate(input: &str) -> Option<(String, Value)> {
         return None;
     }
     let (value, remainder) = parse_fast_value(expr)?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+    Some((column.to_ascii_lowercase(), value))
+}
+
+fn parse_fast_update_predicate_template(
+    input: &str,
+    param_pos: &mut usize,
+) -> Option<(String, FastValueSource)> {
+    let mut iter = input.splitn(2, '=');
+    let column = iter.next()?.trim();
+    let expr = iter.next()?.trim();
+    if column.is_empty() || expr.is_empty() {
+        return None;
+    }
+    let (value, remainder) = parse_fast_param_value_source(expr, param_pos)?;
     if !remainder.trim().is_empty() {
         return None;
     }
@@ -9468,6 +9811,20 @@ fn parse_fast_param_value<'a>(
     parse_fast_value(rest)
 }
 
+fn parse_fast_param_value_source<'a>(
+    input: &'a str,
+    param_pos: &mut usize,
+) -> Option<(FastValueSource, &'a str)> {
+    let rest = input.trim_start();
+    if rest.starts_with('?') {
+        let idx = *param_pos;
+        *param_pos += 1;
+        return Some((FastValueSource::Param(idx), &rest[1..]));
+    }
+    let (value, remainder) = parse_fast_value(rest)?;
+    Some((FastValueSource::Literal(value), remainder))
+}
+
 fn parse_fast_param_literal<'a>(
     input: &'a str,
     params: &'a [Literal],
@@ -9484,6 +9841,20 @@ fn parse_fast_param_literal<'a>(
     parse_fast_literal(rest)
 }
 
+fn parse_fast_param_literal_source<'a>(
+    input: &'a str,
+    param_pos: &mut usize,
+) -> Option<(FastValueSource, &'a str)> {
+    let rest = input.trim_start();
+    if rest.starts_with('?') {
+        let idx = *param_pos;
+        *param_pos += 1;
+        return Some((FastValueSource::Param(idx), &rest[1..]));
+    }
+    let (value, remainder) = parse_fast_literal(rest)?;
+    Some((FastValueSource::Literal(value), remainder))
+}
+
 fn parse_fast_predicates(input: &str) -> Option<Vec<(String, Value)>> {
     let mut rest = input.trim_start();
     let mut predicates = Vec::new();
@@ -9495,6 +9866,34 @@ fn parse_fast_predicates(input: &str) -> Option<Vec<(String, Value)>> {
         }
         remainder = &remainder[1..];
         let (value, after_value) = parse_fast_literal(remainder)?;
+        predicates.push((column.to_string(), value));
+        rest = after_value.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(next) = consume_fast_keyword(rest, "AND") {
+            rest = next;
+            continue;
+        }
+        return None;
+    }
+    Some(predicates)
+}
+
+fn parse_fast_predicates_template(
+    input: &str,
+    param_pos: &mut usize,
+) -> Option<Vec<(String, FastValueSource)>> {
+    let mut rest = input.trim_start();
+    let mut predicates = Vec::new();
+    loop {
+        let (column, after_col) = parse_fast_ident(rest)?;
+        let mut remainder = after_col.trim_start();
+        if !remainder.starts_with('=') {
+            return None;
+        }
+        remainder = &remainder[1..];
+        let (value, after_value) = parse_fast_param_literal_source(remainder, param_pos)?;
         predicates.push((column.to_string(), value));
         rest = after_value.trim_start();
         if rest.is_empty() {
