@@ -1701,6 +1701,29 @@ impl GongDB {
             });
         }
 
+        if preordered_by_index
+            && !select.distinct
+            && select.group_by.is_empty()
+            && select.having.is_none()
+            && select.limit.is_some()
+            && select.offset.is_none()
+        {
+            let (limit, offset) = eval_limit_offset(self, select)?;
+            if offset == 0 {
+                if let Some(limit) = limit {
+                    if limit == 0 {
+                        return Ok(QueryResult {
+                            columns: output_columns,
+                            rows: Vec::new(),
+                        });
+                    }
+                    if filtered.len() > limit {
+                        filtered.truncate(limit);
+                    }
+                }
+            }
+        }
+
         let order_plans = if select.order_by.is_empty() {
             Vec::new()
         } else {
@@ -2123,10 +2146,12 @@ impl GongDB {
             .map(|predicate| self.build_row_predicate_plan(predicate, &table_scope, &table.columns))
             .filter(|plan| plan.steps.iter().all(|step| matches!(step, RowPredicateStep::Simple(_))));
         let mut ordered_by_index = false;
+        let mut ordered_by_desc = false;
         let mut rows = if let Some(plan) =
             choose_index_scan_plan(self, table, selection, order_by, &table_scope)
         {
             ordered_by_index = plan.ordered_by;
+            ordered_by_desc = plan.ordered_by_desc;
             scan_rows_with_index(self, &plan)?
         } else {
             let mut fresh_rows = Vec::with_capacity(table.row_count as usize);
@@ -2203,6 +2228,9 @@ impl GongDB {
                 filtered.push(row);
             }
             rows = filtered;
+        }
+        if ordered_by_index && ordered_by_desc && rows.len() > 1 {
+            rows.reverse();
         }
         Ok((rows, ordered_by_index))
     }
@@ -2841,6 +2869,7 @@ struct IndexScanPlan {
     lower: Option<Vec<Value>>,
     upper: Option<Vec<Value>>,
     ordered_by: bool,
+    ordered_by_desc: bool,
 }
 
 #[derive(Clone)]
@@ -3141,14 +3170,17 @@ fn choose_index_scan_plan_with_stats(
     let mut best_plan: Option<(IndexScanPlan, f64)> = None;
 
     for index in &indexes {
-        let ordered = order_by_matches_index(order_by, index, table_scope, &table.columns);
-        let ordered_by = !order_by.is_empty() && ordered;
+        let order_match =
+            order_by_matches_index(order_by, index, table_scope, &table.columns);
+        let ordered_by = !order_by.is_empty() && order_match.is_some();
+        let ordered_by_desc = matches!(order_match, Some(SortOrder::Desc));
         if let Some(key) = build_eq_key(index, &constraints) {
             let plan = IndexScanPlan {
                 index_name: index.name.clone(),
                 lower: Some(key.clone()),
                 upper: Some(key),
                 ordered_by,
+                ordered_by_desc,
             };
             let selectivity = estimate_index_selectivity(index, &constraints, stats);
             let cost = estimate_index_scan_cost(
@@ -3166,7 +3198,12 @@ fn choose_index_scan_plan_with_stats(
             continue;
         }
 
-        if let Some(plan) = build_prefix_range_plan(index, &constraints, ordered_by) {
+        if let Some(plan) = build_prefix_range_plan(
+            index,
+            &constraints,
+            ordered_by,
+            ordered_by_desc,
+        ) {
             let selectivity = estimate_index_selectivity(index, &constraints, stats);
             let cost = estimate_index_scan_cost(row_count, selectivity, needs_sort && !ordered_by);
             if best_plan
@@ -3181,7 +3218,9 @@ fn choose_index_scan_plan_with_stats(
 
     if !order_by.is_empty() {
         for index in &indexes {
-            if !order_by_matches_index(order_by, index, table_scope, &table.columns) {
+            let order_match =
+                order_by_matches_index(order_by, index, table_scope, &table.columns);
+            if order_match.is_none() {
                 continue;
             }
             let plan = IndexScanPlan {
@@ -3189,6 +3228,7 @@ fn choose_index_scan_plan_with_stats(
                 lower: None,
                 upper: None,
                 ordered_by: true,
+                ordered_by_desc: matches!(order_match, Some(SortOrder::Desc)),
             };
             let cost = estimate_index_scan_cost(row_count, 1.0, false);
             if best_plan
@@ -3211,6 +3251,7 @@ fn build_prefix_range_plan(
     index: &IndexMeta,
     constraints: &HashMap<String, IndexColumnConstraint>,
     ordered_by: bool,
+    ordered_by_desc: bool,
 ) -> Option<IndexScanPlan> {
     let mut prefix: Vec<Value> = Vec::new();
     for column in &index.columns {
@@ -3257,6 +3298,7 @@ fn build_prefix_range_plan(
         lower: Some(lower),
         upper: Some(upper),
         ordered_by,
+        ordered_by_desc,
     })
 }
 
@@ -3465,33 +3507,43 @@ fn order_by_matches_index(
     index: &IndexMeta,
     table_scope: &TableScope,
     columns: &[Column],
-) -> bool {
+) -> Option<SortOrder> {
     if order_by.is_empty() {
-        return false;
+        return None;
     }
     if order_by.len() > index.columns.len() {
-        return false;
+        return None;
     }
+    let mut desired_order: Option<SortOrder> = None;
     for (idx, order) in order_by.iter().enumerate() {
-        if order.asc == Some(false) {
-            return false;
-        }
         if matches!(order.nulls.as_ref(), Some(NullsOrder::Last)) {
-            return false;
+            return None;
+        }
+        let order_dir = if order.asc == Some(false) {
+            SortOrder::Desc
+        } else {
+            SortOrder::Asc
+        };
+        if let Some(existing) = desired_order.as_ref() {
+            if existing != &order_dir {
+                return None;
+            }
+        } else {
+            desired_order = Some(order_dir);
         }
         let column = match column_ref_for_expr(&order.expr, table_scope, columns) {
             Some((_idx, name)) => name,
-            None => return false,
+            None => return None,
         };
         let index_column = &index.columns[idx];
         if !index_column.name.value.eq_ignore_ascii_case(&column) {
-            return false;
+            return None;
         }
         if matches!(index_column.order, Some(SortOrder::Desc)) {
-            return false;
+            return None;
         }
     }
-    true
+    desired_order.or(Some(SortOrder::Asc))
 }
 
 fn column_ref_for_expr(
