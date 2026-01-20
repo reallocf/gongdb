@@ -194,6 +194,9 @@ impl GongDB {
     /// println!("{:?}", output);
     /// ```
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(result) = self.try_fast_insert(sql) {
+            return result;
+        }
         if let Some(cached) = { self.select_cache.borrow().get(sql).cloned() } {
             return Ok(DBOutput::Rows {
                 types: cached.types.clone(),
@@ -727,7 +730,7 @@ impl GongDB {
                     self.build_row_predicate_plan(predicate, &table_scope, &table.columns)
                 });
                 let index_plan =
-                    choose_index_scan_plan(self, &table, selection, &[], &table_scope);
+                    choose_index_scan_plan_no_stats(self, &table, selection, &[], &table_scope);
                 let mut updates = Vec::new();
                 if let Some(plan) = index_plan {
                     let locations = self.storage.scan_index_range(
@@ -969,6 +972,31 @@ impl GongDB {
         })
     }
 
+    fn try_fast_insert(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let (table_name, values) = parse_fast_insert(sql)?;
+        let table = match self.storage.get_table(&table_name) {
+            Some(table) => table.clone(),
+            None => {
+                return Some(Err(GongDBError::new(format!(
+                    "no such table: {}",
+                    table_name
+                ))))
+            }
+        };
+        let row = match build_insert_row_from_values(self, &table, &[], &values) {
+            Ok(row) => row,
+            Err(err) => return Some(Err(err)),
+        };
+        if let Err(err) = self.storage.insert_row(&table_name, &row) {
+            return Some(Err(err.into()));
+        }
+        self.invalidate_table_stats(&table_name);
+        Some(Ok(DBOutput::StatementComplete(1)))
+    }
+
     fn invalidate_table_stats(&self, table_name: &str) {
         self.stats_cache
             .borrow_mut()
@@ -976,9 +1004,19 @@ impl GongDB {
     }
 
     fn get_table_stats(&self, table: &TableMeta) -> Result<TableStats, GongDBError> {
+        const STATS_SCAN_ROW_LIMIT: usize = 2048;
         let key = table.name.to_ascii_lowercase();
         if let Some(stats) = self.stats_cache.borrow().get(&key) {
             return Ok(stats.clone());
+        }
+        let row_count = table.row_count as usize;
+        if row_count > STATS_SCAN_ROW_LIMIT {
+            let stats = TableStats {
+                row_count,
+                column_stats: HashMap::new(),
+            };
+            self.stats_cache.borrow_mut().insert(key, stats.clone());
+            return Ok(stats);
         }
         let rows = self.storage.scan_table(&table.name)?;
         let stats = compute_table_stats(&table.columns, &rows);
@@ -4397,6 +4435,107 @@ fn object_name(name: &crate::ast::ObjectName) -> String {
         .map(|part| part.value.clone())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    if input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&input[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Value>)> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = strip_prefix_ci(input, "INSERT INTO")?;
+    let mut rest = rest.trim_start();
+    let table_end = rest
+        .find(char::is_whitespace)
+        .unwrap_or_else(|| rest.len());
+    if table_end == 0 {
+        return None;
+    }
+    let table_name = rest[..table_end].trim().to_string();
+    rest = rest[table_end..].trim_start();
+    rest = strip_prefix_ci(rest, "VALUES")?.trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let (values, remainder) = parse_fast_values(&rest[1..])?;
+    let remainder = remainder.trim_start();
+    if !remainder.is_empty() {
+        return None;
+    }
+    Some((table_name, values))
+}
+
+fn parse_fast_values(input: &str) -> Option<(Vec<Value>, &str)> {
+    let mut values = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with(')') {
+            return Some((values, &rest[1..]));
+        }
+        let (value, next) = parse_fast_value(rest)?;
+        values.push(value);
+        rest = next.trim_start();
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+            continue;
+        }
+        if rest.starts_with(')') {
+            return Some((values, &rest[1..]));
+        }
+        return None;
+    }
+}
+
+fn parse_fast_value(input: &str) -> Option<(Value, &str)> {
+    let rest = input.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.starts_with('\'') {
+        let mut out = String::new();
+        let mut idx = 1;
+        let chars: Vec<char> = rest.chars().collect();
+        while idx < chars.len() {
+            let ch = chars[idx];
+            if ch == '\'' {
+                if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
+                    out.push('\'');
+                    idx += 2;
+                    continue;
+                }
+                let remainder = &rest[idx + 1..];
+                return Some((Value::Text(out), remainder));
+            }
+            out.push(ch);
+            idx += 1;
+        }
+        return None;
+    }
+    let token_end = rest
+        .find(|ch: char| ch == ',' || ch == ')')
+        .unwrap_or_else(|| rest.len());
+    let token = rest[..token_end].trim();
+    if token.is_empty() {
+        return None;
+    }
+    let remainder = &rest[token_end..];
+    if token.eq_ignore_ascii_case("NULL") {
+        return Some((Value::Null, remainder));
+    }
+    if token.contains('.') || token.contains('e') || token.contains('E') {
+        let value = token.parse::<f64>().ok()?;
+        return Some((Value::Real(value), remainder));
+    }
+    let value = token.parse::<i64>().ok()?;
+    Some((Value::Integer(value), remainder))
 }
 
 fn qualified_wildcard_indices(qualifier: &str, column_scopes: &[TableScope]) -> Vec<usize> {

@@ -231,6 +231,8 @@ pub struct StorageSnapshot {
     indexes: HashMap<String, IndexMeta>,
     views: HashMap<String, ViewMeta>,
     free_pages: Vec<u32>,
+    in_memory_base_len: Option<usize>,
+    use_in_memory_log: bool,
 }
 
 #[derive(Debug)]
@@ -429,6 +431,8 @@ pub struct StorageEngine {
     index_eq_cache: RefCell<HashMap<IndexEqCacheKey, Vec<RowLocation>>>,
     index_eq_row_cache: RefCell<HashMap<IndexEqRowCacheKey, Vec<Vec<Value>>>>,
     pending_sync_writes: usize,
+    in_memory_txn_log: Option<HashMap<u32, Option<Vec<u8>>>>,
+    in_memory_txn_base_len: Option<usize>,
 }
 
 /// Streaming table scan iterator.
@@ -523,6 +527,8 @@ impl StorageEngine {
             index_eq_cache: RefCell::new(HashMap::new()),
             index_eq_row_cache: RefCell::new(HashMap::new()),
             pending_sync_writes: 0,
+            in_memory_txn_log: None,
+            in_memory_txn_base_len: None,
         };
         engine.write_header()?;
         engine.write_catalog()?;
@@ -621,6 +627,8 @@ impl StorageEngine {
             index_eq_cache: RefCell::new(HashMap::new()),
             index_eq_row_cache: RefCell::new(HashMap::new()),
             pending_sync_writes: 0,
+            in_memory_txn_log: None,
+            in_memory_txn_base_len: None,
         };
         if needs_row_count_rebuild {
             engine.recompute_table_row_counts()?;
@@ -633,14 +641,18 @@ impl StorageEngine {
 
     /// Capture a snapshot of storage state for transactional rollback.
     pub fn snapshot(&self) -> Result<StorageSnapshot, StorageError> {
-        let mode = match &self.mode {
-            StorageMode::InMemory { pages } => StorageModeSnapshot::InMemory { pages: pages.clone() },
+        let (mode, in_memory_base_len, use_in_memory_log) = match &self.mode {
+            StorageMode::InMemory { pages } => (
+                StorageModeSnapshot::InMemory { pages: Vec::new() },
+                Some(pages.len()),
+                true,
+            ),
             StorageMode::OnDisk { file } => {
                 let mut clone = file.try_clone()?;
                 clone.seek(SeekFrom::Start(0))?;
                 let mut data = Vec::new();
                 clone.read_to_end(&mut data)?;
-                StorageModeSnapshot::OnDisk { data }
+                (StorageModeSnapshot::OnDisk { data }, None, false)
             }
         };
         Ok(StorageSnapshot {
@@ -652,6 +664,8 @@ impl StorageEngine {
             indexes: self.indexes.clone(),
             views: self.views.clone(),
             free_pages: self.free_pages.clone(),
+            in_memory_base_len,
+            use_in_memory_log,
         })
     }
 
@@ -661,7 +675,25 @@ impl StorageEngine {
     pub fn restore(&mut self, snapshot: StorageSnapshot) -> Result<(), StorageError> {
         match (&mut self.mode, snapshot.mode) {
             (StorageMode::InMemory { pages }, StorageModeSnapshot::InMemory { pages: snap }) => {
-                *pages = snap;
+                if snapshot.use_in_memory_log {
+                    let base_len = snapshot
+                        .in_memory_base_len
+                        .ok_or_else(|| StorageError::Invalid("missing in-memory base length".to_string()))?;
+                    if let Some(log) = self.in_memory_txn_log.take() {
+                        for (page_id, old_data) in log {
+                            if let Some(data) = old_data {
+                                if page_id as usize >= pages.len() {
+                                    pages.resize(page_id as usize + 1, vec![0; PAGE_SIZE]);
+                                }
+                                pages[page_id as usize] = data;
+                            }
+                        }
+                    }
+                    pages.truncate(base_len);
+                    self.in_memory_txn_base_len = None;
+                } else {
+                    *pages = snap;
+                }
             }
             (StorageMode::OnDisk { file }, StorageModeSnapshot::OnDisk { data }) => {
                 file.seek(SeekFrom::Start(0))?;
@@ -698,6 +730,10 @@ impl StorageEngine {
     /// Mark the start of a transaction.
     pub fn begin_transaction(&mut self) {
         self.txn_active = true;
+        if let StorageMode::InMemory { pages } = &self.mode {
+            self.in_memory_txn_base_len = Some(pages.len());
+            self.in_memory_txn_log = Some(HashMap::new());
+        }
     }
 
     /// Commit the active transaction and flush dirty pages.
@@ -710,6 +746,8 @@ impl StorageEngine {
             }
             let _ = std::fs::remove_file(&journal.path);
         }
+        self.in_memory_txn_log = None;
+        self.in_memory_txn_base_len = None;
         Ok(())
     }
 
@@ -722,6 +760,8 @@ impl StorageEngine {
         self.page_cache.borrow_mut().clear();
         self.index_eq_cache.borrow_mut().clear();
         self.index_eq_row_cache.borrow_mut().clear();
+        self.in_memory_txn_log = None;
+        self.in_memory_txn_base_len = None;
     }
 
     /// Acquire a shared read lock for the given transaction.
@@ -1981,6 +2021,21 @@ impl StorageEngine {
         match &mut self.mode {
             StorageMode::InMemory { pages } => {
                 let idx = page_id as usize;
+                if self.txn_active {
+                    if let Some(log) = self.in_memory_txn_log.as_mut() {
+                        if !log.contains_key(&page_id) {
+                            let base_len = self.in_memory_txn_base_len.unwrap_or(pages.len());
+                            if idx < base_len {
+                                if idx >= pages.len() {
+                                    pages.resize(idx + 1, vec![0; PAGE_SIZE]);
+                                }
+                                log.insert(page_id, Some(pages[idx].clone()));
+                            } else {
+                                log.insert(page_id, None);
+                            }
+                        }
+                    }
+                }
                 if idx >= pages.len() {
                     pages.resize(idx + 1, vec![0; PAGE_SIZE]);
                     self.reserved_pages = pages.len() as u32;
