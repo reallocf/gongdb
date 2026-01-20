@@ -963,7 +963,12 @@ impl StorageEngine {
                 _ => self.btree_scan_range(index.first_page, lower, upper)?,
             }
         } else {
-            self.btree_scan_range(index.first_page, lower, upper)?
+            match (lower, upper) {
+                (Some(lower), Some(upper)) if lower == upper => {
+                    self.btree_scan_eq_multi(index.first_page, lower)?
+                }
+                _ => self.btree_scan_range(index.first_page, lower, upper)?,
+            }
         };
         if let Some(key) = cache_key {
             self.index_eq_cache.borrow_mut().insert(key, rows.clone());
@@ -1759,6 +1764,59 @@ impl StorageEngine {
                     }
                 }
                 rows.push(entry.row);
+            }
+            let next = get_next_page_id(&page);
+            if next == 0 {
+                break;
+            }
+            page_id = next;
+        }
+        Ok(rows)
+    }
+
+    fn btree_scan_eq_multi(
+        &self,
+        root: u32,
+        target: &[Value],
+    ) -> Result<Vec<RowLocation>, StorageError> {
+        let mut page_id = self.btree_find_leaf(root, Some(target))?;
+        let mut rows = Vec::new();
+        loop {
+            let page = self.read_page(page_id)?;
+            if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+                return Err(StorageError::Corrupt(
+                    "invalid btree leaf page".to_string(),
+                ));
+            }
+            let slot_count = read_u16(&page, 1) as usize;
+            for idx in 0..slot_count {
+                let slot_offset = PAGE_SIZE - (idx + 1) * 4;
+                let record_offset = read_u16(&page, slot_offset) as usize;
+                let record_len = read_u16(&page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    continue;
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt(
+                        "invalid index record bounds".to_string(),
+                    ));
+                }
+                let record = &page[record_offset..record_offset + record_len];
+                let (ordering, key_end) = compare_index_record_key(record, target)?;
+                match ordering {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => {
+                        if key_end + 6 > record.len() {
+                            return Err(StorageError::Corrupt(
+                                "invalid index entry location".to_string(),
+                            ));
+                        }
+                        let page_id = read_u32(record, key_end);
+                        let slot = read_u16(record, key_end + 4);
+                        rows.push(RowLocation { page_id, slot });
+                    }
+                    std::cmp::Ordering::Greater => return Ok(rows),
+                }
             }
             let next = get_next_page_id(&page);
             if next == 0 {
@@ -2923,6 +2981,33 @@ fn compare_index_keys(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
         }
     }
     a.len().cmp(&b.len())
+}
+
+fn compare_index_record_key(
+    record: &[u8],
+    target: &[Value],
+) -> Result<(std::cmp::Ordering, usize), StorageError> {
+    if record.len() < 2 {
+        return Err(StorageError::Corrupt("invalid index entry".to_string()));
+    }
+    let mut pos = 0;
+    let count = read_u16(record, pos) as usize;
+    pos += 2;
+    for idx in 0..count {
+        if idx >= target.len() {
+            return Ok((std::cmp::Ordering::Greater, pos));
+        }
+        let (value, new_pos) = decode_value(record, pos)?;
+        pos = new_pos;
+        let ord = compare_index_value(&value, &target[idx]);
+        if ord != std::cmp::Ordering::Equal {
+            return Ok((ord, pos));
+        }
+    }
+    if count < target.len() {
+        return Ok((std::cmp::Ordering::Less, pos));
+    }
+    Ok((std::cmp::Ordering::Equal, pos))
 }
 
 fn compare_index_value(a: &Value, b: &Value) -> std::cmp::Ordering {
