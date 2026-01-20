@@ -27,6 +27,7 @@
 //!
 //! Run with: `cargo test --test tpcc -- --nocapture`
 
+use gongdb::ast::Literal;
 use gongdb::engine::GongDB;
 use rusqlite::Connection;
 use duckdb::Connection as DuckDBConnection;
@@ -790,10 +791,13 @@ fn run_new_order(
     let o_id = 3001 + (txn_id % 1000); // Simulated order ID
     
     // Update district's next order ID (TPC-C spec requirement)
-    db.run_statement(&format!(
-        "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = {} AND d_id = {}",
-        w_id, d_id
-    ))?;
+    db.run_statement_with_params(
+        "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = ? AND d_id = ?",
+        &[
+            Literal::Integer(w_id as i64),
+            Literal::Integer(d_id as i64),
+        ],
+    )?;
     
     // Track if any remote warehouse is used (for o_all_local)
     // TPC-C spec: o_all_local = 1 if all order lines come from local warehouse, 0 otherwise
@@ -809,16 +813,27 @@ fn run_new_order(
     }
     
     // Create order with correct o_all_local flag
-    db.run_statement(&format!(
-        "INSERT INTO orders VALUES ({}, {}, {}, {}, '2024-01-01', NULL, {}, {})",
-        o_id, d_id, w_id, c_id, ol_cnt, all_local
-    ))?;
+    db.run_statement_with_params(
+        "INSERT INTO orders VALUES (?, ?, ?, ?, '2024-01-01', NULL, ?, ?)",
+        &[
+            Literal::Integer(o_id as i64),
+            Literal::Integer(d_id as i64),
+            Literal::Integer(w_id as i64),
+            Literal::Integer(c_id as i64),
+            Literal::Integer(ol_cnt as i64),
+            Literal::Integer(all_local as i64),
+        ],
+    )?;
     
     // Create new_order entry
-    db.run_statement(&format!(
-        "INSERT INTO new_order VALUES ({}, {}, {})",
-        o_id, d_id, w_id
-    ))?;
+    db.run_statement_with_params(
+        "INSERT INTO new_order VALUES (?, ?, ?)",
+        &[
+            Literal::Integer(o_id as i64),
+            Literal::Integer(d_id as i64),
+            Literal::Integer(w_id as i64),
+        ],
+    )?;
     
     // Create order lines
     let mut order_line_values = Vec::with_capacity(ol_cnt);
@@ -848,19 +863,14 @@ fn run_new_order(
         ));
         
         // Update stock (TPC-C spec: update s_quantity, s_ytd, s_order_cnt, s_remote_cnt)
-        if ol_supply_w_id != w_id {
-            // Remote warehouse - update remote count
-            db.run_statement(&format!(
-                "UPDATE stock SET s_quantity = s_quantity - {}, s_ytd = s_ytd + {}, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 1 WHERE s_w_id = {} AND s_i_id = {}",
-                ol_quantity, ol_quantity, ol_supply_w_id, ol_i_id
-            ))?;
-        } else {
-            // Local warehouse
-            db.run_statement(&format!(
-                "UPDATE stock SET s_quantity = s_quantity - {}, s_ytd = s_ytd + {}, s_order_cnt = s_order_cnt + 1 WHERE s_w_id = {} AND s_i_id = {}",
-                ol_quantity, ol_quantity, ol_supply_w_id, ol_i_id
-            ))?;
-        }
+        let remote = ol_supply_w_id != w_id;
+        db.run_fast_stock_update(
+            ol_quantity as i64,
+            ol_quantity as i64,
+            ol_supply_w_id as i64,
+            ol_i_id as i64,
+            remote,
+        )?;
     }
 
     if !order_line_values.is_empty() {
@@ -1107,28 +1117,45 @@ fn run_payment(
     db.run_statement("BEGIN TRANSACTION")?;
     
     // Update warehouse (always local warehouse)
-    db.run_statement(&format!(
-        "UPDATE warehouse SET w_ytd = w_ytd + {} WHERE w_id = {}",
-        payment, w_id
-    ))?;
+    db.run_statement_with_params(
+        "UPDATE warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?",
+        &[Literal::Float(payment), Literal::Integer(w_id as i64)],
+    )?;
     
     // Update district (always local district)
-    db.run_statement(&format!(
-        "UPDATE district SET d_ytd = d_ytd + {} WHERE d_w_id = {} AND d_id = {}",
-        payment, w_id, d_id
-    ))?;
+    db.run_statement_with_params(
+        "UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?",
+        &[
+            Literal::Float(payment),
+            Literal::Integer(w_id as i64),
+            Literal::Integer(d_id as i64),
+        ],
+    )?;
     
     // Update customer (may be remote)
-    db.run_statement(&format!(
-        "UPDATE customer SET c_balance = c_balance - {}, c_ytd_payment = c_ytd_payment + {}, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = {} AND c_d_id = {} AND c_id = {}",
-        payment, payment, c_w_id, c_d_id, c_id
-    ))?;
+    db.run_statement_with_params(
+        "UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
+        &[
+            Literal::Float(payment),
+            Literal::Float(payment),
+            Literal::Integer(c_w_id as i64),
+            Literal::Integer(c_d_id as i64),
+            Literal::Integer(c_id as i64),
+        ],
+    )?;
     
     // Insert into history table (TPC-C spec requirement)
-    db.run_statement(&format!(
-        "INSERT INTO history VALUES ({}, {}, {}, {}, {}, '2024-01-01', {}, 'Payment history data')",
-        c_id, c_d_id, c_w_id, d_id, w_id, payment
-    ))?;
+    db.run_statement_with_params(
+        "INSERT INTO history VALUES (?, ?, ?, ?, ?, '2024-01-01', ?, 'Payment history data')",
+        &[
+            Literal::Integer(c_id as i64),
+            Literal::Integer(c_d_id as i64),
+            Literal::Integer(c_w_id as i64),
+            Literal::Integer(d_id as i64),
+            Literal::Integer(w_id as i64),
+            Literal::Float(payment),
+        ],
+    )?;
     
     db.run_statement("COMMIT")?;
     Ok(())
@@ -1435,23 +1462,36 @@ fn run_delivery(
         // TPC-C spec: Delete the oldest new_order entry for this district
         // Note: In a real implementation, we'd first query for MIN(no_o_id), then delete it
         // This simplified version assumes the order exists
-        db.run_statement(&format!(
-            "DELETE FROM new_order WHERE no_w_id = {} AND no_d_id = {} AND no_o_id = {}",
-            w_id, d_id, o_id
-        ))?;
+        db.run_statement_with_params(
+            "DELETE FROM new_order WHERE no_w_id = ? AND no_d_id = ? AND no_o_id = ?",
+            &[
+                Literal::Integer(w_id as i64),
+                Literal::Integer(d_id as i64),
+                Literal::Integer(o_id as i64),
+            ],
+        )?;
         
         // TPC-C spec: Update order with carrier ID (1-10)
         let carrier_id = 1 + (txn_id % 10);
-        db.run_statement(&format!(
-            "UPDATE orders SET o_carrier_id = {} WHERE o_w_id = {} AND o_d_id = {} AND o_id = {}",
-            carrier_id, w_id, d_id, o_id
-        ))?;
+        db.run_statement_with_params(
+            "UPDATE orders SET o_carrier_id = ? WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?",
+            &[
+                Literal::Integer(carrier_id as i64),
+                Literal::Integer(w_id as i64),
+                Literal::Integer(d_id as i64),
+                Literal::Integer(o_id as i64),
+            ],
+        )?;
         
         // TPC-C spec: Update order lines with delivery date
-        db.run_statement(&format!(
-            "UPDATE order_line SET ol_delivery_d = '2024-01-01' WHERE ol_w_id = {} AND ol_d_id = {} AND ol_o_id = {}",
-            w_id, d_id, o_id
-        ))?;
+        db.run_statement_with_params(
+            "UPDATE order_line SET ol_delivery_d = '2024-01-01' WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",
+            &[
+                Literal::Integer(w_id as i64),
+                Literal::Integer(d_id as i64),
+                Literal::Integer(o_id as i64),
+            ],
+        )?;
         
         // TPC-C spec: Update customer balance (add sum of ol_amount) and delivery count
         db.run_statement(&format!(

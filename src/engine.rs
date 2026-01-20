@@ -382,6 +382,104 @@ impl GongDB {
         }
     }
 
+    /// Execute a SQL statement with pre-bound parameters.
+    ///
+    /// The SQL must use `?` parameter markers. This method skips normalization
+    /// so callers can reuse parameterized statements to avoid per-call parsing
+    /// overhead.
+    pub fn run_statement_with_params(
+        &mut self,
+        sql: &str,
+        params: &[Literal],
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        let cached = { self.statement_cache.borrow().get(sql).cloned() };
+        let template = if let Some(stmt) = cached {
+            stmt
+        } else {
+            let parsed = parser::parse_statement_with_params(sql)
+                .map_err(|e| GongDBError::parse(e.sqlite_message_with_sql(sql)))?;
+            let mut cache = self.statement_cache.borrow_mut();
+            let cached = CachedStatement {
+                statement: parsed.statement.clone(),
+                param_count: parsed.param_count,
+            };
+            cache.insert(sql.to_string(), cached.clone());
+            if cache.len() > Self::STATEMENT_CACHE_LIMIT {
+                cache.clear();
+            }
+            cached
+        };
+        if template.param_count != params.len() {
+            return Err(GongDBError::new("parameter count mismatch"));
+        }
+        let stmt = bind_statement_params(&template.statement, params)?;
+        self.in_list_cache.replace(InListCache::new());
+        self.in_subquery_cache.replace(InSubqueryCache::new());
+        self.subquery_cache.replace(SubqueryCache::new());
+        match stmt {
+            Statement::BeginTransaction(begin) => self.begin_transaction(begin),
+            Statement::Commit => self.commit_transaction(),
+            Statement::Rollback => self.rollback_transaction(),
+            _ => {
+                let is_write = is_write_statement(&stmt);
+                if is_write {
+                    self.select_cache.borrow_mut().clear();
+                }
+                let lock = self.acquire_statement_lock(is_write)?;
+                let result = self.execute_statement(stmt);
+                match result {
+                    Ok(output) => {
+                        self.release_statement_lock(lock);
+                        Ok(output)
+                    }
+                    Err(err) => {
+                        if self.transaction.is_some() {
+                            if let Err(rollback_err) = self.rollback_internal() {
+                                self.release_statement_lock(lock);
+                                return Err(rollback_err);
+                            }
+                        }
+                        self.release_statement_lock(lock);
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fast path for TPC-C stock updates without SQL parsing.
+    pub fn run_fast_stock_update(
+        &mut self,
+        quantity: i64,
+        ytd: i64,
+        w_id: i64,
+        i_id: i64,
+        remote: bool,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        let plan = FastStockUpdatePlan {
+            quantity,
+            ytd,
+            w_id,
+            i_id,
+            remote,
+        };
+        if let Some(result) = self.apply_fast_stock_update(plan) {
+            return result;
+        }
+        let sql = if remote {
+            "UPDATE stock SET s_quantity = s_quantity - ?, s_ytd = s_ytd + ?, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + 1 WHERE s_w_id = ? AND s_i_id = ?"
+        } else {
+            "UPDATE stock SET s_quantity = s_quantity - ?, s_ytd = s_ytd + ?, s_order_cnt = s_order_cnt + 1 WHERE s_w_id = ? AND s_i_id = ?"
+        };
+        let params = [
+            Literal::Integer(quantity),
+            Literal::Integer(ytd),
+            Literal::Integer(w_id),
+            Literal::Integer(i_id),
+        ];
+        self.run_statement_with_params(sql, &params)
+    }
+
     fn begin_transaction(
         &mut self,
         begin: BeginTransaction,
@@ -1580,6 +1678,13 @@ impl GongDB {
         sql: &str,
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let plan = parse_fast_stock_update(sql)?;
+        self.apply_fast_stock_update(plan)
+    }
+
+    fn apply_fast_stock_update(
+        &mut self,
+        plan: FastStockUpdatePlan,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let mut target_index: Option<IndexMeta> = None;
         for index in self.table_indexes_cached("stock") {
             if !index.table.eq_ignore_ascii_case("stock") || !index.unique {
