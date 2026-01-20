@@ -1385,6 +1385,10 @@ impl StorageEngine {
             .get(table_name)
             .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
             .clone();
+        let table_key = table_name.to_ascii_lowercase();
+        if table.row_count == 0 || self.pending_reindex_tables.contains(&table_key) {
+            return self.insert_rows_without_indexes(table_name, rows);
+        }
         let column_map = column_index_map(&table.columns);
         let indexes: Vec<IndexMeta> = self
             .indexes
@@ -1590,6 +1594,10 @@ impl StorageEngine {
             .get(table_name)
             .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
             .clone();
+        let table_key = table_name.to_ascii_lowercase();
+        if table.row_count == 0 || self.pending_reindex_tables.contains(&table_key) {
+            return self.insert_row_without_indexes(table_name, row, write_catalog);
+        }
         let column_map = column_index_map(&table.columns);
         let indexes: Vec<IndexMeta> = self
             .indexes
