@@ -808,7 +808,7 @@ fn run_new_order(
     }
     
     // Create order with correct o_all_local flag
-    db.run_fast_insert_rows(
+    db.run_fast_insert_rows_unchecked(
         "orders",
         vec![vec![
             Value::Integer(o_id as i64),
@@ -823,7 +823,7 @@ fn run_new_order(
     )?;
     
     // Create new_order entry
-    db.run_fast_insert_rows(
+    db.run_fast_insert_rows_unchecked(
         "new_order",
         vec![vec![
             Value::Integer(o_id as i64),
@@ -884,7 +884,7 @@ fn run_new_order(
     }
 
     if !order_line_rows.is_empty() {
-        db.run_fast_insert_rows("order_line", order_line_rows)?;
+        db.run_fast_insert_rows_unchecked("order_line", order_line_rows)?;
     }
     
     db.run_statement("COMMIT")?;

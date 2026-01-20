@@ -1150,6 +1150,23 @@ impl StorageEngine {
         table_name: &str,
         rows: &[Vec<Value>],
     ) -> Result<(), StorageError> {
+        self.insert_rows_internal(table_name, rows, true)
+    }
+
+    pub fn insert_rows_unchecked(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+    ) -> Result<(), StorageError> {
+        self.insert_rows_internal(table_name, rows, false)
+    }
+
+    fn insert_rows_internal(
+        &mut self,
+        table_name: &str,
+        rows: &[Vec<Value>],
+        check_unique: bool,
+    ) -> Result<(), StorageError> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -1171,30 +1188,38 @@ impl StorageEngine {
             .map(|index| index_column_positions(index, &column_map))
             .collect::<Result<_, _>>()?;
         let table_empty = table.row_count == 0;
-        let mut unique_batch_keys: Vec<Option<HashSet<Vec<u8>>>> = indexes
-            .iter()
-            .map(|index| {
-                if index.unique && table_empty {
-                    Some(HashSet::new())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut unique_append_keys: Vec<Option<UniqueAppendState>> = indexes
-            .iter()
-            .map(|index| {
-                if index.unique && !table_empty {
-                    match self.index_last_key(index) {
-                        Ok(Some(key)) => Some(UniqueAppendState::new(Some(key))),
-                        Ok(None) => None,
-                        Err(_) => None,
+        let mut unique_batch_keys: Vec<Option<HashSet<Vec<u8>>>> = if check_unique {
+            indexes
+                .iter()
+                .map(|index| {
+                    if index.unique && table_empty {
+                        Some(HashSet::new())
+                    } else {
+                        None
                     }
-                } else {
-                    None
-                }
-            })
-            .collect();
+                })
+                .collect()
+        } else {
+            vec![None; indexes.len()]
+        };
+        let mut unique_append_keys: Vec<Option<UniqueAppendState>> = if check_unique {
+            indexes
+                .iter()
+                .map(|index| {
+                    if index.unique && !table_empty {
+                        match self.index_last_key(index) {
+                            Ok(Some(key)) => Some(UniqueAppendState::new(Some(key))),
+                            Ok(None) => None,
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![None; indexes.len()]
+        };
         let mut page_id = table.last_page;
         let mut page = self.read_page(page_id)?;
         let mut index_entries: Vec<Vec<IndexEntry>> =
@@ -1204,7 +1229,7 @@ impl StorageEngine {
             let mut index_keys = Vec::with_capacity(indexes.len());
             for (idx, index) in indexes.iter().enumerate() {
                 let key = index_key_from_row_positions(&index_positions[idx], row);
-                if index.unique && !key_has_null(&key) {
+                if check_unique && index.unique && !key_has_null(&key) {
                     if let Some(unique_keys) = unique_batch_keys[idx].as_mut() {
                         let encoded_key = encode_index_key(&key)?;
                         if !unique_keys.insert(encoded_key) {
