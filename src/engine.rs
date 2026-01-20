@@ -1763,37 +1763,117 @@ impl GongDB {
             return self.resolve_table_ref(&select.from[0], view_stack, cte_context);
         }
 
-        let mut sources = Vec::new();
+        let predicates = selection
+            .map(split_conjuncts)
+            .unwrap_or_default();
+
         let mut named_only = true;
         for table_ref in &select.from {
             if !matches!(table_ref, TableRef::Named { .. }) {
                 named_only = false;
+                break;
             }
+        }
+
+        if named_only && !predicates.is_empty() {
+            let mut table_infos = Vec::new();
+            let mut base_tables = Vec::new();
+            for table_ref in &select.from {
+                if let TableRef::Named { name, alias } = table_ref {
+                    let table_name = object_name(name);
+                    let table_alias = alias.as_ref().map(|ident| ident.value.clone());
+                    let table_scope = TableScope {
+                        table_name: Some(table_name.clone()),
+                        table_alias: table_alias.clone(),
+                    };
+                    if let Some(ctes) = cte_context {
+                        if let Some(result) = ctes.get(&table_name) {
+                            let column_count = result.columns.len();
+                            table_infos.push(TableInfo {
+                                source: QuerySource {
+                                    columns: result.columns.clone(),
+                                    column_scopes: vec![table_scope.clone(); column_count],
+                                    rows: result.rows.clone(),
+                                    table_scope: table_scope.clone(),
+                                },
+                                scope: table_scope,
+                            });
+                            base_tables.push(false);
+                            continue;
+                        }
+                    }
+                    if let Some(table) = self.storage.get_table(&table_name) {
+                        let column_count = table.columns.len();
+                        table_infos.push(TableInfo {
+                            source: QuerySource {
+                                columns: table.columns.clone(),
+                                column_scopes: vec![table_scope.clone(); column_count],
+                                rows: Vec::new(),
+                                table_scope: table_scope.clone(),
+                            },
+                            scope: table_scope,
+                        });
+                        base_tables.push(true);
+                        continue;
+                    }
+                }
+                let source = self.resolve_table_ref(table_ref, view_stack, cte_context)?;
+                let scope = source.table_scope.clone();
+                table_infos.push(TableInfo { source, scope });
+                base_tables.push(false);
+            }
+
+            let mut local_predicates = vec![Vec::new(); table_infos.len()];
+            let mut remaining_predicates = Vec::new();
+            for predicate in predicates {
+                if let Some(refs) = predicate_table_refs(&predicate, &table_infos) {
+                    if refs.len() == 1 && base_tables[refs[0]] {
+                        local_predicates[refs[0]].push(predicate);
+                        continue;
+                    }
+                }
+                remaining_predicates.push(predicate);
+            }
+
+            for (idx, info) in table_infos.iter_mut().enumerate() {
+                if !base_tables[idx] {
+                    continue;
+                }
+                let table_name = info
+                    .source
+                    .table_scope
+                    .table_name
+                    .as_ref()
+                    .expect("base table name");
+                let selection = combine_predicates(&local_predicates[idx]);
+                let (rows, _) = self.scan_table_rows(
+                    table_name,
+                    info.source.table_scope.table_alias.as_deref(),
+                    selection.as_ref(),
+                    &[],
+                    outer,
+                    cte_context,
+                )?;
+                info.source.rows = rows;
+            }
+
+            let ordered_scopes = table_infos.iter().map(|info| info.scope.clone()).collect();
+            return self.resolve_join_plan(
+                table_infos,
+                remaining_predicates,
+                ordered_scopes,
+                outer,
+                cte_context,
+            );
+        }
+
+        let mut sources = Vec::new();
+        for table_ref in &select.from {
             sources.push(self.resolve_table_ref(table_ref, view_stack, cte_context)?);
         }
 
         if sources.len() == 1 {
             return Ok(sources.remove(0));
-        }
-
-        let predicates = selection
-            .map(split_conjuncts)
-            .unwrap_or_default();
-
-        if named_only && !predicates.is_empty() {
-            let mut table_infos = Vec::new();
-            for source in sources {
-                let scope = source.table_scope.clone();
-                table_infos.push(TableInfo { source, scope });
-            }
-            let ordered_scopes = table_infos.iter().map(|info| info.scope.clone()).collect();
-            return self.resolve_join_plan(
-                table_infos,
-                predicates,
-                ordered_scopes,
-                outer,
-                cte_context,
-            );
         }
 
         let mut rows = vec![Vec::new()];
@@ -2875,30 +2955,15 @@ fn choose_index_scan_plan_with_stats(
             continue;
         }
 
-        if index.columns.len() == 1 {
-            let column_name = index.columns[0].name.value.to_lowercase();
-            if let Some(constraint) = constraints.get(&column_name) {
-                if constraint.lower.is_some() || constraint.upper.is_some() {
-                    let plan = IndexScanPlan {
-                        index_name: index.name.clone(),
-                        lower: constraint.lower.clone().map(|value| vec![value]),
-                        upper: constraint.upper.clone().map(|value| vec![value]),
-                        ordered_by,
-                    };
-                    let selectivity = estimate_index_selectivity(index, &constraints, stats);
-                    let cost = estimate_index_scan_cost(
-                        row_count,
-                        selectivity,
-                        needs_sort && !ordered_by,
-                    );
-                    if best_plan
-                        .as_ref()
-                        .map(|(_, best_cost)| cost < *best_cost)
-                        .unwrap_or(true)
-                    {
-                        best_plan = Some((plan, cost));
-                    }
-                }
+        if let Some(plan) = build_prefix_range_plan(index, &constraints, ordered_by) {
+            let selectivity = estimate_index_selectivity(index, &constraints, stats);
+            let cost = estimate_index_scan_cost(row_count, selectivity, needs_sort && !ordered_by);
+            if best_plan
+                .as_ref()
+                .map(|(_, best_cost)| cost < *best_cost)
+                .unwrap_or(true)
+            {
+                best_plan = Some((plan, cost));
             }
         }
     }
@@ -2929,6 +2994,76 @@ fn choose_index_scan_plan_with_stats(
         Some((plan, cost)) if cost < table_scan_cost => Some(plan),
         _ => None,
     }
+}
+
+fn build_prefix_range_plan(
+    index: &IndexMeta,
+    constraints: &HashMap<String, IndexColumnConstraint>,
+    ordered_by: bool,
+) -> Option<IndexScanPlan> {
+    let mut prefix: Vec<Value> = Vec::new();
+    for column in &index.columns {
+        let entry = match constraints.get(&column.name.value.to_lowercase()) {
+            Some(entry) => entry,
+            None => break,
+        };
+        let Some(eq) = &entry.eq else {
+            break;
+        };
+        prefix.push(eq.clone());
+    }
+
+    if prefix.len() == index.columns.len() {
+        return None;
+    }
+
+    let range_entry = index
+        .columns
+        .get(prefix.len())
+        .and_then(|column| constraints.get(&column.name.value.to_lowercase()));
+    let range_lower = range_entry.and_then(|entry| entry.lower.clone());
+    let range_upper = range_entry.and_then(|entry| entry.upper.clone());
+
+    if prefix.is_empty() && range_lower.is_none() && range_upper.is_none() {
+        return None;
+    }
+
+    let lower = build_index_bound(
+        index.columns.len(),
+        &prefix,
+        range_lower.as_ref(),
+        Value::Null,
+    );
+    let upper = build_index_bound(
+        index.columns.len(),
+        &prefix,
+        range_upper.as_ref(),
+        Value::Blob(Vec::new()),
+    );
+
+    Some(IndexScanPlan {
+        index_name: index.name.clone(),
+        lower: Some(lower),
+        upper: Some(upper),
+        ordered_by,
+    })
+}
+
+fn build_index_bound(
+    index_len: usize,
+    prefix: &[Value],
+    range_value: Option<&Value>,
+    fill_value: Value,
+) -> Vec<Value> {
+    let mut key = Vec::with_capacity(index_len);
+    key.extend(prefix.iter().cloned());
+    if let Some(value) = range_value {
+        key.push(value.clone());
+    }
+    while key.len() < index_len {
+        key.push(fill_value.clone());
+    }
+    key
 }
 
 fn scan_rows_with_index(db: &GongDB, plan: &IndexScanPlan) -> Result<Vec<Vec<Value>>, GongDBError> {
@@ -3759,6 +3894,23 @@ fn apply_predicates_to_source(
     if remaining.is_empty() {
         return Ok(source);
     }
+    if let Some(table_name) = source.table_scope.table_name.as_ref() {
+        let cte_match = cte_context
+            .and_then(|ctes| ctes.get(table_name))
+            .is_some();
+        if !cte_match && db.storage.get_table(table_name).is_some() {
+            let selection = combine_predicates(&remaining);
+            let (rows, _) = db.scan_table_rows(
+                table_name,
+                source.table_scope.table_alias.as_deref(),
+                selection.as_ref(),
+                &[],
+                outer,
+                cte_context,
+            )?;
+            return Ok(QuerySource { rows, ..source });
+        }
+    }
     let table_scope = source.table_scope.clone();
     let column_lookup = build_column_lookup(&source.columns, &source.column_scopes);
     let mut rows = Vec::new();
@@ -3787,6 +3939,16 @@ fn apply_predicates_to_source(
         rows,
         ..source
     })
+}
+
+fn combine_predicates(predicates: &[Expr]) -> Option<Expr> {
+    let mut iter = predicates.iter();
+    let first = iter.next()?.clone();
+    Some(iter.fold(first, |acc, expr| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: BinaryOperator::And,
+        right: Box::new(expr.clone()),
+    }))
 }
 
 fn join_sources_with_predicates(
