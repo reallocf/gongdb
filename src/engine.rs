@@ -119,6 +119,7 @@ pub struct GongDB {
     subquery_cache: RefCell<SubqueryCache>,
     statement_cache: RefCell<HashMap<String, CachedStatement>>,
     select_cache: RefCell<HashMap<String, CachedSelect>>,
+    fast_update_cache: RefCell<HashMap<String, FastUpdateTemplate>>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +177,7 @@ impl GongDB {
             subquery_cache: RefCell::new(SubqueryCache::new()),
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
+            fast_update_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -199,6 +201,7 @@ impl GongDB {
             subquery_cache: RefCell::new(SubqueryCache::new()),
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
+            fast_update_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -437,6 +440,7 @@ impl GongDB {
                 };
                 self.storage.create_table(meta)?;
                 self.invalidate_table_stats(&name);
+                self.fast_update_cache.borrow_mut().clear();
 
                 let mut counter = 1;
                 let mut used_names = HashSet::new();
@@ -495,6 +499,7 @@ impl GongDB {
                     self.storage.create_index(meta)?;
                 }
                 self.invalidate_table_stats(&table_name);
+                self.fast_update_cache.borrow_mut().clear();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::CreateTrigger(create) => {
@@ -535,6 +540,7 @@ impl GongDB {
                 if self.storage.get_index(&name).is_some() {
                     self.storage.drop_index(&name)?;
                 }
+                self.fast_update_cache.borrow_mut().clear();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::DropTrigger(drop) => {
@@ -551,6 +557,7 @@ impl GongDB {
             Statement::Reindex(reindex) => {
                 let target = reindex.name.as_ref().map(object_name);
                 self.storage.reindex(target.as_deref())?;
+                self.fast_update_cache.borrow_mut().clear();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::DropTable(drop) => {
@@ -567,6 +574,7 @@ impl GongDB {
                 self.triggers
                     .retain(|_, trigger| !trigger.table.eq_ignore_ascii_case(&name));
                 self.invalidate_table_stats(&name);
+                self.fast_update_cache.borrow_mut().clear();
                 Ok(DBOutput::StatementComplete(0))
             }
             Statement::CreateView(create) => {
@@ -1246,103 +1254,55 @@ impl GongDB {
                 plan.table
             ))));
         }
-        let mut indexed_columns = HashSet::new();
-        for index in self.storage.list_indexes() {
-            if index.table.eq_ignore_ascii_case(&plan.table) {
-                for column in &index.columns {
-                    indexed_columns.insert(column.name.value.to_ascii_lowercase());
-                }
-            }
-        }
-        if plan
-            .assignments
-            .iter()
-            .any(|assignment| indexed_columns.contains(&assignment.column))
-        {
-            return None;
-        }
-        let mut column_map = HashMap::new();
-        for (idx, col) in table.columns.iter().enumerate() {
-            column_map.insert(col.name.to_ascii_lowercase(), idx);
-        }
-        let mut predicate_values = HashMap::new();
-        let mut predicate_indices = Vec::with_capacity(plan.predicates.len());
-        for (column, value) in &plan.predicates {
-            let idx = match column_map.get(column) {
-                Some(idx) => *idx,
-                None => {
-                    return Some(Err(GongDBError::new(format!(
-                        "no such column: {}",
-                        column
-                    ))))
-                }
+        let cache_key = fast_update_cache_key(&plan);
+        let cached = { self.fast_update_cache.borrow().get(&cache_key).cloned() };
+        let template = if let Some(template) = cached {
+            template
+        } else {
+            let indexes = self.storage.list_indexes();
+            let template = match build_fast_update_template(&table, &plan, &indexes) {
+                Ok(template) => template,
+                Err(err) => return Some(Err(err)),
             };
+            self.fast_update_cache
+                .borrow_mut()
+                .insert(cache_key, template.clone());
+            template
+        };
+        let (assignment_index_map, predicate_index_map, best_index, best_prefix_index) =
+            match template {
+                FastUpdateTemplate::Ineligible => return None,
+                FastUpdateTemplate::Eligible {
+                    assignment_indices,
+                    predicate_indices,
+                    best_index,
+                    best_prefix_index,
+                } => (assignment_indices, predicate_indices, best_index, best_prefix_index),
+            };
+        let mut predicate_values = Vec::with_capacity(plan.predicates.len());
+        let mut predicate_indices = Vec::with_capacity(plan.predicates.len());
+        for (pos, (_, value)) in plan.predicates.iter().enumerate() {
+            let idx = predicate_index_map[pos];
             let value = apply_affinity(value.clone(), &table.columns[idx].data_type);
-            predicate_values.insert(column.clone(), value.clone());
+            predicate_values.push(value.clone());
             predicate_indices.push((idx, value));
         }
         let mut assignment_indices = Vec::with_capacity(plan.assignments.len());
-        for assignment in &plan.assignments {
-            let idx = match column_map.get(&assignment.column) {
-                Some(idx) => *idx,
-                None => {
-                    return Some(Err(GongDBError::new(format!(
-                        "no such column: {}",
-                        assignment.column
-                    ))))
-                }
-            };
-            assignment_indices.push((idx, assignment.clone()));
-        }
-        let mut best_index: Option<IndexMeta> = None;
-        let mut best_prefix_index: Option<(IndexMeta, usize)> = None;
-        for index in self.storage.list_indexes() {
-            if !index.table.eq_ignore_ascii_case(&plan.table) {
-                continue;
-            }
-            let mut prefix_len = 0usize;
-            let mut matches_all = true;
-            for column in &index.columns {
-                if predicate_values.contains_key(&column.name.value.to_ascii_lowercase()) {
-                    prefix_len += 1;
-                } else {
-                    matches_all = false;
-                    break;
-                }
-            }
-            if matches_all {
-                let replace = match &best_index {
-                    Some(best) => index.columns.len() > best.columns.len(),
-                    None => true,
-                };
-                if replace {
-                    best_index = Some(index);
-                }
-                continue;
-            }
-            if prefix_len > 0 {
-                let replace = match &best_prefix_index {
-                    Some((_, best_len)) => prefix_len > *best_len,
-                    None => true,
-                };
-                if replace {
-                    best_prefix_index = Some((index, prefix_len));
-                }
-            }
+        for (idx, assignment) in assignment_index_map.iter().zip(plan.assignments.iter()) {
+            assignment_indices.push((*idx, assignment.clone()));
         }
         let mut updates = Vec::new();
         let mut in_place_updates = Vec::new();
-        if let Some(index) = best_index {
-            let mut key = Vec::with_capacity(index.columns.len());
-            for column in &index.columns {
-                let value = predicate_values
-                    .get(&column.name.value.to_ascii_lowercase())
-                    .cloned()
-                    .unwrap();
-                key.push(value);
+        if let Some(index_plan) = best_index {
+            let mut key = Vec::with_capacity(index_plan.predicate_positions.len());
+            for pos in &index_plan.predicate_positions {
+                key.push(predicate_values[*pos].clone());
             }
-            if index.unique {
-                let location = match self.storage.scan_index_first_location(&index.name, &key) {
+            if index_plan.index.unique {
+                let location = match self
+                    .storage
+                    .scan_index_first_location(&index_plan.index.name, &key)
+                {
                     Ok(location) => location,
                     Err(err) => return Some(Err(err.into())),
                 };
@@ -1386,7 +1346,7 @@ impl GongDB {
                 }
             } else {
                 let locations = match self.storage.scan_index_range(
-                    &index.name,
+                    &index_plan.index.name,
                     Some(&key),
                     Some(&key),
                 ) {
@@ -1431,25 +1391,26 @@ impl GongDB {
                     }
                 }
             }
-        } else if let Some((index, prefix_len)) = best_prefix_index {
-            let mut prefix = Vec::with_capacity(prefix_len);
-            for column in index.columns.iter().take(prefix_len) {
-                let value = predicate_values
-                    .get(&column.name.value.to_ascii_lowercase())
-                    .cloned()
-                    .unwrap();
-                prefix.push(value);
+        } else if let Some(index_plan) = best_prefix_index {
+            let mut prefix = Vec::with_capacity(index_plan.predicate_positions.len());
+            for pos in &index_plan.predicate_positions {
+                prefix.push(predicate_values[*pos].clone());
             }
-            let lower = build_index_bound(index.columns.len(), &prefix, None, Value::Null);
+            let lower = build_index_bound(
+                index_plan.index.columns.len(),
+                &prefix,
+                None,
+                Value::Null,
+            );
             let upper = build_index_bound(
-                index.columns.len(),
+                index_plan.index.columns.len(),
                 &prefix,
                 None,
                 Value::Blob(Vec::new()),
             );
             let locations = match self
                 .storage
-                .scan_index_range(&index.name, Some(&lower), Some(&upper))
+                .scan_index_range(&index_plan.index.name, Some(&lower), Some(&upper))
             {
                 Ok(locations) => locations,
                 Err(err) => return Some(Err(err.into())),
@@ -6409,6 +6370,29 @@ struct FastUpdatePlan {
     predicates: Vec<(String, Value)>,
 }
 
+#[derive(Clone)]
+enum FastUpdateTemplate {
+    Ineligible,
+    Eligible {
+        assignment_indices: Vec<usize>,
+        predicate_indices: Vec<usize>,
+        best_index: Option<FastUpdateIndexPlan>,
+        best_prefix_index: Option<FastUpdateIndexPrefixPlan>,
+    },
+}
+
+#[derive(Clone)]
+struct FastUpdateIndexPlan {
+    index: IndexMeta,
+    predicate_positions: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct FastUpdateIndexPrefixPlan {
+    index: IndexMeta,
+    predicate_positions: Vec<usize>,
+}
+
 fn parse_fast_update(sql: &str) -> Option<FastUpdatePlan> {
     let mut input = sql.trim();
     if let Some(stripped) = input.strip_suffix(';') {
@@ -6447,6 +6431,138 @@ fn parse_fast_update(sql: &str) -> Option<FastUpdatePlan> {
         table: table_name,
         assignments,
         predicates,
+    })
+}
+
+fn fast_update_cache_key(plan: &FastUpdatePlan) -> String {
+    let mut key = String::with_capacity(
+        plan.table.len() + plan.assignments.len() * 12 + plan.predicates.len() * 12,
+    );
+    key.push_str(&plan.table.to_ascii_lowercase());
+    for assignment in &plan.assignments {
+        key.push_str("|a:");
+        key.push_str(&assignment.column.to_ascii_lowercase());
+        key.push(':');
+        let action = match assignment.action {
+            FastUpdateAction::Set(_) => "set",
+            FastUpdateAction::Add(_) => "add",
+            FastUpdateAction::Sub(_) => "sub",
+        };
+        key.push_str(action);
+    }
+    for (column, _) in &plan.predicates {
+        key.push_str("|p:");
+        key.push_str(&column.to_ascii_lowercase());
+    }
+    key
+}
+
+fn build_fast_update_template(
+    table: &TableMeta,
+    plan: &FastUpdatePlan,
+    indexes: &[IndexMeta],
+) -> Result<FastUpdateTemplate, GongDBError> {
+    let mut indexed_columns = HashSet::new();
+    for index in indexes {
+        if index.table.eq_ignore_ascii_case(&plan.table) {
+            for column in &index.columns {
+                indexed_columns.insert(column.name.value.to_ascii_lowercase());
+            }
+        }
+    }
+    if plan
+        .assignments
+        .iter()
+        .any(|assignment| indexed_columns.contains(&assignment.column.to_ascii_lowercase()))
+    {
+        return Ok(FastUpdateTemplate::Ineligible);
+    }
+    let mut column_map = HashMap::new();
+    for (idx, col) in table.columns.iter().enumerate() {
+        column_map.insert(col.name.to_ascii_lowercase(), idx);
+    }
+    let mut predicate_indices = Vec::with_capacity(plan.predicates.len());
+    let mut predicate_positions = HashMap::new();
+    for (pos, (column, _)) in plan.predicates.iter().enumerate() {
+        let column_key = column.to_ascii_lowercase();
+        let idx = match column_map.get(&column_key) {
+            Some(idx) => *idx,
+            None => {
+                return Err(GongDBError::new(format!(
+                    "no such column: {}",
+                    column
+                )))
+            }
+        };
+        predicate_indices.push(idx);
+        predicate_positions.insert(column_key, pos);
+    }
+    let mut assignment_indices = Vec::with_capacity(plan.assignments.len());
+    for assignment in &plan.assignments {
+        let column_key = assignment.column.to_ascii_lowercase();
+        let idx = match column_map.get(&column_key) {
+            Some(idx) => *idx,
+            None => {
+                return Err(GongDBError::new(format!(
+                    "no such column: {}",
+                    assignment.column
+                )))
+            }
+        };
+        assignment_indices.push(idx);
+    }
+
+    let mut best_index: Option<FastUpdateIndexPlan> = None;
+    let mut best_prefix_index: Option<FastUpdateIndexPrefixPlan> = None;
+    for index in indexes {
+        if !index.table.eq_ignore_ascii_case(&plan.table) {
+            continue;
+        }
+        let mut prefix_len = 0usize;
+        let mut matches_all = true;
+        let mut predicate_positions_for_index = Vec::with_capacity(index.columns.len());
+        for column in &index.columns {
+            if let Some(pos) = predicate_positions.get(&column.name.value.to_ascii_lowercase()) {
+                prefix_len += 1;
+                predicate_positions_for_index.push(*pos);
+            } else {
+                matches_all = false;
+                break;
+            }
+        }
+        if matches_all {
+            let replace = match &best_index {
+                Some(best) => index.columns.len() > best.index.columns.len(),
+                None => true,
+            };
+            if replace {
+                best_index = Some(FastUpdateIndexPlan {
+                    index: index.clone(),
+                    predicate_positions: predicate_positions_for_index,
+                });
+            }
+            continue;
+        }
+        if prefix_len > 0 {
+            let replace = match &best_prefix_index {
+                Some(best) => prefix_len > best.predicate_positions.len(),
+                None => true,
+            };
+            if replace {
+                predicate_positions_for_index.truncate(prefix_len);
+                best_prefix_index = Some(FastUpdateIndexPrefixPlan {
+                    index: index.clone(),
+                    predicate_positions: predicate_positions_for_index,
+                });
+            }
+        }
+    }
+
+    Ok(FastUpdateTemplate::Eligible {
+        assignment_indices,
+        predicate_indices,
+        best_index,
+        best_prefix_index,
     })
 }
 
