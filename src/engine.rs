@@ -1314,9 +1314,13 @@ impl GongDB {
                         }
                         Err(err) => return Some(Err(err.into())),
                     };
-                    let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
-                        Ok(matches) => matches,
-                        Err(err) => return Some(Err(err)),
+                    let matches = if index_plan.all_predicates_covered {
+                        true
+                    } else {
+                        match fast_record_matches_predicates(&record, &predicate_indices) {
+                            Ok(matches) => matches,
+                            Err(err) => return Some(Err(err)),
+                        }
                     };
                     if matches {
                         match apply_fast_update_record_bytes(
@@ -6385,6 +6389,7 @@ enum FastUpdateTemplate {
 struct FastUpdateIndexPlan {
     index: IndexMeta,
     predicate_positions: Vec<usize>,
+    all_predicates_covered: bool,
 }
 
 #[derive(Clone)]
@@ -6531,6 +6536,7 @@ fn build_fast_update_template(
             }
         }
         if matches_all {
+            let all_predicates_covered = plan.predicates.len() == index.columns.len();
             let replace = match &best_index {
                 Some(best) => index.columns.len() > best.index.columns.len(),
                 None => true,
@@ -6539,6 +6545,7 @@ fn build_fast_update_template(
                 best_index = Some(FastUpdateIndexPlan {
                     index: index.clone(),
                     predicate_positions: predicate_positions_for_index,
+                    all_predicates_covered,
                 });
             }
             continue;

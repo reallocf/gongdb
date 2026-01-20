@@ -1611,10 +1611,21 @@ impl StorageEngine {
         &mut self,
         updates: &[(RowLocation, Vec<FieldUpdate>)],
     ) -> Result<(), StorageError> {
+        // Used for in-place updates that do not change indexed columns.
+        self.update_record_fields_at_internal(updates, false)
+    }
+
+    fn update_record_fields_at_internal(
+        &mut self,
+        updates: &[(RowLocation, Vec<FieldUpdate>)],
+        clear_index_cache: bool,
+    ) -> Result<(), StorageError> {
         if updates.is_empty() {
             return Ok(());
         }
-        self.clear_index_eq_cache();
+        if clear_index_cache {
+            self.clear_index_eq_cache();
+        }
         if matches!(self.mode, StorageMode::InMemory { .. }) {
             return self.update_record_fields_at_in_memory(updates);
         }
