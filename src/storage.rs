@@ -1500,6 +1500,9 @@ impl StorageEngine {
             return Ok(());
         }
         self.clear_index_eq_cache();
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return self.update_encoded_rows_at_in_memory(updates);
+        }
         if updates.len() == 1 {
             let (location, encoded) = &updates[0];
             let mut page = self.read_page(location.page_id)?;
@@ -1598,6 +1601,76 @@ impl StorageEngine {
         Ok(())
     }
 
+    fn update_encoded_rows_at_in_memory(
+        &mut self,
+        updates: &[(RowLocation, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        let mut updates_by_page: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, (location, _)) in updates.iter().enumerate() {
+            updates_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push(idx);
+        }
+
+        for (page_id, page_updates) in updates_by_page.iter() {
+            self.with_page(*page_id, |page| {
+                let slot_count = read_u16(page, 1) as usize;
+                let free_start = read_u16(page, 3) as usize;
+                let free_end = read_u16(page, 5) as usize;
+                let mut extra_needed = 0usize;
+                for &update_idx in page_updates {
+                    let (location, encoded) = &updates[update_idx];
+                    let slot = location.slot as usize;
+                    if slot >= slot_count {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                    let record_offset = read_u16(page, slot_offset) as usize;
+                    let record_len = read_u16(page, slot_offset + 2) as usize;
+                    if record_offset + record_len > PAGE_SIZE {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    if encoded.len() > record_len {
+                        extra_needed = extra_needed.saturating_add(encoded.len());
+                    }
+                }
+                if free_start + extra_needed > free_end {
+                    return Err(StorageError::Invalid("page full".to_string()));
+                }
+                Ok(())
+            })?;
+        }
+
+        for (page_id, page_updates) in updates_by_page {
+            self.with_page_mut(page_id, |page| {
+                let mut next_free_start = read_u16(page, 3) as usize;
+                for update_idx in page_updates {
+                    let (location, encoded) = &updates[update_idx];
+                    let slot = location.slot as usize;
+                    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                    let record_offset = read_u16(page, slot_offset) as usize;
+                    let record_len = read_u16(page, slot_offset + 2) as usize;
+                    if encoded.len() <= record_len {
+                        page[record_offset..record_offset + encoded.len()]
+                            .copy_from_slice(&encoded);
+                        write_u16(page, slot_offset + 2, encoded.len() as u16);
+                    } else {
+                        page[next_free_start..next_free_start + encoded.len()]
+                            .copy_from_slice(&encoded);
+                        write_u16(page, slot_offset, next_free_start as u16);
+                        write_u16(page, slot_offset + 2, encoded.len() as u16);
+                        next_free_start += encoded.len();
+                    }
+                }
+                write_u16(page, 3, next_free_start as u16);
+                Ok(())
+            })?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn delete_rows_at(
         &mut self,
         table_name: &str,
@@ -1607,6 +1680,9 @@ impl StorageEngine {
             return Ok(0);
         }
         self.clear_index_eq_cache();
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return self.delete_rows_at_in_memory(table_name, locations);
+        }
         let mut deletes_by_page: HashMap<u32, Vec<u16>> = HashMap::new();
         for location in locations {
             deletes_by_page
@@ -1634,6 +1710,70 @@ impl StorageEngine {
                 deleted = deleted.saturating_add(1);
             }
             self.write_page(*page_id, &page)?;
+        }
+
+        if deleted > 0 {
+            if let Some(table) = self.tables.get_mut(table_name) {
+                table.row_count = table.row_count.saturating_sub(deleted);
+            } else {
+                return Err(StorageError::NotFound(format!(
+                    "table not found: {}",
+                    table_name
+                )));
+            }
+            self.write_catalog()?;
+        }
+        Ok(deleted)
+    }
+
+    fn delete_rows_at_in_memory(
+        &mut self,
+        table_name: &str,
+        locations: &[RowLocation],
+    ) -> Result<u64, StorageError> {
+        let mut deletes_by_page: HashMap<u32, Vec<u16>> = HashMap::new();
+        for location in locations {
+            deletes_by_page
+                .entry(location.page_id)
+                .or_default()
+                .push(location.slot);
+        }
+
+        for (page_id, slots) in deletes_by_page.iter() {
+            self.with_page(*page_id, |page| {
+                let slot_count = read_u16(page, 1) as usize;
+                for slot in slots {
+                    let slot = *slot as usize;
+                    if slot >= slot_count {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        let mut deleted = 0u64;
+        for (page_id, slots) in deletes_by_page {
+            let page_deleted = self.with_page_mut(page_id, |page| {
+                let slot_count = read_u16(page, 1) as usize;
+                let mut page_deleted = 0u64;
+                for slot in slots {
+                    let slot = slot as usize;
+                    if slot >= slot_count {
+                        return Err(StorageError::Corrupt("invalid row location".to_string()));
+                    }
+                    let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                    let record_len = read_u16(page, slot_offset + 2);
+                    if record_len == 0 {
+                        continue;
+                    }
+                    write_u16(page, slot_offset, 0);
+                    write_u16(page, slot_offset + 2, 0);
+                    page_deleted = page_deleted.saturating_add(1);
+                }
+                Ok(page_deleted)
+            })?;
+            deleted = deleted.saturating_add(page_deleted);
         }
 
         if deleted > 0 {
@@ -1850,6 +1990,28 @@ impl StorageEngine {
         entry: &IndexEntry,
     ) -> Result<bool, StorageError> {
         let last_leaf = self.ensure_index_last_leaf(index)?;
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            let can_append = self.with_page(last_leaf, |page| {
+                if page_type(page) != PAGE_TYPE_BTREE_LEAF {
+                    return Ok(false);
+                }
+                if let Some(last) = read_last_leaf_entry(page)? {
+                    if compare_index_keys(&entry.key, &last.key) == std::cmp::Ordering::Less {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            if !can_append {
+                return Ok(false);
+            }
+            let record = encode_index_entry(entry)?;
+            return self.with_page_mut(last_leaf, |page| match insert_record(page, &record) {
+                Ok(_) => Ok(true),
+                Err(StorageError::Invalid(msg)) if msg == "page full" => Ok(false),
+                Err(err) => Err(err),
+            });
+        }
         let mut page = self.read_page(last_leaf)?;
         if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
             return Ok(false);
@@ -1876,6 +2038,41 @@ impl StorageEngine {
         entries: &[IndexEntry],
     ) -> Result<Option<usize>, StorageError> {
         let last_leaf = self.ensure_index_last_leaf(index)?;
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            let last_key = self.with_page(last_leaf, |page| {
+                if page_type(page) != PAGE_TYPE_BTREE_LEAF {
+                    return Ok(None);
+                }
+                Ok(Some(read_last_leaf_entry(page)?.map(|entry| entry.key)))
+            })?;
+            let Some(mut last_key) = last_key else {
+                return Ok(Some(0));
+            };
+            let mut encoded_entries = Vec::with_capacity(entries.len());
+            for entry in entries {
+                encoded_entries.push(encode_index_entry(entry)?);
+            }
+            return self.with_page_mut(last_leaf, |page| {
+                for (idx, entry) in entries.iter().enumerate() {
+                    if let Some(ref key) = last_key {
+                        if compare_index_keys(&entry.key, key) == std::cmp::Ordering::Less {
+                            return Ok(Some(idx));
+                        }
+                    }
+                    let record = &encoded_entries[idx];
+                    match insert_record(page, record) {
+                        Ok(_) => {
+                            last_key = Some(entry.key.clone());
+                        }
+                        Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                            return Ok(Some(idx));
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                Ok(None)
+            });
+        }
         let mut page = self.read_page(last_leaf)?;
         if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
             return Ok(Some(0));
@@ -2530,6 +2727,63 @@ impl StorageEngine {
                     .borrow_mut()
                     .insert_clean(page_id, buf.clone());
                 Ok(buf)
+            }
+        }
+    }
+
+    fn with_page<R>(
+        &self,
+        page_id: u32,
+        f: impl FnOnce(&[u8]) -> Result<R, StorageError>,
+    ) -> Result<R, StorageError> {
+        match &self.mode {
+            StorageMode::InMemory { pages } => {
+                let page = pages
+                    .get(page_id as usize)
+                    .ok_or_else(|| StorageError::Invalid(format!("missing page {}", page_id)))?;
+                f(page)
+            }
+            StorageMode::OnDisk { .. } => {
+                let page = self.read_page(page_id)?;
+                f(&page)
+            }
+        }
+    }
+
+    fn with_page_mut<R>(
+        &mut self,
+        page_id: u32,
+        f: impl FnOnce(&mut [u8]) -> Result<R, StorageError>,
+    ) -> Result<R, StorageError> {
+        match &mut self.mode {
+            StorageMode::InMemory { pages } => {
+                let idx = page_id as usize;
+                let base_len = if self.txn_active {
+                    self.in_memory_txn_base_len.unwrap_or(pages.len())
+                } else {
+                    0
+                };
+                let page = pages
+                    .get_mut(idx)
+                    .ok_or_else(|| StorageError::Invalid(format!("missing page {}", page_id)))?;
+                if self.txn_active {
+                    if let Some(log) = self.in_memory_txn_log.as_mut() {
+                        if !log.contains_key(&page_id) {
+                            if idx < base_len {
+                                log.insert(page_id, Some(page.clone()));
+                            } else {
+                                log.insert(page_id, None);
+                            }
+                        }
+                    }
+                }
+                f(page)
+            }
+            StorageMode::OnDisk { .. } => {
+                let mut page = self.read_page(page_id)?;
+                let result = f(&mut page)?;
+                self.write_page(page_id, &page)?;
+                Ok(result)
             }
         }
     }
