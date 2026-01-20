@@ -472,6 +472,7 @@ pub struct StorageEngine {
     page_cache: RefCell<PageCache>,
     index_eq_cache: RefCell<HashMap<IndexEqCacheKey, Vec<RowLocation>>>,
     index_eq_row_cache: RefCell<HashMap<IndexEqRowCacheKey, Vec<Vec<Value>>>>,
+    unique_index_cache: RefCell<HashMap<IndexEqCacheKey, RowLocation>>,
     pending_sync_writes: usize,
     in_memory_txn_log: Option<HashMap<u32, Option<Vec<u8>>>>,
     in_memory_txn_base_len: Option<usize>,
@@ -568,6 +569,7 @@ impl StorageEngine {
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
             index_eq_cache: RefCell::new(HashMap::new()),
             index_eq_row_cache: RefCell::new(HashMap::new()),
+            unique_index_cache: RefCell::new(HashMap::new()),
             pending_sync_writes: 0,
             in_memory_txn_log: None,
             in_memory_txn_base_len: None,
@@ -668,6 +670,7 @@ impl StorageEngine {
             page_cache: RefCell::new(PageCache::new(PAGE_CACHE_CAPACITY)),
             index_eq_cache: RefCell::new(HashMap::new()),
             index_eq_row_cache: RefCell::new(HashMap::new()),
+            unique_index_cache: RefCell::new(HashMap::new()),
             pending_sync_writes: 0,
             in_memory_txn_log: None,
             in_memory_txn_base_len: None,
@@ -761,12 +764,56 @@ impl StorageEngine {
         self.page_cache.borrow_mut().clear();
         self.index_eq_cache.borrow_mut().clear();
         self.index_eq_row_cache.borrow_mut().clear();
+        self.unique_index_cache.borrow_mut().clear();
         Ok(())
     }
 
     fn clear_index_eq_cache(&self) {
         self.index_eq_cache.borrow_mut().clear();
         self.index_eq_row_cache.borrow_mut().clear();
+    }
+
+    fn clear_unique_index_cache(&self) {
+        self.unique_index_cache.borrow_mut().clear();
+    }
+
+    fn clear_unique_index_cache_for_table(&self, table_name: &str) {
+        let index_names: Vec<String> = self
+            .indexes
+            .values()
+            .filter(|index| index.table.eq_ignore_ascii_case(table_name) && index.unique)
+            .map(|index| index.name.clone())
+            .collect();
+        if index_names.is_empty() {
+            return;
+        }
+        let mut cache = self.unique_index_cache.borrow_mut();
+        cache.retain(|key, _| !index_names.iter().any(|name| name.eq_ignore_ascii_case(&key.index_name)));
+    }
+
+    fn clear_unique_index_cache_for_index(&self, index_name: &str) {
+        let mut cache = self.unique_index_cache.borrow_mut();
+        cache.retain(|key, _| !key.index_name.eq_ignore_ascii_case(index_name));
+    }
+
+    fn cache_unique_index_entry(
+        &self,
+        index: &IndexMeta,
+        entry: &IndexEntry,
+    ) -> Result<(), StorageError> {
+        if !matches!(self.mode, StorageMode::InMemory { .. }) {
+            return Ok(());
+        }
+        if !index.unique || key_has_null(&entry.key) {
+            return Ok(());
+        }
+        let encoded_key = encode_index_key(&entry.key)?;
+        let key = IndexEqCacheKey {
+            index_name: index.name.clone(),
+            encoded_key,
+        };
+        self.unique_index_cache.borrow_mut().insert(key, entry.row);
+        Ok(())
     }
 
     /// Mark the start of a transaction.
@@ -1307,6 +1354,7 @@ impl StorageEngine {
     /// Create an index and populate it from existing table rows.
     pub fn create_index(&mut self, index: IndexMeta) -> Result<(), StorageError> {
         self.clear_index_eq_cache();
+        self.clear_unique_index_cache_for_index(&index.name);
         if self.indexes.contains_key(&index.name) {
             return Err(StorageError::Invalid(format!(
                 "index already exists: {}",
@@ -1347,6 +1395,7 @@ impl StorageEngine {
     /// Drop an index by name.
     pub fn drop_index(&mut self, name: &str) -> Result<(), StorageError> {
         self.clear_index_eq_cache();
+        self.clear_unique_index_cache_for_index(name);
         let index = self
             .indexes
             .get(name)
@@ -1363,6 +1412,7 @@ impl StorageEngine {
         self.clear_index_eq_cache();
         match target {
             None => {
+                self.clear_unique_index_cache();
                 let index_names: Vec<String> = self.indexes.keys().cloned().collect();
                 for index_name in index_names {
                     self.rebuild_index(&index_name)?;
@@ -1517,6 +1567,7 @@ impl StorageEngine {
             return Ok(());
         }
         self.clear_index_eq_cache();
+        self.clear_unique_index_cache();
         if matches!(self.mode, StorageMode::InMemory { .. }) {
             return self.update_encoded_rows_at_in_memory(updates);
         }
@@ -1989,6 +2040,7 @@ impl StorageEngine {
             return Ok(0);
         }
         self.clear_index_eq_cache();
+        self.clear_unique_index_cache_for_table(table_name);
         if matches!(self.mode, StorageMode::InMemory { .. }) {
             return self.delete_rows_at_in_memory(table_name, locations);
         }
@@ -2156,6 +2208,7 @@ impl StorageEngine {
         if !self.try_append_index_entry(&mut index, entry)? {
             self.insert_index_record_btree(&mut index, entry)?;
         }
+        self.cache_unique_index_entry(&index, entry)?;
         self.indexes.insert(index_name.to_string(), index);
         Ok(())
     }
@@ -2186,12 +2239,18 @@ impl StorageEngine {
                 self.insert_index_record_btree(&mut index, entry)?;
             }
         }
+        if index.unique && matches!(self.mode, StorageMode::InMemory { .. }) {
+            for entry in entries {
+                self.cache_unique_index_entry(&index, entry)?;
+            }
+        }
         self.indexes.insert(index_name.to_string(), index);
         Ok(())
     }
 
     fn rebuild_index(&mut self, index_name: &str) -> Result<(), StorageError> {
         self.clear_index_eq_cache();
+        self.clear_unique_index_cache_for_index(index_name);
         let index = self
             .indexes
             .get(index_name)
@@ -2628,10 +2687,39 @@ impl StorageEngine {
         if key.is_empty() {
             return Ok(None);
         }
-        match index.columns.len() {
+        if matches!(self.mode, StorageMode::InMemory { .. })
+            && index.unique
+            && !key_has_null(key)
+        {
+            if let Ok(encoded_key) = encode_index_key(key) {
+                let cache_key = IndexEqCacheKey {
+                    index_name: index.name.clone(),
+                    encoded_key,
+                };
+                if let Some(location) = self.unique_index_cache.borrow().get(&cache_key) {
+                    return Ok(Some(*location));
+                }
+            }
+        }
+        let result = match index.columns.len() {
             1 => self.btree_scan_eq_single_first(index.first_page, &key[0]),
             _ => self.btree_scan_eq_multi_first(index.first_page, key),
+        }?;
+        if matches!(self.mode, StorageMode::InMemory { .. })
+            && index.unique
+            && !key_has_null(key)
+        {
+            if let (Some(location), Ok(encoded_key)) = (result, encode_index_key(key)) {
+                let cache_key = IndexEqCacheKey {
+                    index_name: index.name.clone(),
+                    encoded_key,
+                };
+                self.unique_index_cache
+                    .borrow_mut()
+                    .insert(cache_key, location);
+            }
         }
+        Ok(result)
     }
 
     fn btree_scan_eq_single_first(
