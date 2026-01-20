@@ -3170,8 +3170,13 @@ fn choose_index_scan_plan_with_stats(
     let mut best_plan: Option<(IndexScanPlan, f64)> = None;
 
     for index in &indexes {
-        let order_match =
-            order_by_matches_index(order_by, index, table_scope, &table.columns);
+        let order_match = order_by_matches_index_with_constraints(
+            order_by,
+            index,
+            table_scope,
+            &table.columns,
+            &constraints,
+        );
         let ordered_by = !order_by.is_empty() && order_match.is_some();
         let ordered_by_desc = matches!(order_match, Some(SortOrder::Desc));
         if let Some(key) = build_eq_key(index, &constraints) {
@@ -3218,8 +3223,13 @@ fn choose_index_scan_plan_with_stats(
 
     if !order_by.is_empty() {
         for index in &indexes {
-            let order_match =
-                order_by_matches_index(order_by, index, table_scope, &table.columns);
+            let order_match = order_by_matches_index_with_constraints(
+                order_by,
+                index,
+                table_scope,
+                &table.columns,
+                &constraints,
+            );
             if order_match.is_none() {
                 continue;
             }
@@ -3502,11 +3512,12 @@ fn invert_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
     }
 }
 
-fn order_by_matches_index(
+fn order_by_matches_index_with_constraints(
     order_by: &[OrderByExpr],
     index: &IndexMeta,
     table_scope: &TableScope,
     columns: &[Column],
+    constraints: &HashMap<String, IndexColumnConstraint>,
 ) -> Option<SortOrder> {
     if order_by.is_empty() {
         return None;
@@ -3514,6 +3525,38 @@ fn order_by_matches_index(
     if order_by.len() > index.columns.len() {
         return None;
     }
+    let mut max_skip = 0usize;
+    for column in &index.columns {
+        let entry = match constraints.get(&column.name.value.to_lowercase()) {
+            Some(entry) => entry,
+            None => break,
+        };
+        if entry.eq.is_some() {
+            max_skip += 1;
+        } else {
+            break;
+        }
+    }
+    for offset in 0..=max_skip {
+        if order_by.len() + offset > index.columns.len() {
+            continue;
+        }
+        if let Some(order) =
+            order_by_matches_index_at_offset(order_by, index, table_scope, columns, offset)
+        {
+            return Some(order);
+        }
+    }
+    None
+}
+
+fn order_by_matches_index_at_offset(
+    order_by: &[OrderByExpr],
+    index: &IndexMeta,
+    table_scope: &TableScope,
+    columns: &[Column],
+    offset: usize,
+) -> Option<SortOrder> {
     let mut desired_order: Option<SortOrder> = None;
     for (idx, order) in order_by.iter().enumerate() {
         if matches!(order.nulls.as_ref(), Some(NullsOrder::Last)) {
@@ -3535,7 +3578,7 @@ fn order_by_matches_index(
             Some((_idx, name)) => name,
             None => return None,
         };
-        let index_column = &index.columns[idx];
+        let index_column = index.columns.get(idx + offset)?;
         if !index_column.name.value.eq_ignore_ascii_case(&column) {
             return None;
         }
