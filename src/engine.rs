@@ -530,6 +530,9 @@ impl GongDB {
         if let Some(result) = self.try_fast_delivery_params(sql, params) {
             return result;
         }
+        if let Some(result) = self.try_fast_update_params(sql, params) {
+            return result;
+        }
         let cached = { self.statement_cache.borrow().get(sql).cloned() };
         let template = if let Some(stmt) = cached {
             stmt
@@ -1971,20 +1974,47 @@ impl GongDB {
         sql: &str,
     ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
         let plan = parse_fast_update(sql)?;
+        match self.execute_fast_update_plan(plan) {
+            Ok(Some(output)) => Some(Ok(output)),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    fn try_fast_update_params(
+        &mut self,
+        sql: &str,
+        params: &[Literal],
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        match parse_fast_update_with_params(sql, params) {
+            Ok(Some(plan)) => match self.execute_fast_update_plan(plan) {
+                Ok(Some(output)) => Some(Ok(output)),
+                Ok(None) => None,
+                Err(err) => Some(Err(err)),
+            },
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    fn execute_fast_update_plan(
+        &mut self,
+        plan: FastUpdatePlan,
+    ) -> Result<Option<DBOutput<DefaultColumnType>>, GongDBError> {
         let table = match self.storage.get_table(&plan.table) {
             Some(table) => table.clone(),
             None => {
-                return Some(Err(GongDBError::new(format!(
+                return Err(GongDBError::new(format!(
                     "no such table: {}",
                     plan.table
-                ))))
+                )))
             }
         };
         if self.storage.get_view(&plan.table).is_some() {
-            return Some(Err(GongDBError::new(format!(
+            return Err(GongDBError::new(format!(
                 "cannot modify view {}",
                 plan.table
-            ))));
+            )));
         }
         let cache_key = fast_update_cache_key(&plan);
         let cached = { self.fast_update_cache.borrow().get(&cache_key).cloned() };
@@ -1992,10 +2022,7 @@ impl GongDB {
             template
         } else {
             let indexes = self.storage.list_indexes();
-            let template = match build_fast_update_template(&table, &plan, &indexes) {
-                Ok(template) => template,
-                Err(err) => return Some(Err(err)),
-            };
+            let template = build_fast_update_template(&table, &plan, &indexes)?;
             self.fast_update_cache
                 .borrow_mut()
                 .insert(cache_key, template.clone());
@@ -2003,7 +2030,7 @@ impl GongDB {
         };
         let (assignment_index_map, predicate_index_map, best_index, best_prefix_index) =
             match template {
-                FastUpdateTemplate::Ineligible => return None,
+                FastUpdateTemplate::Ineligible => return Ok(None),
                 FastUpdateTemplate::Eligible {
                     assignment_indices,
                     predicate_indices,
@@ -2031,41 +2058,30 @@ impl GongDB {
                 key.push(predicate_values[*pos].clone());
             }
             if index_plan.index.unique {
-                let location = match self
-                    .storage
-                    .scan_index_first_location(&index_plan.index.name, &key)
-                {
-                    Ok(location) => location,
-                    Err(err) => return Some(Err(err.into())),
-                };
-                if let Some(location) = location {
-                    let mut row_update: Option<Vec<Value>> = None;
+                    let location =
+                        self.storage
+                            .scan_index_first_location(&index_plan.index.name, &key)?;
+                    if let Some(location) = location {
+                        let mut row_update: Option<Vec<Value>> = None;
                     let applied = match self.storage.update_record_fields_at_with(
                         location,
                         |record| {
                             let matches = if index_plan.all_predicates_covered {
                                 true
                             } else {
-                                match fast_record_matches_predicates(record, &predicate_indices) {
-                                    Ok(matches) => matches,
-                                    Err(err) => {
-                                        return Err(StorageError::Invalid(err.to_string()))
-                                    }
-                                }
+                                fast_record_matches_predicates(record, &predicate_indices).map_err(
+                                    |err| StorageError::Invalid(err.to_string()),
+                                )?
                             };
                             if !matches {
                                 return Ok(None);
                             }
-                            let outcome = match build_fast_update_outcome(
+                            let outcome = build_fast_update_outcome(
                                 &table.columns,
                                 record,
                                 &assignment_indices,
-                            ) {
-                                Ok(outcome) => outcome,
-                                Err(err) => {
-                                    return Err(StorageError::Invalid(err.to_string()))
-                                }
-                            };
+                            )
+                            .map_err(|err| StorageError::Invalid(err.to_string()))?;
                             match outcome {
                                 FastUpdateOutcome::InPlace(fields) => Ok(Some(fields)),
                                 FastUpdateOutcome::Row(new_row) => {
@@ -2077,9 +2093,9 @@ impl GongDB {
                     ) {
                         Ok(applied) => applied,
                         Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
-                            return Some(Ok(DBOutput::StatementComplete(0)))
+                            return Ok(Some(DBOutput::StatementComplete(0)));
                         }
-                        Err(err) => return Some(Err(err.into())),
+                        Err(err) => return Err(err.into()),
                     };
                     if let Some(new_row) = row_update {
                         updates.push((location, new_row));
@@ -2088,37 +2104,29 @@ impl GongDB {
                     }
                 }
             } else {
-                let locations = match self.storage.scan_index_range(
-                    &index_plan.index.name,
-                    Some(&key),
-                    Some(&key),
-                ) {
-                    Ok(locations) => locations,
-                    Err(err) => return Some(Err(err.into())),
-                };
-                for location in locations {
+                    let locations = self.storage.scan_index_range(
+                        &index_plan.index.name,
+                        Some(&key),
+                        Some(&key),
+                    )?;
+                    for location in locations {
                     let outcome = match self.storage.with_record_at(&location, |record| {
-                        let matches = match fast_record_matches_predicates(record, &predicate_indices)
-                        {
-                            Ok(matches) => matches,
-                            Err(err) => return Err(StorageError::Invalid(err.to_string())),
-                        };
+                        let matches = fast_record_matches_predicates(record, &predicate_indices)
+                            .map_err(|err| StorageError::Invalid(err.to_string()))?;
                         if !matches {
                             return Ok(None);
                         }
-                        let outcome =
-                            match build_fast_update_outcome(&table.columns, record, &assignment_indices)
-                            {
-                                Ok(outcome) => outcome,
-                                Err(err) => {
-                                    return Err(StorageError::Invalid(err.to_string()))
-                                }
-                            };
+                        let outcome = build_fast_update_outcome(
+                            &table.columns,
+                            record,
+                            &assignment_indices,
+                        )
+                        .map_err(|err| StorageError::Invalid(err.to_string()))?;
                         Ok(Some(outcome))
                     }) {
                         Ok(outcome) => outcome,
                         Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
-                        Err(err) => return Some(Err(err.into())),
+                        Err(err) => return Err(err.into()),
                     };
                     if let Some(outcome) = outcome {
                         match outcome {
@@ -2149,33 +2157,27 @@ impl GongDB {
                 None,
                 Value::Blob(Vec::new()),
             );
-            let locations = match self
-                .storage
-                .scan_index_range(&index_plan.index.name, Some(&lower), Some(&upper))
-            {
-                Ok(locations) => locations,
-                Err(err) => return Some(Err(err.into())),
-            };
+            let locations =
+                self.storage
+                    .scan_index_range(&index_plan.index.name, Some(&lower), Some(&upper))?;
             for location in locations {
                 let outcome = match self.storage.with_record_at(&location, |record| {
-                    let matches = match fast_record_matches_predicates(record, &predicate_indices) {
-                        Ok(matches) => matches,
-                        Err(err) => return Err(StorageError::Invalid(err.to_string())),
-                    };
+                    let matches = fast_record_matches_predicates(record, &predicate_indices)
+                        .map_err(|err| StorageError::Invalid(err.to_string()))?;
                     if !matches {
                         return Ok(None);
                     }
-                    let outcome =
-                        match build_fast_update_outcome(&table.columns, record, &assignment_indices)
-                        {
-                            Ok(outcome) => outcome,
-                            Err(err) => return Err(StorageError::Invalid(err.to_string())),
-                        };
+                    let outcome = build_fast_update_outcome(
+                        &table.columns,
+                        record,
+                        &assignment_indices,
+                    )
+                    .map_err(|err| StorageError::Invalid(err.to_string()))?;
                     Ok(Some(outcome))
                 }) {
                     Ok(outcome) => outcome,
                     Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
-                    Err(err) => return Some(Err(err.into())),
+                    Err(err) => return Err(err.into()),
                 };
                 if let Some(outcome) = outcome {
                     match outcome {
@@ -2189,65 +2191,45 @@ impl GongDB {
                 }
             }
         } else {
-            let rows = match self.storage.scan_table_with_locations(&plan.table) {
-                Ok(rows) => rows,
-                Err(err) => return Some(Err(err.into())),
-            };
+            let rows = self.storage.scan_table_with_locations(&plan.table)?;
             for (location, row) in rows {
                 if !fast_row_matches_predicates(&row, &predicate_indices) {
                     continue;
                 }
-                let new_row = match apply_fast_update_assignments(
-                    &table.columns,
-                    &row,
-                    &assignment_indices,
-                ) {
-                    Ok(new_row) => new_row,
-                    Err(err) => return Some(Err(err)),
-                };
+                let new_row =
+                    apply_fast_update_assignments(&table.columns, &row, &assignment_indices)?;
                 updates.push((location, new_row));
             }
         }
         if !in_place_updates.is_empty() {
-            match self.storage.update_record_fields_at(&in_place_updates) {
-                Ok(()) => {}
-                Err(err) => return Some(Err(err.into())),
-            }
+            self.storage.update_record_fields_at(&in_place_updates)?;
         }
         if !updates.is_empty() {
             match self.storage.update_rows_at(&updates) {
                 Ok(()) => {}
                 Err(StorageError::Invalid(msg)) if msg == "page full" => {
-                    let rows = match self.storage.scan_table(&plan.table) {
-                        Ok(rows) => rows,
-                        Err(err) => return Some(Err(err.into())),
-                    };
+                    let rows = self.storage.scan_table(&plan.table)?;
                     let mut updated_rows = Vec::with_capacity(rows.len());
                     for row in rows {
                         if fast_row_matches_predicates(&row, &predicate_indices) {
-                            let new_row = match apply_fast_update_assignments(
+                            let new_row = apply_fast_update_assignments(
                                 &table.columns,
                                 &row,
                                 &assignment_indices,
-                            ) {
-                                Ok(new_row) => new_row,
-                                Err(err) => return Some(Err(err)),
-                            };
+                            )?;
                             updated_rows.push(new_row);
                         } else {
                             updated_rows.push(row);
                         }
                     }
-                    if let Err(err) = self.storage.replace_table_rows(&plan.table, &updated_rows) {
-                        return Some(Err(err.into()));
-                    }
+                    self.storage.replace_table_rows(&plan.table, &updated_rows)?;
                 }
-                Err(err) => return Some(Err(err.into())),
+                Err(err) => return Err(err.into()),
             }
         }
         self.select_cache.borrow_mut().clear();
         self.invalidate_table_stats(&plan.table);
-        Some(Ok(DBOutput::StatementComplete(0)))
+        Ok(Some(DBOutput::StatementComplete(0)))
     }
 
     fn try_fast_stock_update(
@@ -7993,6 +7975,79 @@ fn parse_fast_update(sql: &str) -> Option<FastUpdatePlan> {
     })
 }
 
+fn parse_fast_update_with_params(
+    sql: &str,
+    params: &[Literal],
+) -> Result<Option<FastUpdatePlan>, GongDBError> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = match strip_prefix_ci(input, "UPDATE") {
+        Some(rest) => rest,
+        None => return Ok(None),
+    };
+    let rest = rest.trim_start();
+    let table_end = rest
+        .find(|ch: char| ch.is_whitespace())
+        .unwrap_or_else(|| rest.len());
+    if table_end == 0 {
+        return Ok(None);
+    }
+    let table_name = rest[..table_end].trim().to_string();
+    let mut rest = rest[table_end..].trim_start();
+    rest = match strip_prefix_ci(rest, "SET") {
+        Some(rest) => rest,
+        None => return Ok(None),
+    };
+    let rest = rest.trim_start();
+    let (assignments_str, predicates_str) = match split_where_clause(rest) {
+        Some(parts) => parts,
+        None => return Ok(None),
+    };
+    let assignment_parts = match split_commas_outside_quotes(assignments_str) {
+        Some(parts) => parts,
+        None => return Ok(None),
+    };
+    let mut assignments = Vec::with_capacity(assignment_parts.len());
+    let mut param_pos = 0usize;
+    for part in assignment_parts {
+        let assignment =
+            match parse_fast_update_assignment_with_params(part, params, &mut param_pos) {
+                Some(assignment) => assignment,
+                None => return Ok(None),
+            };
+        assignments.push(assignment);
+    }
+    if assignments.is_empty() {
+        return Ok(None);
+    }
+    let predicate_parts = match split_and_outside_quotes(predicates_str) {
+        Some(parts) => parts,
+        None => return Ok(None),
+    };
+    let mut predicates = Vec::with_capacity(predicate_parts.len());
+    for part in predicate_parts {
+        let predicate =
+            match parse_fast_update_predicate_with_params(part, params, &mut param_pos) {
+                Some(predicate) => predicate,
+                None => return Ok(None),
+            };
+        predicates.push(predicate);
+    }
+    if predicates.is_empty() {
+        return Ok(None);
+    }
+    if param_pos != params.len() {
+        return Err(GongDBError::new("parameter count mismatch"));
+    }
+    Ok(Some(FastUpdatePlan {
+        table: table_name,
+        assignments,
+        predicates,
+    }))
+}
+
 fn fast_update_cache_key(plan: &FastUpdatePlan) -> String {
     let mut key = String::with_capacity(
         plan.table.len() + plan.assignments.len() * 12 + plan.predicates.len() * 12,
@@ -8305,6 +8360,51 @@ fn parse_fast_update_assignment(input: &str) -> Option<FastUpdateAssignment> {
     })
 }
 
+fn parse_fast_update_assignment_with_params(
+    input: &str,
+    params: &[Literal],
+    param_pos: &mut usize,
+) -> Option<FastUpdateAssignment> {
+    let mut iter = input.splitn(2, '=');
+    let column = iter.next()?.trim();
+    let expr = iter.next()?.trim();
+    if column.is_empty() || expr.is_empty() {
+        return None;
+    }
+    if expr.len() >= column.len() && expr[..column.len()].eq_ignore_ascii_case(column) {
+        let after = &expr[column.len()..];
+        if !after.chars().next().map_or(false, |c| c.is_whitespace()) {
+            return None;
+        }
+        let mut rest = expr[column.len()..].trim_start();
+        let op = rest.chars().next()?;
+        if op == '+' || op == '-' {
+            rest = rest[op.len_utf8()..].trim_start();
+            let (value, remainder) = parse_fast_param_value(rest, params, param_pos)?;
+            if !remainder.trim().is_empty() {
+                return None;
+            }
+            let action = if op == '+' {
+                FastUpdateAction::Add(value)
+            } else {
+                FastUpdateAction::Sub(value)
+            };
+            return Some(FastUpdateAssignment {
+                column: column.to_ascii_lowercase(),
+                action,
+            });
+        }
+    }
+    let (value, remainder) = parse_fast_param_value(expr, params, param_pos)?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+    Some(FastUpdateAssignment {
+        column: column.to_ascii_lowercase(),
+        action: FastUpdateAction::Set(value),
+    })
+}
+
 fn parse_fast_update_predicate(input: &str) -> Option<(String, Value)> {
     let mut iter = input.splitn(2, '=');
     let column = iter.next()?.trim();
@@ -8313,6 +8413,24 @@ fn parse_fast_update_predicate(input: &str) -> Option<(String, Value)> {
         return None;
     }
     let (value, remainder) = parse_fast_value(expr)?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+    Some((column.to_ascii_lowercase(), value))
+}
+
+fn parse_fast_update_predicate_with_params(
+    input: &str,
+    params: &[Literal],
+    param_pos: &mut usize,
+) -> Option<(String, Value)> {
+    let mut iter = input.splitn(2, '=');
+    let column = iter.next()?.trim();
+    let expr = iter.next()?.trim();
+    if column.is_empty() || expr.is_empty() {
+        return None;
+    }
+    let (value, remainder) = parse_fast_param_value(expr, params, param_pos)?;
     if !remainder.trim().is_empty() {
         return None;
     }
@@ -8406,6 +8524,22 @@ fn parse_fast_value(input: &str) -> Option<(Value, &str)> {
     }
     let value = token.parse::<i64>().ok()?;
     Some((Value::Integer(value), remainder))
+}
+
+fn parse_fast_param_value<'a>(
+    input: &'a str,
+    params: &'a [Literal],
+    param_pos: &mut usize,
+) -> Option<(Value, &'a str)> {
+    let rest = input.trim_start();
+    if rest.starts_with('?') {
+        let idx = *param_pos;
+        let literal = params.get(idx)?;
+        *param_pos += 1;
+        let value = literal_to_value(literal);
+        return Some((value, &rest[1..]));
+    }
+    parse_fast_value(rest)
 }
 
 fn parse_fast_predicates(input: &str) -> Option<Vec<(String, Value)>> {
@@ -11327,6 +11461,17 @@ fn literal_to_i64(literal: &Literal) -> Option<i64> {
         Literal::Float(v) => Some(*v as i64),
         Literal::Boolean(v) => Some(if *v { 1 } else { 0 }),
         _ => None,
+    }
+}
+
+fn literal_to_value(literal: &Literal) -> Value {
+    match literal {
+        Literal::Null => Value::Null,
+        Literal::Integer(v) => Value::Integer(*v),
+        Literal::Float(v) => Value::Real(*v),
+        Literal::String(text) => Value::Text(text.clone()),
+        Literal::Boolean(value) => Value::Integer(if *value { 1 } else { 0 }),
+        Literal::Blob(bytes) => Value::Blob(bytes.clone()),
     }
 }
 
