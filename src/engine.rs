@@ -22,7 +22,8 @@ use crate::ast::{
 };
 use crate::parser;
 use crate::storage::{
-    Column, IndexMeta, StorageEngine, StorageError, StorageSnapshot, TableMeta, Value, ViewMeta,
+    Column, IndexMeta, RowLocation, StorageEngine, StorageError, StorageSnapshot, TableMeta, Value,
+    ViewMeta,
 };
 use async_trait::async_trait;
 use sqllogictest::{DBOutput, DefaultColumnType};
@@ -137,6 +138,21 @@ struct CachedStatement {
     param_count: usize,
 }
 
+#[derive(Debug, Clone)]
+struct FastOrderBy {
+    column: String,
+    desc: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FastSelectPlan {
+    table: String,
+    columns: Vec<String>,
+    predicates: Vec<(String, Value)>,
+    order_by: Option<FastOrderBy>,
+    limit: Option<usize>,
+}
+
 impl GongDB {
     const STATEMENT_CACHE_LIMIT: usize = 128;
 
@@ -203,7 +219,16 @@ impl GongDB {
         if let Some(result) = self.try_fast_insert(sql) {
             return result;
         }
+        if let Some(result) = self.try_fast_delivery_customer_update(sql) {
+            return result;
+        }
         if let Some(result) = self.try_fast_update(sql) {
+            return result;
+        }
+        if let Some(result) = self.try_fast_stock_level(sql) {
+            return result;
+        }
+        if let Some(result) = self.try_fast_select(sql) {
             return result;
         }
         if let Some(cached) = { self.select_cache.borrow().get(sql).cloned() } {
@@ -1035,6 +1060,144 @@ impl GongDB {
         Some(Ok(DBOutput::StatementComplete(rows.len() as u64)))
     }
 
+    fn try_fast_delivery_customer_update(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let (w_id, d_id, o_id) = parse_fast_delivery_customer_update(sql)?;
+        let orders = self.storage.get_table("orders")?.clone();
+        let order_line = self.storage.get_table("order_line")?.clone();
+        let customer = self.storage.get_table("customer")?.clone();
+
+        let orders_idx = column_index_map_fast(&orders.columns);
+        let order_line_idx = column_index_map_fast(&order_line.columns);
+        let customer_idx = column_index_map_fast(&customer.columns);
+        let o_c_id_idx = *orders_idx.get("o_c_id")?;
+        let ol_amount_idx = *order_line_idx.get("ol_amount")?;
+        let c_balance_idx = *customer_idx.get("c_balance")?;
+        let c_delivery_cnt_idx = *customer_idx.get("c_delivery_cnt")?;
+
+        let orders_indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(&orders.name))
+            .collect();
+        let order_line_indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(&order_line.name))
+            .collect();
+        let customer_indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(&customer.name))
+            .collect();
+
+        let orders_index = fast_find_index_prefix(&orders_indexes, &["o_w_id", "o_d_id", "o_id"])?;
+        let order_line_index =
+            fast_find_index_prefix(&order_line_indexes, &["ol_w_id", "ol_d_id", "ol_o_id"])?;
+        let customer_index =
+            fast_find_index_prefix(&customer_indexes, &["c_w_id", "c_d_id", "c_id"])?;
+
+        let order_key = vec![
+            Value::Integer(w_id),
+            Value::Integer(d_id),
+            Value::Integer(o_id),
+        ];
+        let order_rows = match self
+            .storage
+            .scan_index_rows(&orders_index.name, Some(&order_key), Some(&order_key), false)
+        {
+            Ok(rows) => rows,
+            Err(err) => return Some(Err(GongDBError::from(err))),
+        };
+        let o_c_id = match order_rows.get(0).and_then(|row| row.get(o_c_id_idx)) {
+            Some(Value::Integer(v)) => *v,
+            Some(Value::Real(v)) => *v as i64,
+            _ => return Some(Ok(DBOutput::StatementComplete(0))),
+        };
+
+        let lower_key = build_index_bound(
+            order_line_index.columns.len(),
+            &[Value::Integer(w_id), Value::Integer(d_id)],
+            Some(&Value::Integer(o_id)),
+            Value::Null,
+        );
+        let upper_key = build_index_bound(
+            order_line_index.columns.len(),
+            &[Value::Integer(w_id), Value::Integer(d_id)],
+            Some(&Value::Integer(o_id)),
+            Value::Blob(Vec::new()),
+        );
+        let locations = match self
+            .storage
+            .scan_index_range(&order_line_index.name, Some(&lower_key), Some(&upper_key))
+        {
+            Ok(locations) => locations,
+            Err(err) => return Some(Err(GongDBError::from(err))),
+        };
+        let mut sum_amount = 0.0_f64;
+        for location in locations {
+            let row = match self.storage.read_row_at(&location) {
+                Ok(row) => row,
+                Err(StorageError::NotFound(_)) => continue,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            let amount = match row.get(ol_amount_idx) {
+                Some(Value::Integer(v)) => *v as f64,
+                Some(Value::Real(v)) => *v,
+                _ => 0.0,
+            };
+            sum_amount += amount;
+        }
+
+        let customer_key = vec![
+            Value::Integer(w_id),
+            Value::Integer(d_id),
+            Value::Integer(o_c_id),
+        ];
+        let locations = match self
+            .storage
+            .scan_index_range(&customer_index.name, Some(&customer_key), Some(&customer_key))
+        {
+            Ok(locations) => locations,
+            Err(err) => return Some(Err(GongDBError::from(err))),
+        };
+        let mut updates = Vec::new();
+        for location in locations {
+            let row = match self.storage.read_row_at(&location) {
+                Ok(row) => row,
+                Err(StorageError::NotFound(_)) => continue,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            let mut new_row = row.clone();
+            let balance = match row.get(c_balance_idx) {
+                Some(Value::Integer(v)) => *v as f64,
+                Some(Value::Real(v)) => *v,
+                _ => 0.0,
+            };
+            let delivery_cnt = match row.get(c_delivery_cnt_idx) {
+                Some(Value::Integer(v)) => *v,
+                Some(Value::Real(v)) => *v as i64,
+                _ => 0,
+            };
+            new_row[c_balance_idx] = Value::Real(balance + sum_amount);
+            new_row[c_delivery_cnt_idx] = Value::Integer(delivery_cnt + 1);
+            updates.push((location, new_row));
+        }
+        if !updates.is_empty() {
+            if let Err(err) = self.storage.update_rows_at(&updates) {
+                return Some(Err(GongDBError::from(err)));
+            }
+            self.invalidate_table_stats("customer");
+            self.select_cache.borrow_mut().clear();
+        }
+        Some(Ok(DBOutput::StatementComplete(0)))
+    }
+
     fn try_fast_update(
         &mut self,
         sql: &str,
@@ -1216,6 +1379,260 @@ impl GongDB {
         self.select_cache.borrow_mut().clear();
         self.invalidate_table_stats(&plan.table);
         Some(Ok(DBOutput::StatementComplete(0)))
+    }
+
+    fn try_fast_stock_level(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let (w_id, d_id, next_o_id, threshold) = parse_fast_stock_level(sql)?;
+        let order_line = match self.storage.get_table("order_line") {
+            Some(table) => table.clone(),
+            None => return None,
+        };
+        let stock = match self.storage.get_table("stock") {
+            Some(table) => table.clone(),
+            None => return None,
+        };
+
+        let order_line_idx = column_index_map_fast(&order_line.columns);
+        let stock_idx = column_index_map_fast(&stock.columns);
+        let ol_i_id_idx = *order_line_idx.get("ol_i_id")?;
+        let s_quantity_idx = *stock_idx.get("s_quantity")?;
+
+        let order_indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(&order_line.name))
+            .collect();
+        let stock_indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(&stock.name))
+            .collect();
+
+        let order_index = fast_find_index_prefix(
+            &order_indexes,
+            &["ol_w_id", "ol_d_id", "ol_o_id"],
+        )?;
+        let stock_index = fast_find_index_prefix(&stock_indexes, &["s_w_id", "s_i_id"])?;
+
+        let lower_o = next_o_id.saturating_sub(20);
+        if next_o_id == 0 || next_o_id <= lower_o {
+            return Some(Ok(DBOutput::Rows {
+                types: vec![DefaultColumnType::Text],
+                rows: vec![vec![value_to_string(&Value::Integer(0))]],
+            }));
+        }
+        let upper_o = next_o_id.saturating_sub(1);
+        if upper_o < lower_o {
+            return Some(Ok(DBOutput::Rows {
+                types: vec![DefaultColumnType::Text],
+                rows: vec![vec![value_to_string(&Value::Integer(0))]],
+            }));
+        }
+
+        let lower_key = build_index_bound(
+            order_index.columns.len(),
+            &[Value::Integer(w_id), Value::Integer(d_id)],
+            Some(&Value::Integer(lower_o)),
+            Value::Null,
+        );
+        let upper_key = build_index_bound(
+            order_index.columns.len(),
+            &[Value::Integer(w_id), Value::Integer(d_id)],
+            Some(&Value::Integer(upper_o)),
+            Value::Blob(Vec::new()),
+        );
+
+        let locations = match self
+            .storage
+            .scan_index_range(&order_index.name, Some(&lower_key), Some(&upper_key))
+        {
+            Ok(locations) => locations,
+            Err(err) => return Some(Err(GongDBError::from(err))),
+        };
+        let mut distinct_items: HashMap<DistinctKey, Value> = HashMap::new();
+        for location in locations {
+            let row = match self.storage.read_row_at(&location) {
+                Ok(row) => row,
+                Err(StorageError::NotFound(_)) => continue,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            if let Some(value) = row.get(ol_i_id_idx) {
+                distinct_items
+                    .entry(distinct_key(value))
+                    .or_insert_with(|| value.clone());
+            }
+        }
+
+        let mut count = 0i64;
+        for item_id in distinct_items.values() {
+            let key = vec![Value::Integer(w_id), item_id.clone()];
+            let rows = match self
+                .storage
+                .scan_index_rows(&stock_index.name, Some(&key), Some(&key), false)
+            {
+                Ok(rows) => rows,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let qty = rows[0].get(s_quantity_idx);
+            let qty_value = match qty {
+                Some(Value::Integer(v)) => *v,
+                Some(Value::Real(v)) => *v as i64,
+                _ => continue,
+            };
+            if qty_value < threshold {
+                count += 1;
+            }
+        }
+
+        Some(Ok(DBOutput::Rows {
+            types: vec![DefaultColumnType::Text],
+            rows: vec![vec![value_to_string(&Value::Integer(count))]],
+        }))
+    }
+
+    fn try_fast_select(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let plan = parse_fast_select(sql)?;
+        let table = match self.storage.get_table(&plan.table) {
+            Some(table) => table.clone(),
+            None => {
+                return Some(Err(GongDBError::new(format!(
+                    "no such table: {}",
+                    plan.table
+                ))))
+            }
+        };
+        let mut column_map: HashMap<String, usize> = HashMap::new();
+        for (idx, col) in table.columns.iter().enumerate() {
+            column_map.insert(col.name.to_lowercase(), idx);
+        }
+        let mut predicate_indices = Vec::with_capacity(plan.predicates.len());
+        let mut predicate_values: HashMap<String, Value> = HashMap::new();
+        for (name, value) in plan.predicates {
+            let key = name.to_lowercase();
+            let idx = match column_map.get(&key) {
+                Some(idx) => *idx,
+                None => {
+                    return Some(Err(GongDBError::new(format!(
+                        "no such column: {}",
+                        name
+                    ))))
+                }
+            };
+            predicate_indices.push((idx, value.clone()));
+            predicate_values.insert(key, value);
+        }
+        let output_indices = if plan.columns.len() == 1 && plan.columns[0] == "*" {
+            (0..table.columns.len()).collect::<Vec<_>>()
+        } else {
+            let mut indices = Vec::with_capacity(plan.columns.len());
+            for name in &plan.columns {
+                let key = name.to_lowercase();
+                let idx = match column_map.get(&key) {
+                    Some(idx) => *idx,
+                    None => {
+                        return Some(Err(GongDBError::new(format!(
+                            "no such column: {}",
+                            name
+                        ))))
+                    }
+                };
+                indices.push(idx);
+            }
+            indices
+        };
+
+        let indexes: Vec<IndexMeta> = self
+            .storage
+            .list_indexes()
+            .into_iter()
+            .filter(|index| index.table.eq_ignore_ascii_case(&table.name))
+            .collect();
+
+        let rows = if let Some((index, key)) =
+            fast_select_eq_index(&indexes, &predicate_values)
+        {
+            let mut rows = match self
+                .storage
+                .scan_index_rows(&index.name, Some(&key), Some(&key), false)
+            {
+                Ok(rows) => rows,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            if !predicate_indices.is_empty() {
+                rows.retain(|row| fast_row_matches_predicates(row, &predicate_indices));
+            }
+            rows
+        } else if let Some(order_by) = plan.order_by.as_ref() {
+            let limit = plan.limit.unwrap_or(usize::MAX);
+            let (index, lower, upper) = match fast_select_order_by_range(
+                &indexes,
+                order_by,
+                &predicate_values,
+            ) {
+                Some(result) => result,
+                None => return None,
+            };
+            let locations = match self
+                .storage
+                .scan_index_range(&index.name, Some(&lower), Some(&upper))
+            {
+                Ok(locations) => locations,
+                Err(err) => return Some(Err(GongDBError::from(err))),
+            };
+            let iter: Box<dyn Iterator<Item = RowLocation>> = if order_by.desc {
+                Box::new(locations.into_iter().rev())
+            } else {
+                Box::new(locations.into_iter())
+            };
+            let mut rows = Vec::new();
+            for location in iter {
+                let row = match self.storage.read_row_at(&location) {
+                    Ok(row) => row,
+                    Err(StorageError::NotFound(_)) => continue,
+                    Err(err) => return Some(Err(GongDBError::from(err))),
+                };
+                if !predicate_indices.is_empty()
+                    && !fast_row_matches_predicates(&row, &predicate_indices)
+                {
+                    continue;
+                }
+                rows.push(row);
+                if rows.len() >= limit {
+                    break;
+                }
+            }
+            rows
+        } else {
+            return None;
+        };
+
+        let limit = plan.limit.unwrap_or(rows.len());
+        let output_rows = rows
+            .into_iter()
+            .take(limit)
+            .map(|row| {
+                output_indices
+                    .iter()
+                    .map(|idx| value_to_string(&row[*idx]))
+                    .collect::<Vec<String>>()
+            })
+            .collect::<Vec<_>>();
+
+        Some(Ok(DBOutput::Rows {
+            types: vec![DefaultColumnType::Text; output_indices.len()],
+            rows: output_rows,
+        }))
     }
 
     fn invalidate_table_stats(&self, table_name: &str) {
@@ -5503,6 +5920,64 @@ fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+fn consume_fast_keyword<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = input.trim_start();
+    if rest.len() < keyword.len() {
+        return None;
+    }
+    if !rest[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let remainder = &rest[keyword.len()..];
+    if remainder.is_empty()
+        || remainder
+            .chars()
+            .next()
+            .map(|ch| ch.is_whitespace())
+            .unwrap_or(false)
+    {
+        Some(remainder)
+    } else {
+        None
+    }
+}
+
+fn parse_fast_ident<'a>(input: &'a str) -> Option<(&'a str, &'a str)> {
+    let rest = input.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or_else(|| rest.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&rest[..end], &rest[end..]))
+}
+
+fn parse_fast_ident_list(input: &str) -> Option<Vec<String>> {
+    let mut rest = input.trim();
+    let mut idents = Vec::new();
+    if rest == "*" {
+        return Some(vec!["*".to_string()]);
+    }
+    loop {
+        let (ident, next) = parse_fast_ident(rest)?;
+        idents.push(ident.to_string());
+        rest = next.trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+            continue;
+        }
+        if rest.is_empty() {
+            break;
+        }
+        return None;
+    }
+    Some(idents)
+}
+
 fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Vec<Value>>)> {
     let mut input = sql.trim();
     if let Some(stripped) = input.strip_suffix(';') {
@@ -5531,6 +6006,191 @@ fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Vec<Value>>)> {
         return None;
     }
     Some((table_name, rows))
+}
+
+fn parse_fast_select(sql: &str) -> Option<FastSelectPlan> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = consume_fast_keyword(input, "SELECT")?;
+    let lower = rest.to_ascii_lowercase();
+    let from_idx = lower.find(" from ")?;
+    let columns_str = rest[..from_idx].trim();
+    if columns_str.is_empty() {
+        return None;
+    }
+    let columns = parse_fast_ident_list(columns_str)?;
+    let mut rest = &rest[from_idx + 6..];
+    let (table, remainder) = parse_fast_ident(rest)?;
+    rest = remainder;
+    let mut order_by = None;
+    let mut limit = None;
+    let rest = consume_fast_keyword(rest, "WHERE")?;
+    let mut rest = rest;
+    let lower_rest = rest.to_ascii_lowercase();
+    let mut where_end = rest.len();
+    if let Some(idx) = lower_rest.find(" order by ") {
+        where_end = where_end.min(idx);
+    }
+    if let Some(idx) = lower_rest.find(" limit ") {
+        where_end = where_end.min(idx);
+    }
+    let (where_part, remainder) = rest.split_at(where_end);
+    let predicates = parse_fast_predicates(where_part)?;
+    rest = remainder;
+    if let Some(after_order) = consume_fast_keyword(rest, "ORDER") {
+        let after_by = consume_fast_keyword(after_order, "BY")?;
+        let (order_col, after_col) = parse_fast_ident(after_by)?;
+        let mut desc = false;
+        let mut after_col = after_col;
+        if let Some(after_desc) = consume_fast_keyword(after_col, "DESC") {
+            desc = true;
+            after_col = after_desc;
+        } else if let Some(after_asc) = consume_fast_keyword(after_col, "ASC") {
+            after_col = after_asc;
+        }
+        order_by = Some(FastOrderBy {
+            column: order_col.to_string(),
+            desc,
+        });
+        rest = after_col;
+    }
+    if let Some(after_limit) = consume_fast_keyword(rest, "LIMIT") {
+        let (value, after_value) = parse_fast_literal(after_limit)?;
+        let limit_value = match value {
+            Value::Integer(v) if v >= 0 => v as usize,
+            _ => return None,
+        };
+        limit = Some(limit_value);
+        rest = after_value;
+    }
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(FastSelectPlan {
+        table: table.to_string(),
+        columns,
+        predicates,
+        order_by,
+        limit,
+    })
+}
+
+fn parse_fast_stock_level(sql: &str) -> Option<(i64, i64, i64, i64)> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let mut rest = strip_prefix_ci(
+        input,
+        "SELECT COUNT(DISTINCT ol_i_id) FROM order_line, stock WHERE",
+    )?;
+    let (w_id, after_w) = parse_fast_stock_eq(rest, "ol_w_id")?;
+    rest = after_w;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (d_id, after_d) = parse_fast_stock_eq(rest, "ol_d_id")?;
+    rest = after_d;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (next_o_id, after_ge) = parse_fast_stock_cmp(rest, "ol_o_id", ">=")?;
+    rest = after_ge;
+    rest = rest.trim_start();
+    if !rest.starts_with('-') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    let (minus_value, after_minus) = parse_fast_i64(rest)?;
+    if minus_value != 20 {
+        return None;
+    }
+    rest = after_minus;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (upper_o_id, after_lt) = parse_fast_stock_cmp(rest, "ol_o_id", "<")?;
+    rest = after_lt;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    rest = strip_prefix_ci(rest.trim_start(), "s_w_id = ol_w_id")?;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    rest = strip_prefix_ci(rest.trim_start(), "s_i_id = ol_i_id")?;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (threshold, after_qty) = parse_fast_stock_cmp(rest, "s_quantity", "<")?;
+    if !after_qty.trim().is_empty() {
+        return None;
+    }
+    if upper_o_id != next_o_id {
+        return None;
+    }
+    Some((w_id, d_id, next_o_id, threshold))
+}
+
+fn parse_fast_delivery_customer_update(sql: &str) -> Option<(i64, i64, i64)> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let mut rest = strip_prefix_ci(
+        input,
+        "UPDATE customer SET c_balance = c_balance + (SELECT COALESCE(SUM(ol_amount), 0) FROM order_line WHERE",
+    )?;
+    let (w_id, after_w) = parse_fast_stock_eq(rest, "ol_w_id")?;
+    rest = after_w;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (d_id, after_d) = parse_fast_stock_eq(rest, "ol_d_id")?;
+    rest = after_d;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (o_id, after_o) = parse_fast_stock_eq(rest, "ol_o_id")?;
+    rest = after_o;
+    rest = strip_prefix_ci(rest.trim_start(), "),")?;
+    rest = strip_prefix_ci(rest.trim_start(), "c_delivery_cnt = c_delivery_cnt + 1 WHERE")?;
+    let (c_w_id, after_cw) = parse_fast_stock_eq(rest, "c_w_id")?;
+    rest = after_cw;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (c_d_id, after_cd) = parse_fast_stock_eq(rest, "c_d_id")?;
+    rest = after_cd;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    rest = strip_prefix_ci(rest.trim_start(), "c_id = (SELECT o_c_id FROM orders WHERE")?;
+    let (o_w_id, after_ow) = parse_fast_stock_eq(rest, "o_w_id")?;
+    rest = after_ow;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (o_d_id, after_od) = parse_fast_stock_eq(rest, "o_d_id")?;
+    rest = after_od;
+    rest = strip_prefix_ci(rest.trim_start(), "AND")?;
+    let (o_id2, after_oid) = parse_fast_stock_eq(rest, "o_id")?;
+    if !after_oid.trim().trim_end_matches(')').trim().is_empty() {
+        return None;
+    }
+    if w_id != c_w_id || w_id != o_w_id || d_id != c_d_id || d_id != o_d_id || o_id != o_id2 {
+        return None;
+    }
+    Some((w_id, d_id, o_id))
+}
+
+fn parse_fast_stock_eq<'a>(input: &'a str, name: &str) -> Option<(i64, &'a str)> {
+    let mut rest = input.trim_start();
+    rest = strip_prefix_ci(rest, name)?;
+    rest = rest.trim_start();
+    if !rest.starts_with('=') {
+        return None;
+    }
+    rest = &rest[1..];
+    parse_fast_i64(rest)
+}
+
+fn parse_fast_stock_cmp<'a>(input: &'a str, name: &str, op: &str) -> Option<(i64, &'a str)> {
+    let mut rest = input.trim_start();
+    rest = strip_prefix_ci(rest, name)?;
+    rest = rest.trim_start();
+    rest = strip_prefix_ci(rest, op)?;
+    parse_fast_i64(rest)
+}
+
+fn parse_fast_i64(input: &str) -> Option<(i64, &str)> {
+    let (value, rest) = parse_fast_literal(input)?;
+    let value = match value {
+        Value::Integer(v) => v,
+        Value::Real(v) => v as i64,
+        _ => return None,
+    };
+    Some((value, rest))
 }
 
 #[derive(Clone)]
@@ -5874,6 +6534,76 @@ fn parse_fast_value(input: &str) -> Option<(Value, &str)> {
     Some((Value::Integer(value), remainder))
 }
 
+fn parse_fast_predicates(input: &str) -> Option<Vec<(String, Value)>> {
+    let mut rest = input.trim_start();
+    let mut predicates = Vec::new();
+    loop {
+        let (column, after_col) = parse_fast_ident(rest)?;
+        let mut remainder = after_col.trim_start();
+        if !remainder.starts_with('=') {
+            return None;
+        }
+        remainder = &remainder[1..];
+        let (value, after_value) = parse_fast_literal(remainder)?;
+        predicates.push((column.to_string(), value));
+        rest = after_value.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(next) = consume_fast_keyword(rest, "AND") {
+            rest = next;
+            continue;
+        }
+        return None;
+    }
+    Some(predicates)
+}
+
+fn parse_fast_literal(input: &str) -> Option<(Value, &str)> {
+    let rest = input.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    if rest.starts_with('\'') {
+        let bytes = rest.as_bytes();
+        let mut out = Vec::new();
+        let mut idx = 1;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            if byte == b'\'' {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                    out.push(b'\'');
+                    idx += 2;
+                    continue;
+                }
+                let text = String::from_utf8(out).ok()?;
+                let remainder = &rest[idx + 1..];
+                return Some((Value::Text(text), remainder));
+            }
+            out.push(byte);
+            idx += 1;
+        }
+        return None;
+    }
+    let token_end = rest
+        .find(|ch: char| ch.is_whitespace() || ch == ';' || ch == ')' || ch == ',')
+        .unwrap_or_else(|| rest.len());
+    let token = rest[..token_end].trim();
+    if token.is_empty() {
+        return None;
+    }
+    let remainder = &rest[token_end..];
+    if token.eq_ignore_ascii_case("NULL") {
+        return Some((Value::Null, remainder));
+    }
+    if token.contains('.') || token.contains('e') || token.contains('E') {
+        let value = token.parse::<f64>().ok()?;
+        return Some((Value::Real(value), remainder));
+    }
+    let value = token.parse::<i64>().ok()?;
+    Some((Value::Integer(value), remainder))
+}
+
 fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> bool {
     for (idx, value) in predicates {
         if !values_equal(&row[*idx], value) {
@@ -5881,6 +6611,86 @@ fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> 
         }
     }
     true
+}
+
+fn fast_select_eq_index<'a>(
+    indexes: &'a [IndexMeta],
+    predicates: &HashMap<String, Value>,
+) -> Option<(&'a IndexMeta, Vec<Value>)> {
+    for index in indexes {
+        let mut key = Vec::with_capacity(index.columns.len());
+        for column in &index.columns {
+            let value = predicates.get(&column.name.value.to_lowercase())?;
+            key.push(value.clone());
+        }
+        return Some((index, key));
+    }
+    None
+}
+
+fn fast_select_order_by_range<'a>(
+    indexes: &'a [IndexMeta],
+    order_by: &FastOrderBy,
+    predicates: &HashMap<String, Value>,
+) -> Option<(&'a IndexMeta, Vec<Value>, Vec<Value>)> {
+    let order_key = order_by.column.to_lowercase();
+    for index in indexes {
+        let mut prefix = Vec::new();
+        let mut order_pos = None;
+        for (idx, column) in index.columns.iter().enumerate() {
+            let col_key = column.name.value.to_lowercase();
+            if col_key == order_key {
+                order_pos = Some(idx);
+                break;
+            }
+            let value = predicates.get(&col_key)?;
+            prefix.push(value.clone());
+        }
+        let Some(_) = order_pos else { continue };
+        let lower = build_index_bound(index.columns.len(), &prefix, None, Value::Null);
+        let upper = build_index_bound(
+            index.columns.len(),
+            &prefix,
+            None,
+            Value::Blob(Vec::new()),
+        );
+        return Some((index, lower, upper));
+    }
+    None
+}
+
+fn column_index_map_fast(columns: &[Column]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (idx, col) in columns.iter().enumerate() {
+        map.insert(col.name.to_lowercase(), idx);
+    }
+    map
+}
+
+fn fast_find_index_prefix<'a>(
+    indexes: &'a [IndexMeta],
+    columns: &[&str],
+) -> Option<&'a IndexMeta> {
+    for index in indexes {
+        if index.columns.len() < columns.len() {
+            continue;
+        }
+        let mut matches = true;
+        for (idx, col) in columns.iter().enumerate() {
+            if !index.columns[idx]
+                .name
+                .value
+                .eq_ignore_ascii_case(col)
+            {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn apply_fast_update_assignments(
