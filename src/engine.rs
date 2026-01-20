@@ -986,7 +986,7 @@ impl GongDB {
                 ))))
             }
         };
-        let row = match build_insert_row_from_values(self, &table, &[], &values) {
+        let row = match build_insert_row_from_owned_values_no_columns(self, &table, values) {
             Ok(row) => row,
             Err(err) => return Some(Err(err)),
         };
@@ -4867,6 +4867,9 @@ fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     let table_name = rest[..table_end].trim().to_string();
     rest = rest[table_end..].trim_start();
     rest = strip_prefix_ci(rest, "VALUES")?.trim_start();
+    if rest.contains("),") {
+        return None;
+    }
     if !rest.starts_with('(') {
         return None;
     }
@@ -5079,17 +5082,21 @@ fn build_insert_row_from_values(
     columns: &[Ident],
     values: &[Value],
 ) -> Result<Vec<Value>, GongDBError> {
-    let mut row = build_default_row(db, table)?;
     if columns.is_empty() {
         if values.len() != table.columns.len() {
             return Err(GongDBError::new("column count mismatch"));
         }
+        let mut row = Vec::with_capacity(table.columns.len());
         for (idx, value) in values.iter().enumerate() {
-            row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
+            row.push(apply_affinity(
+                value.clone(),
+                &table.columns[idx].data_type,
+            ));
         }
         validate_insert_row(db, table, &row)?;
         return Ok(row);
     }
+    let mut row = build_default_row(db, table)?;
     if values.len() != columns.len() {
         return Err(GongDBError::new("column count mismatch"));
     }
@@ -5110,6 +5117,22 @@ fn build_insert_row_from_values(
             .get(&key)
             .ok_or_else(|| GongDBError::new(format!("no such column: {}", col_ident.value)))?;
         row[idx] = apply_affinity(value.clone(), &table.columns[idx].data_type);
+    }
+    validate_insert_row(db, table, &row)?;
+    Ok(row)
+}
+
+fn build_insert_row_from_owned_values_no_columns(
+    db: &GongDB,
+    table: &TableMeta,
+    values: Vec<Value>,
+) -> Result<Vec<Value>, GongDBError> {
+    if values.len() != table.columns.len() {
+        return Err(GongDBError::new("column count mismatch"));
+    }
+    let mut row = Vec::with_capacity(table.columns.len());
+    for (idx, value) in values.into_iter().enumerate() {
+        row.push(apply_affinity(value, &table.columns[idx].data_type));
     }
     validate_insert_row(db, table, &row)?;
     Ok(row)
