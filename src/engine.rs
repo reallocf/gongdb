@@ -216,6 +216,9 @@ impl GongDB {
     /// println!("{:?}", output);
     /// ```
     pub fn run_statement(&mut self, sql: &str) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(result) = self.try_fast_transaction(sql) {
+            return result;
+        }
         if let Some(result) = self.try_fast_insert(sql) {
             return result;
         }
@@ -1025,6 +1028,31 @@ impl GongDB {
             types: vec![DefaultColumnType::Text; result.columns.len()],
             rows: output_rows,
         })
+    }
+
+    fn try_fast_transaction(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let trimmed = sql.trim();
+        if trimmed.eq_ignore_ascii_case("BEGIN")
+            || trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
+        {
+            return Some(self.begin_transaction(BeginTransaction { isolation: None }));
+        }
+        if trimmed.eq_ignore_ascii_case("COMMIT")
+            || trimmed.eq_ignore_ascii_case("COMMIT TRANSACTION")
+            || trimmed.eq_ignore_ascii_case("END")
+            || trimmed.eq_ignore_ascii_case("END TRANSACTION")
+        {
+            return Some(self.commit_transaction());
+        }
+        if trimmed.eq_ignore_ascii_case("ROLLBACK")
+            || trimmed.eq_ignore_ascii_case("ROLLBACK TRANSACTION")
+        {
+            return Some(self.rollback_transaction());
+        }
+        None
     }
 
     fn try_fast_insert(
