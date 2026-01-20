@@ -1604,7 +1604,16 @@ impl StorageEngine {
             .indexes
             .remove(index_name)
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
-        for entry in entries {
+        let mut start = 0usize;
+        if entries.len() > 1 {
+            if let Some(first_unappended) = self.try_append_index_entries_batch(&mut index, entries)? {
+                start = first_unappended;
+            } else {
+                self.indexes.insert(index_name.to_string(), index);
+                return Ok(());
+            }
+        }
+        for entry in &entries[start..] {
             if !self.try_append_index_entry(&mut index, entry)? {
                 self.insert_index_record_btree(&mut index, entry)?;
             }
@@ -1740,6 +1749,51 @@ impl StorageEngine {
             Err(StorageError::Invalid(msg)) if msg == "page full" => Ok(false),
             Err(err) => Err(err),
         }
+    }
+
+    fn try_append_index_entries_batch(
+        &mut self,
+        index: &mut IndexMeta,
+        entries: &[IndexEntry],
+    ) -> Result<Option<usize>, StorageError> {
+        let last_leaf = self.ensure_index_last_leaf(index)?;
+        let mut page = self.read_page(last_leaf)?;
+        if page_type(&page) != PAGE_TYPE_BTREE_LEAF {
+            return Ok(Some(0));
+        }
+        let mut last_key = match read_last_leaf_entry(&page)? {
+            Some(entry) => Some(entry.key),
+            None => None,
+        };
+        let mut modified = false;
+        for (idx, entry) in entries.iter().enumerate() {
+            if let Some(ref key) = last_key {
+                if compare_index_keys(&entry.key, key) == std::cmp::Ordering::Less {
+                    if modified {
+                        self.write_page(last_leaf, &page)?;
+                    }
+                    return Ok(Some(idx));
+                }
+            }
+            let record = encode_index_entry(entry)?;
+            match insert_record(&mut page, &record) {
+                Ok(_) => {
+                    last_key = Some(entry.key.clone());
+                    modified = true;
+                }
+                Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                    if modified {
+                        self.write_page(last_leaf, &page)?;
+                    }
+                    return Ok(Some(idx));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if modified {
+            self.write_page(last_leaf, &page)?;
+        }
+        Ok(None)
     }
 
     fn ensure_index_last_leaf(&mut self, index: &mut IndexMeta) -> Result<u32, StorageError> {
