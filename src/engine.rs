@@ -4683,6 +4683,79 @@ impl GongDB {
         };
         let mut right_matched = vec![false; right_rows.len()];
 
+        if !join_pairs.is_empty()
+            && matches!(operator, JoinOperator::Inner | JoinOperator::Left)
+        {
+            if let Some(plan) = index_lookup_plan_for_pairs(
+                self,
+                &right.table_scope,
+                &columns[left_len..],
+                &join_pairs,
+            ) {
+                for left_row in &left_rows {
+                    let mut key = Vec::with_capacity(plan.left_key_indices.len());
+                    let mut has_null = false;
+                    for idx in &plan.left_key_indices {
+                        let value = &left_row[*idx];
+                        if matches!(value, Value::Null) {
+                            has_null = true;
+                            break;
+                        }
+                        key.push(value.clone());
+                    }
+                    let mut matched = false;
+                    if !has_null {
+                        let right_matches = self.storage.scan_index_rows(
+                            &plan.index_name,
+                            Some(&key),
+                            Some(&key),
+                            false,
+                        )?;
+                        for right_row in right_matches {
+                            let mut combined = Vec::with_capacity(left_len + right_len);
+                            combined.extend(left_row.iter().cloned());
+                            combined.extend(right_row.into_iter());
+                            if !remaining_predicates.is_empty() {
+                                let scope = EvalScope {
+                                    columns: &columns,
+                                    column_scopes: &column_scopes,
+                                    row: &combined,
+                                    table_scope: &table_scope,
+                                    cte_context,
+                                    column_lookup: column_lookup.as_ref(),
+                                };
+                                let mut keep = true;
+                                for predicate in &remaining_predicates {
+                                    let value = eval_expr(self, predicate, &scope, outer)?;
+                                    if !value_to_bool(&value) {
+                                        keep = false;
+                                        break;
+                                    }
+                                }
+                                if !keep {
+                                    continue;
+                                }
+                            }
+                            matched = true;
+                            rows.push(combined);
+                        }
+                    }
+                    if !matched && matches!(operator, JoinOperator::Left) {
+                        let mut combined = Vec::with_capacity(left_len + right_len);
+                        combined.extend(left_row.iter().cloned());
+                        combined.extend(null_right.iter().cloned());
+                        rows.push(combined);
+                    }
+                }
+                return Ok(QuerySource {
+                    columns,
+                    column_scopes,
+                    rows,
+                    table_scope,
+                });
+            }
+        }
+
         if join_pairs.is_empty() {
             let on_expr = constraint.and_then(|c| match c {
                 JoinConstraint::On(expr) => Some(expr),
