@@ -81,6 +81,19 @@ where
     Ok(())
 }
 
+fn flush_value_batch(
+    db: &mut GongDB,
+    table: &str,
+    batch: &mut Vec<Vec<Value>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let rows = std::mem::take(batch);
+    db.run_fast_insert_rows_unchecked(table, rows)?;
+    Ok(())
+}
+
 /// TPC-C Benchmark test
 #[test]
 fn test_tpcc_benchmark() {
@@ -428,121 +441,138 @@ fn load_tpcc_data(
     let batch_size = 100;
     // Load warehouses
     db.defer_index_updates("warehouse")?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        batch.push(format!(
-            "({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
-            w_id, w_id
-        ));
+        batch.push(vec![
+            Value::Integer(w_id as i64),
+            Value::Text(format!("Warehouse{}", w_id)),
+            Value::Text("Street1".to_string()),
+            Value::Text("Street2".to_string()),
+            Value::Text("City".to_string()),
+            Value::Text("ST".to_string()),
+            Value::Text("12345".to_string()),
+            Value::Real(0.0825),
+            Value::Real(300000.0),
+        ]);
         if batch.len() >= batch_size {
-            flush_insert_batch("warehouse", &mut batch, |sql| {
-                db.run_statement(sql)?;
-                Ok(())
-            })?;
+            flush_value_batch(db, "warehouse", &mut batch)?;
         }
     }
-    flush_insert_batch("warehouse", &mut batch, |sql| {
-        db.run_statement(sql)?;
-        Ok(())
-    })?;
+    flush_value_batch(db, "warehouse", &mut batch)?;
     db.resume_index_updates("warehouse")?;
     
     // Load districts
     db.defer_index_updates("district")?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
-            batch.push(format!(
-                "({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
-                d_id, w_id, d_id
-            ));
+            batch.push(vec![
+                Value::Integer(d_id as i64),
+                Value::Integer(w_id as i64),
+                Value::Text(format!("District{}", d_id)),
+                Value::Text("Street1".to_string()),
+                Value::Text("Street2".to_string()),
+                Value::Text("City".to_string()),
+                Value::Text("ST".to_string()),
+                Value::Text("12345".to_string()),
+                Value::Real(0.0825),
+                Value::Real(30000.0),
+                Value::Integer(3001),
+            ]);
             if batch.len() >= batch_size {
-                flush_insert_batch("district", &mut batch, |sql| {
-                    db.run_statement(sql)?;
-                    Ok(())
-                })?;
+                flush_value_batch(db, "district", &mut batch)?;
             }
         }
     }
-    flush_insert_batch("district", &mut batch, |sql| {
-        db.run_statement(sql)?;
-        Ok(())
-    })?;
+    flush_value_batch(db, "district", &mut batch)?;
     db.resume_index_updates("district")?;
     
     // Load customers
     db.defer_index_updates("customer")?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
             for c_id in 1..=customers_per_district {
-                batch.push(format!(
-                    "({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
-                    c_id, d_id, w_id, c_id, c_id
-                ));
+                batch.push(vec![
+                    Value::Integer(c_id as i64),
+                    Value::Integer(d_id as i64),
+                    Value::Integer(w_id as i64),
+                    Value::Text(format!("First{}", c_id)),
+                    Value::Text("M".to_string()),
+                    Value::Text(format!("Last{}", c_id)),
+                    Value::Text("Street1".to_string()),
+                    Value::Text("Street2".to_string()),
+                    Value::Text("City".to_string()),
+                    Value::Text("ST".to_string()),
+                    Value::Text("12345".to_string()),
+                    Value::Text("555-1234".to_string()),
+                    Value::Text("2024-01-01".to_string()),
+                    Value::Text("GC".to_string()),
+                    Value::Real(50000.0),
+                    Value::Real(0.05),
+                    Value::Real(-10.0),
+                    Value::Real(10.0),
+                    Value::Integer(1),
+                    Value::Integer(0),
+                    Value::Text("Data".to_string()),
+                ]);
                 if batch.len() >= batch_size {
-                    flush_insert_batch("customer", &mut batch, |sql| {
-                        db.run_statement(sql)?;
-                        Ok(())
-                    })?;
+                    flush_value_batch(db, "customer", &mut batch)?;
                 }
             }
         }
     }
-    flush_insert_batch("customer", &mut batch, |sql| {
-        db.run_statement(sql)?;
-        Ok(())
-    })?;
+    flush_value_batch(db, "customer", &mut batch)?;
     db.resume_index_updates("customer")?;
     
     // Load items
     db.defer_index_updates("item")?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
     for i_id in 1..=items {
-        batch.push(format!(
-            "({}, {}, 'Item{}', {}, 'Data{}')",
-            i_id,
-            i_id % 100,
-            i_id,
-            1.0 + (i_id as f64) * 0.01,
-            i_id
-        ));
+        batch.push(vec![
+            Value::Integer(i_id as i64),
+            Value::Integer((i_id % 100) as i64),
+            Value::Text(format!("Item{}", i_id)),
+            Value::Real(1.0 + (i_id as f64) * 0.01),
+            Value::Text(format!("Data{}", i_id)),
+        ]);
         if batch.len() >= batch_size {
-            flush_insert_batch("item", &mut batch, |sql| {
-                db.run_statement(sql)?;
-                Ok(())
-            })?;
+            flush_value_batch(db, "item", &mut batch)?;
         }
     }
-    flush_insert_batch("item", &mut batch, |sql| {
-        db.run_statement(sql)?;
-        Ok(())
-    })?;
+    flush_value_batch(db, "item", &mut batch)?;
     db.resume_index_updates("item")?;
     
     // Load stock
     db.defer_index_updates("stock")?;
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for i_id in 1..=items {
-            batch.push(format!(
-                "({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
-                i_id,
-                w_id,
-                10 + (i_id % 90)
-            ));
+            batch.push(vec![
+                Value::Integer(i_id as i64),
+                Value::Integer(w_id as i64),
+                Value::Integer((10 + (i_id % 90)) as i64),
+                Value::Text("S_DIST_01".to_string()),
+                Value::Text("S_DIST_02".to_string()),
+                Value::Text("S_DIST_03".to_string()),
+                Value::Text("S_DIST_04".to_string()),
+                Value::Text("S_DIST_05".to_string()),
+                Value::Text("S_DIST_06".to_string()),
+                Value::Text("S_DIST_07".to_string()),
+                Value::Text("S_DIST_08".to_string()),
+                Value::Text("S_DIST_09".to_string()),
+                Value::Text("S_DIST_10".to_string()),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Integer(0),
+                Value::Text("S_DATA".to_string()),
+            ]);
             if batch.len() >= batch_size {
-                flush_insert_batch("stock", &mut batch, |sql| {
-                    db.run_statement(sql)?;
-                    Ok(())
-                })?;
+                flush_value_batch(db, "stock", &mut batch)?;
             }
         }
     }
-    flush_insert_batch("stock", &mut batch, |sql| {
-        db.run_statement(sql)?;
-        Ok(())
-    })?;
+    flush_value_batch(db, "stock", &mut batch)?;
     db.resume_index_updates("stock")?;
     
     Ok(())
