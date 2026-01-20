@@ -6716,34 +6716,44 @@ fn apply_fast_update_record_bytes(
             Err(err) => return Err(err.into()),
         };
         if col_idx == sorted[assign_idx].0 {
-            let (current, new_pos) = match crate::storage::decode_value_at(record, pos) {
-                Ok(result) => result,
-                Err(err) => return Err(err.into()),
-            };
             let assignment = &sorted[assign_idx].1;
             let column = &columns[col_idx];
-            let updated = match &assignment.action {
-                FastUpdateAction::Set(value) => apply_affinity(value.clone(), &column.data_type),
-                FastUpdateAction::Add(delta) => {
-                    let delta = apply_affinity(delta.clone(), &column.data_type);
-                    let value = apply_binary_op(&BinaryOperator::Plus, current, delta)?;
-                    apply_affinity(value, &column.data_type)
+            if let Some(encoded) = fast_numeric_update_bytes(
+                column,
+                assignment,
+                record,
+                pos,
+            ) {
+                updates.push((pos, encoded, len));
+                pos = pos.saturating_add(len);
+            } else {
+                let (current, new_pos) = match crate::storage::decode_value_at(record, pos) {
+                    Ok(result) => result,
+                    Err(err) => return Err(err.into()),
+                };
+                let updated = match &assignment.action {
+                    FastUpdateAction::Set(value) => apply_affinity(value.clone(), &column.data_type),
+                    FastUpdateAction::Add(delta) => {
+                        let delta = apply_affinity(delta.clone(), &column.data_type);
+                        let value = apply_binary_op(&BinaryOperator::Plus, current, delta)?;
+                        apply_affinity(value, &column.data_type)
+                    }
+                    FastUpdateAction::Sub(delta) => {
+                        let delta = apply_affinity(delta.clone(), &column.data_type);
+                        let value = apply_binary_op(&BinaryOperator::Minus, current, delta)?;
+                        apply_affinity(value, &column.data_type)
+                    }
+                };
+                let encoded = match crate::storage::encode_value_to_vec(&updated) {
+                    Ok(encoded) => encoded,
+                    Err(err) => return Err(err.into()),
+                };
+                if encoded.len() != len {
+                    return Ok(None);
                 }
-                FastUpdateAction::Sub(delta) => {
-                    let delta = apply_affinity(delta.clone(), &column.data_type);
-                    let value = apply_binary_op(&BinaryOperator::Minus, current, delta)?;
-                    apply_affinity(value, &column.data_type)
-                }
-            };
-            let encoded = match crate::storage::encode_value_to_vec(&updated) {
-                Ok(encoded) => encoded,
-                Err(err) => return Err(err.into()),
-            };
-            if encoded.len() != len {
-                return Ok(None);
+                updates.push((pos, encoded, len));
+                pos = new_pos;
             }
-            updates.push((pos, encoded, len));
-            pos = new_pos;
             assign_idx += 1;
         } else {
             pos = pos.saturating_add(len);
@@ -6757,6 +6767,74 @@ fn apply_fast_update_record_bytes(
         new_record[offset..offset + len].copy_from_slice(&encoded);
     }
     Ok(Some(new_record))
+}
+
+fn fast_numeric_update_bytes(
+    column: &Column,
+    assignment: &FastUpdateAssignment,
+    record: &[u8],
+    pos: usize,
+) -> Option<Vec<u8>> {
+    let affinity = type_affinity(&column.data_type);
+    let tag = *record.get(pos)?;
+    match affinity {
+        TypeAffinity::Integer => {
+            if tag != 1 {
+                return None;
+            }
+            let current = read_i64_at(record, pos + 1)?;
+            let next = match &assignment.action {
+                FastUpdateAction::Set(Value::Integer(v)) => *v,
+                FastUpdateAction::Add(Value::Integer(delta)) => current.wrapping_add(*delta),
+                FastUpdateAction::Sub(Value::Integer(delta)) => current.wrapping_sub(*delta),
+                _ => return None,
+            };
+            let mut encoded = Vec::with_capacity(9);
+            encoded.push(1);
+            encoded.extend_from_slice(&next.to_le_bytes());
+            Some(encoded)
+        }
+        TypeAffinity::Real => {
+            if tag != 2 {
+                return None;
+            }
+            let current = read_f64_at(record, pos + 1)?;
+            let next = match &assignment.action {
+                FastUpdateAction::Set(Value::Integer(v)) => *v as f64,
+                FastUpdateAction::Set(Value::Real(v)) => *v,
+                FastUpdateAction::Add(Value::Integer(delta)) => current + (*delta as f64),
+                FastUpdateAction::Add(Value::Real(delta)) => current + *delta,
+                FastUpdateAction::Sub(Value::Integer(delta)) => current - (*delta as f64),
+                FastUpdateAction::Sub(Value::Real(delta)) => current - *delta,
+                _ => return None,
+            };
+            let mut encoded = Vec::with_capacity(9);
+            encoded.push(2);
+            encoded.extend_from_slice(&next.to_le_bytes());
+            Some(encoded)
+        }
+        _ => None,
+    }
+}
+
+fn read_i64_at(record: &[u8], pos: usize) -> Option<i64> {
+    let end = pos.checked_add(8)?;
+    if end > record.len() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&record[pos..end]);
+    Some(i64::from_le_bytes(buf))
+}
+
+fn read_f64_at(record: &[u8], pos: usize) -> Option<f64> {
+    let end = pos.checked_add(8)?;
+    if end > record.len() {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&record[pos..end]);
+    Some(f64::from_le_bytes(buf))
 }
 
 fn fast_select_eq_index<'a>(
