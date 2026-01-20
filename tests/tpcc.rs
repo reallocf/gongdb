@@ -792,13 +792,7 @@ fn run_new_order(
     let o_id = 3001 + (txn_id % 1000); // Simulated order ID
     
     // Update district's next order ID (TPC-C spec requirement)
-    db.run_statement_with_params(
-        "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = ? AND d_id = ?",
-        &[
-            Literal::Integer(w_id as i64),
-            Literal::Integer(d_id as i64),
-        ],
-    )?;
+    db.run_fast_district_next_o_id_increment(w_id as i64, d_id as i64)?;
     
     // Track if any remote warehouse is used (for o_all_local)
     // TPC-C spec: o_all_local = 1 if all order lines come from local warehouse, 0 otherwise
@@ -840,6 +834,7 @@ fn run_new_order(
     
     // Create order lines
     let mut order_line_rows = Vec::with_capacity(ol_cnt);
+    let mut stock_updates = Vec::with_capacity(ol_cnt);
     for ol_number in 1..=ol_cnt {
         let ol_i_id = (txn_id * ol_number) % items + 1;
         let ol_quantity = 1 + (txn_id % 10);
@@ -875,13 +870,17 @@ fn run_new_order(
         
         // Update stock (TPC-C spec: update s_quantity, s_ytd, s_order_cnt, s_remote_cnt)
         let remote = ol_supply_w_id != w_id;
-        db.run_fast_stock_update(
+        stock_updates.push((
             ol_quantity as i64,
             ol_quantity as i64,
             ol_supply_w_id as i64,
             ol_i_id as i64,
             remote,
-        )?;
+        ));
+    }
+
+    if !stock_updates.is_empty() {
+        db.run_fast_stock_updates(&stock_updates)?;
     }
 
     if !order_line_rows.is_empty() {

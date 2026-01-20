@@ -124,6 +124,7 @@ pub struct GongDB {
     column_index_cache: RefCell<HashMap<String, HashMap<String, usize>>>,
     insert_validation_cache: RefCell<HashMap<String, InsertValidationInfo>>,
     fast_stock_offsets_cache: RefCell<Option<FastStockOffsetsCache>>,
+    fast_district_offsets_cache: RefCell<Option<FastDistrictOffsetsCache>>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +171,12 @@ struct FastStockOffsetsCache {
     offsets: FastStockUpdateOffsets,
 }
 
+#[derive(Clone)]
+struct FastDistrictOffsetsCache {
+    record_len: usize,
+    next_o_id: usize,
+}
+
 impl GongDB {
     const STATEMENT_CACHE_LIMIT: usize = 128;
 
@@ -198,6 +205,7 @@ impl GongDB {
             column_index_cache: RefCell::new(HashMap::new()),
             insert_validation_cache: RefCell::new(HashMap::new()),
             fast_stock_offsets_cache: RefCell::new(None),
+            fast_district_offsets_cache: RefCell::new(None),
         })
     }
 
@@ -226,6 +234,7 @@ impl GongDB {
             column_index_cache: RefCell::new(HashMap::new()),
             insert_validation_cache: RefCell::new(HashMap::new()),
             fast_stock_offsets_cache: RefCell::new(None),
+            fast_district_offsets_cache: RefCell::new(None),
         })
     }
 
@@ -235,6 +244,7 @@ impl GongDB {
         self.column_index_cache.borrow_mut().clear();
         self.insert_validation_cache.borrow_mut().clear();
         self.fast_stock_offsets_cache.borrow_mut().take();
+        self.fast_district_offsets_cache.borrow_mut().take();
     }
 
     fn table_indexes_cached(&self, table_name: &str) -> Vec<IndexMeta> {
@@ -477,6 +487,48 @@ impl GongDB {
             Literal::Integer(w_id),
             Literal::Integer(i_id),
         ];
+        self.run_statement_with_params(sql, &params)
+    }
+
+    /// Fast path for batch TPC-C stock updates without SQL parsing.
+    pub fn run_fast_stock_updates(
+        &mut self,
+        updates: &[(i64, i64, i64, i64, bool)],
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if updates.is_empty() {
+            return Ok(DBOutput::StatementComplete(0));
+        }
+        let mut plans = Vec::with_capacity(updates.len());
+        for (quantity, ytd, w_id, i_id, remote) in updates {
+            plans.push(FastStockUpdatePlan {
+                quantity: *quantity,
+                ytd: *ytd,
+                w_id: *w_id,
+                i_id: *i_id,
+                remote: *remote,
+            });
+        }
+        if let Some(result) = self.apply_fast_stock_update_batch(&plans) {
+            return result;
+        }
+        for (quantity, ytd, w_id, i_id, remote) in updates {
+            self.run_fast_stock_update(*quantity, *ytd, *w_id, *i_id, *remote)?;
+        }
+        Ok(DBOutput::StatementComplete(0))
+    }
+
+    /// Fast path for incrementing district next order ID without SQL parsing.
+    pub fn run_fast_district_next_o_id_increment(
+        &mut self,
+        w_id: i64,
+        d_id: i64,
+    ) -> Result<DBOutput<DefaultColumnType>, GongDBError> {
+        if let Some(result) = self.apply_fast_district_next_o_id_increment(w_id, d_id) {
+            return result;
+        }
+        let sql =
+            "UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = ? AND d_id = ?";
+        let params = [Literal::Integer(w_id), Literal::Integer(d_id)];
         self.run_statement_with_params(sql, &params)
     }
 
@@ -1855,6 +1907,267 @@ impl GongDB {
         if applied {
             self.select_cache.borrow_mut().clear();
             self.invalidate_table_stats("stock");
+        }
+        Some(Ok(DBOutput::StatementComplete(0)))
+    }
+
+    fn apply_fast_stock_update_batch(
+        &mut self,
+        plans: &[FastStockUpdatePlan],
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        if plans.is_empty() {
+            return Some(Ok(DBOutput::StatementComplete(0)));
+        }
+        let mut target_index: Option<IndexMeta> = None;
+        for index in self.table_indexes_cached("stock") {
+            if !index.table.eq_ignore_ascii_case("stock") || !index.unique {
+                continue;
+            }
+            if index.columns.len() != 2 {
+                continue;
+            }
+            let first = index.columns[0].name.value.to_ascii_lowercase();
+            let second = index.columns[1].name.value.to_ascii_lowercase();
+            if first == "s_w_id" && second == "s_i_id" {
+                target_index = Some(index.clone());
+                break;
+            }
+        }
+        let index = match target_index {
+            Some(index) => index,
+            None => return None,
+        };
+        let mut cached_offsets = self.fast_stock_offsets_cache.borrow().clone();
+        let mut cache_update: Option<FastStockOffsetsCache> = None;
+        let mut any_applied = false;
+        for plan in plans {
+            let key = vec![Value::Integer(plan.w_id), Value::Integer(plan.i_id)];
+            let location = match self.storage.scan_index_first_location(&index.name, &key) {
+                Ok(location) => location,
+                Err(err) => return Some(Err(err.into())),
+            };
+            let location = match location {
+                Some(location) => location,
+                None => continue,
+            };
+            let cached_snapshot = cached_offsets.clone();
+            let mut local_cache_update: Option<FastStockOffsetsCache> = None;
+            let mut fallback_needed = false;
+            let applied = match self.storage.update_record_at_with(location, |record| {
+                let cached = cached_snapshot.as_ref().and_then(|cache| {
+                    if cache.record_len == record.len()
+                        && (!plan.remote || cache.offsets.remote_cnt.is_some())
+                    {
+                        Some(cache.offsets.clone())
+                    } else {
+                        None
+                    }
+                });
+                let offsets = match cached {
+                    Some(offsets) => offsets,
+                    None => match fast_stock_update_offsets(record, plan.remote) {
+                        Ok(Some(offsets)) => {
+                            local_cache_update = Some(FastStockOffsetsCache {
+                                record_len: record.len(),
+                                offsets: offsets.clone(),
+                            });
+                            offsets
+                        }
+                        Ok(None) => {
+                            fallback_needed = true;
+                            return Ok(false);
+                        }
+                        Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                    },
+                };
+                let quantity = match read_i64_at(record, offsets.quantity + 1) {
+                    Some(value) => value,
+                    None => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                };
+                let ytd = match read_i64_at(record, offsets.ytd + 1) {
+                    Some(value) => value,
+                    None => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                };
+                let order_cnt = match read_i64_at(record, offsets.order_cnt + 1) {
+                    Some(value) => value,
+                    None => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                };
+                let remote_cnt = if let Some(offset) = offsets.remote_cnt {
+                    match read_i64_at(record, offset + 1) {
+                        Some(value) => Some(value),
+                        None => {
+                            fallback_needed = true;
+                            return Ok(false);
+                        }
+                    }
+                } else {
+                    None
+                };
+                let remote_ok = offsets
+                    .remote_cnt
+                    .map(|offset| record[offset] == 1)
+                    .unwrap_or(true);
+                if record[offsets.quantity] != 1
+                    || record[offsets.ytd] != 1
+                    || record[offsets.order_cnt] != 1
+                    || !remote_ok
+                {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+                let next_quantity = quantity.wrapping_sub(plan.quantity);
+                let next_ytd = ytd.wrapping_add(plan.ytd);
+                let next_order_cnt = order_cnt.wrapping_add(1);
+                let next_remote_cnt = remote_cnt.map(|value| value.wrapping_add(1));
+                if write_i64_at(record, offsets.quantity + 1, next_quantity).is_none()
+                    || write_i64_at(record, offsets.ytd + 1, next_ytd).is_none()
+                    || write_i64_at(record, offsets.order_cnt + 1, next_order_cnt).is_none()
+                {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+                if let (Some(offset), Some(next)) = (offsets.remote_cnt, next_remote_cnt) {
+                    if write_i64_at(record, offset + 1, next).is_none() {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }) {
+                Ok(applied) => applied,
+                Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+                Err(err) => return Some(Err(err.into())),
+            };
+            if fallback_needed {
+                return None;
+            }
+            if let Some(update) = local_cache_update {
+                cached_offsets = Some(update.clone());
+                if cache_update.is_none() {
+                    cache_update = Some(update);
+                }
+            }
+            if applied {
+                any_applied = true;
+            }
+        }
+        if let Some(cache_update) = cache_update {
+            self.fast_stock_offsets_cache
+                .borrow_mut()
+                .replace(cache_update);
+        }
+        if any_applied {
+            self.select_cache.borrow_mut().clear();
+            self.invalidate_table_stats("stock");
+        }
+        Some(Ok(DBOutput::StatementComplete(0)))
+    }
+
+    fn apply_fast_district_next_o_id_increment(
+        &mut self,
+        w_id: i64,
+        d_id: i64,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let mut target_index: Option<IndexMeta> = None;
+        for index in self.table_indexes_cached("district") {
+            if !index.table.eq_ignore_ascii_case("district") || !index.unique {
+                continue;
+            }
+            if index.columns.len() != 2 {
+                continue;
+            }
+            let first = index.columns[0].name.value.to_ascii_lowercase();
+            let second = index.columns[1].name.value.to_ascii_lowercase();
+            if first == "d_w_id" && second == "d_id" {
+                target_index = Some(index.clone());
+                break;
+            }
+        }
+        let index = match target_index {
+            Some(index) => index,
+            None => return None,
+        };
+        let key = vec![Value::Integer(w_id), Value::Integer(d_id)];
+        let location = match self.storage.scan_index_first_location(&index.name, &key) {
+            Ok(location) => location,
+            Err(err) => return Some(Err(err.into())),
+        };
+        let location = match location {
+            Some(location) => location,
+            None => return Some(Ok(DBOutput::StatementComplete(0))),
+        };
+        let cached_offsets = self.fast_district_offsets_cache.borrow().clone();
+        let mut cache_update: Option<FastDistrictOffsetsCache> = None;
+        let mut fallback_needed = false;
+        let applied = match self.storage.update_record_at_with(location, |record| {
+            let cached = cached_offsets.as_ref().and_then(|cache| {
+                if cache.record_len == record.len() {
+                    Some(cache.next_o_id)
+                } else {
+                    None
+                }
+            });
+            let offset = match cached {
+                Some(offset) => offset,
+                None => match fast_district_next_o_id_offset(record) {
+                    Ok(Some(offset)) => {
+                        cache_update = Some(FastDistrictOffsetsCache {
+                            record_len: record.len(),
+                            next_o_id: offset,
+                        });
+                        offset
+                    }
+                    Ok(None) => {
+                        fallback_needed = true;
+                        return Ok(false);
+                    }
+                    Err(err) => return Err(StorageError::Invalid(err.to_string())),
+                },
+            };
+            if record.get(offset) != Some(&1) {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            let current = match read_i64_at(record, offset + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(false);
+                }
+            };
+            let next = current.wrapping_add(1);
+            if write_i64_at(record, offset + 1, next).is_none() {
+                fallback_needed = true;
+                return Ok(false);
+            }
+            Ok(true)
+        }) {
+            Ok(applied) => applied,
+            Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
+                return Some(Ok(DBOutput::StatementComplete(0)))
+            }
+            Err(err) => return Some(Err(err.into())),
+        };
+        if fallback_needed {
+            return None;
+        }
+        if let Some(cache_update) = cache_update {
+            self.fast_district_offsets_cache
+                .borrow_mut()
+                .replace(cache_update);
+        }
+        if applied {
+            self.select_cache.borrow_mut().clear();
+            self.invalidate_table_stats("district");
         }
         Some(Ok(DBOutput::StatementComplete(0)))
     }
@@ -7416,6 +7729,25 @@ fn fast_stock_update_offsets(
         order_cnt,
         remote_cnt,
     }))
+}
+
+fn fast_district_next_o_id_offset(record: &[u8]) -> Result<Option<usize>, GongDBError> {
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    if count <= 10 {
+        return Ok(None);
+    }
+    let mut pos = 2usize;
+    for col_idx in 0..count {
+        if col_idx == 10 {
+            return Ok(Some(pos));
+        }
+        let len = crate::storage::value_length_at(record, pos).map_err(GongDBError::Storage)?;
+        pos = pos.saturating_add(len);
+    }
+    Ok(None)
 }
 
 fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> bool {
