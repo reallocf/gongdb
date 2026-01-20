@@ -123,6 +123,7 @@ pub struct GongDB {
     statement_cache: RefCell<HashMap<String, CachedStatement>>,
     select_cache: RefCell<HashMap<String, CachedSelect>>,
     fast_update_cache: RefCell<HashMap<String, FastUpdateTemplate>>,
+    fast_insert_template_cache: RefCell<HashMap<String, FastInsertTemplate>>,
     fast_select_template_cache: RefCell<HashMap<String, FastSelectTemplate>>,
     fast_update_statement_cache: RefCell<HashMap<String, FastUpdateStatementTemplate>>,
     index_cache: RefCell<HashMap<String, Vec<IndexMeta>>>,
@@ -194,6 +195,13 @@ struct FastSelectTemplate {
     predicates: Vec<(String, FastValueSource)>,
     order_by: Option<FastOrderBy>,
     limit: Option<FastValueSource>,
+    param_count: usize,
+}
+
+#[derive(Clone)]
+struct FastInsertTemplate {
+    table: String,
+    rows: Vec<Vec<FastValueSource>>,
     param_count: usize,
 }
 
@@ -340,6 +348,7 @@ impl GongDB {
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
             fast_update_cache: RefCell::new(HashMap::new()),
+            fast_insert_template_cache: RefCell::new(HashMap::new()),
             fast_select_template_cache: RefCell::new(HashMap::new()),
             fast_update_statement_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(HashMap::new()),
@@ -385,6 +394,7 @@ impl GongDB {
             statement_cache: RefCell::new(HashMap::new()),
             select_cache: RefCell::new(HashMap::new()),
             fast_update_cache: RefCell::new(HashMap::new()),
+            fast_insert_template_cache: RefCell::new(HashMap::new()),
             fast_select_template_cache: RefCell::new(HashMap::new()),
             fast_update_statement_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(HashMap::new()),
@@ -423,6 +433,7 @@ impl GongDB {
 
     fn invalidate_schema_caches(&self) {
         self.fast_update_cache.borrow_mut().clear();
+        self.fast_insert_template_cache.borrow_mut().clear();
         self.fast_select_template_cache.borrow_mut().clear();
         self.fast_update_statement_cache.borrow_mut().clear();
         self.index_cache.borrow_mut().clear();
@@ -907,6 +918,9 @@ impl GongDB {
         if let Some(result) = self.try_fast_delivery_params(sql, params) {
             return result;
         }
+        if let Some(result) = self.try_fast_insert_params(sql, params) {
+            return result;
+        }
         if let Some(result) = self.try_fast_update_params(sql, params) {
             return result;
         }
@@ -962,6 +976,50 @@ impl GongDB {
                     }
                 }
             }
+        }
+    }
+
+    fn try_fast_insert_params(
+        &mut self,
+        sql: &str,
+        params: &[Literal],
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let trimmed = sql.trim();
+        let cached = {
+            self.fast_insert_template_cache
+                .borrow()
+                .get(trimmed)
+                .cloned()
+        };
+        let template = if let Some(template) = cached {
+            template
+        } else if let Some(template) = parse_fast_insert_template(trimmed) {
+            let mut cache = self.fast_insert_template_cache.borrow_mut();
+            cache.insert(trimmed.to_string(), template.clone());
+            if cache.len() > Self::STATEMENT_CACHE_LIMIT {
+                cache.clear();
+            }
+            template
+        } else {
+            return None;
+        };
+        if params.len() != template.param_count {
+            return Some(Err(GongDBError::new("parameter count mismatch")));
+        }
+        let mut rows = Vec::with_capacity(template.rows.len());
+        for row in &template.rows {
+            let mut values = Vec::with_capacity(row.len());
+            for source in row {
+                match bind_fast_value_source(source, params) {
+                    Ok(value) => values.push(value),
+                    Err(err) => return Some(Err(err)),
+                }
+            }
+            rows.push(values);
+        }
+        match self.run_fast_insert_rows(&template.table, rows) {
+            Ok(output) => Some(Ok(output)),
+            Err(err) => Some(Err(err)),
         }
     }
 
@@ -8556,6 +8614,41 @@ fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Vec<Value>>)> {
     Some((table_name, rows))
 }
 
+fn parse_fast_insert_template(sql: &str) -> Option<FastInsertTemplate> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = strip_prefix_ci(input, "INSERT INTO")?;
+    let mut rest = rest.trim_start();
+    let table_end = rest
+        .find(|ch: char| ch.is_whitespace() || ch == '(')
+        .unwrap_or_else(|| rest.len());
+    if table_end == 0 {
+        return None;
+    }
+    let table_name = rest[..table_end].trim().to_string();
+    rest = rest[table_end..].trim_start();
+    if rest.starts_with('(') {
+        return None;
+    }
+    rest = strip_prefix_ci(rest, "VALUES")?.trim_start();
+    let mut param_pos = 0usize;
+    let (rows, remainder) = parse_fast_rows_template(rest, &mut param_pos)?;
+    if rows.is_empty() {
+        return None;
+    }
+    let remainder = remainder.trim_start();
+    if !remainder.is_empty() {
+        return None;
+    }
+    Some(FastInsertTemplate {
+        table: table_name,
+        rows,
+        param_count: param_pos,
+    })
+}
+
 fn parse_fast_select(sql: &str) -> Option<FastSelectPlan> {
     let mut input = sql.trim();
     if let Some(stripped) = input.strip_suffix(';') {
@@ -9728,6 +9821,31 @@ fn parse_fast_rows(input: &str) -> Option<(Vec<Vec<Value>>, &str)> {
     }
 }
 
+fn parse_fast_rows_template<'a>(
+    input: &'a str,
+    param_pos: &mut usize,
+) -> Option<(Vec<Vec<FastValueSource>>, &'a str)> {
+    let mut rows = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let (values, next) = parse_fast_values_template(&rest[1..], param_pos)?;
+        if values.is_empty() {
+            return None;
+        }
+        rows.push(values);
+        rest = next.trim_start();
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+            continue;
+        }
+        return Some((rows, rest));
+    }
+}
+
 fn parse_fast_values(input: &str) -> Option<(Vec<Value>, &str)> {
     let mut values = Vec::new();
     let mut rest = input;
@@ -9737,6 +9855,31 @@ fn parse_fast_values(input: &str) -> Option<(Vec<Value>, &str)> {
             return Some((values, &rest[1..]));
         }
         let (value, next) = parse_fast_value(rest)?;
+        values.push(value);
+        rest = next.trim_start();
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+            continue;
+        }
+        if rest.starts_with(')') {
+            return Some((values, &rest[1..]));
+        }
+        return None;
+    }
+}
+
+fn parse_fast_values_template<'a>(
+    input: &'a str,
+    param_pos: &mut usize,
+) -> Option<(Vec<FastValueSource>, &'a str)> {
+    let mut values = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with(')') {
+            return Some((values, &rest[1..]));
+        }
+        let (value, next) = parse_fast_param_value_source(rest, param_pos)?;
         values.push(value);
         rest = next.trim_start();
         if rest.starts_with(',') {
