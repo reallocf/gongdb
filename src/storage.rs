@@ -1090,6 +1090,8 @@ impl StorageEngine {
             .collect();
         let mut page_id = table.last_page;
         let mut page = self.read_page(page_id)?;
+        let mut index_entries: Vec<Vec<IndexEntry>> =
+            (0..indexes.len()).map(|_| Vec::with_capacity(rows.len())).collect();
 
         for row in rows {
             let mut index_keys = Vec::with_capacity(indexes.len());
@@ -1122,13 +1124,16 @@ impl StorageEngine {
 
             let slot = insert_record(&mut page, &record)?;
             let location = RowLocation { page_id, slot };
-            for (index_name, key) in index_keys {
+            for (idx, (_index_name, key)) in index_keys.into_iter().enumerate() {
                 let entry = IndexEntry { key, row: location };
-                self.insert_index_record(&index_name, &entry)?;
+                index_entries[idx].push(entry);
             }
         }
 
         self.write_page(page_id, &page)?;
+        for (index, entries) in indexes.iter().zip(index_entries.iter()) {
+            self.insert_index_entries_batch(&index.name, entries)?;
+        }
         if let Some(table) = self.tables.get_mut(table_name) {
             table.row_count = table.row_count.saturating_add(rows.len() as u64);
         }
@@ -1578,6 +1583,27 @@ impl StorageEngine {
             .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
         if !self.try_append_index_entry(&mut index, entry)? {
             self.insert_index_record_btree(&mut index, entry)?;
+        }
+        self.indexes.insert(index_name.to_string(), index);
+        Ok(())
+    }
+
+    fn insert_index_entries_batch(
+        &mut self,
+        index_name: &str,
+        entries: &[IndexEntry],
+    ) -> Result<(), StorageError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut index = self
+            .indexes
+            .remove(index_name)
+            .ok_or_else(|| StorageError::NotFound(format!("index not found: {}", index_name)))?;
+        for entry in entries {
+            if !self.try_append_index_entry(&mut index, entry)? {
+                self.insert_index_record_btree(&mut index, entry)?;
+            }
         }
         self.indexes.insert(index_name.to_string(), index);
         Ok(())
