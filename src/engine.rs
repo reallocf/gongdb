@@ -1289,6 +1289,7 @@ impl GongDB {
             }
         }
         let mut updates = Vec::new();
+        let mut encoded_updates = Vec::new();
         if let Some(index) = best_index {
             let mut key = Vec::with_capacity(index.columns.len());
             for column in &index.columns {
@@ -1307,23 +1308,41 @@ impl GongDB {
                 Err(err) => return Some(Err(err.into())),
             };
             for location in locations {
-                let row = match self.storage.read_row_at(&location) {
-                    Ok(row) => row,
+                let record = match self.storage.read_record_at(&location) {
+                    Ok(record) => record,
                     Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
                     Err(err) => return Some(Err(err.into())),
                 };
-                if !fast_row_matches_predicates(&row, &predicate_indices) {
-                    continue;
-                }
-                let new_row = match apply_fast_update_assignments(
-                    &table.columns,
-                    &row,
-                    &assignment_indices,
-                ) {
-                    Ok(new_row) => new_row,
+                let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
+                    Ok(matches) => matches,
                     Err(err) => return Some(Err(err)),
                 };
-                updates.push((location, new_row));
+                if !matches {
+                    continue;
+                }
+                match apply_fast_update_record_bytes(
+                    &table.columns,
+                    &record,
+                    &assignment_indices,
+                ) {
+                    Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                    Ok(None) => {
+                        let row = match crate::storage::decode_row_from_record(&record) {
+                            Ok(row) => row,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        let new_row = match apply_fast_update_assignments(
+                            &table.columns,
+                            &row,
+                            &assignment_indices,
+                        ) {
+                            Ok(new_row) => new_row,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        updates.push((location, new_row));
+                    }
+                    Err(err) => return Some(Err(err)),
+                }
             }
         } else {
             let rows = match self.storage.scan_table_with_locations(&plan.table) {
@@ -1343,6 +1362,17 @@ impl GongDB {
                     Err(err) => return Some(Err(err)),
                 };
                 updates.push((location, new_row));
+            }
+        }
+        if !encoded_updates.is_empty() {
+            match self.storage.update_encoded_rows_at(&encoded_updates) {
+                Ok(()) => {}
+                Err(StorageError::Invalid(msg)) if msg == "page full" => {
+                    return Some(Err(GongDBError::new(
+                        "page full during fast update".to_string(),
+                    )))
+                }
+                Err(err) => return Some(Err(err.into())),
             }
         }
         if !updates.is_empty() {
@@ -6611,6 +6641,122 @@ fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> 
         }
     }
     true
+}
+
+fn fast_record_matches_predicates(
+    record: &[u8],
+    predicates: &[(usize, Value)],
+) -> Result<bool, GongDBError> {
+    if predicates.is_empty() {
+        return Ok(true);
+    }
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    let mut sorted = predicates.to_vec();
+    sorted.sort_by_key(|(idx, _)| *idx);
+    if sorted.last().map_or(false, |(idx, _)| *idx >= count) {
+        return Err(GongDBError::new("predicate column out of bounds".to_string()));
+    }
+    let mut pos = 2usize;
+    let mut pred_idx = 0usize;
+    for col_idx in 0..count {
+        if pred_idx >= sorted.len() {
+            break;
+        }
+        let target_idx = sorted[pred_idx].0;
+        let len = match crate::storage::value_length_at(record, pos) {
+            Ok(len) => len,
+            Err(err) => return Err(err.into()),
+        };
+        if col_idx == target_idx {
+            let (value, new_pos) = match crate::storage::decode_value_at(record, pos) {
+                Ok(result) => result,
+                Err(err) => return Err(err.into()),
+            };
+            if !values_equal(&value, &sorted[pred_idx].1) {
+                return Ok(false);
+            }
+            pos = new_pos;
+            pred_idx += 1;
+        } else {
+            pos = pos.saturating_add(len);
+        }
+    }
+    Ok(pred_idx == sorted.len())
+}
+
+fn apply_fast_update_record_bytes(
+    columns: &[Column],
+    record: &[u8],
+    assignments: &[(usize, FastUpdateAssignment)],
+) -> Result<Option<Vec<u8>>, GongDBError> {
+    if assignments.is_empty() {
+        return Ok(None);
+    }
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    let mut sorted = assignments.to_vec();
+    sorted.sort_by_key(|(idx, _)| *idx);
+    if sorted.last().map_or(false, |(idx, _)| *idx >= count) {
+        return Err(GongDBError::new("assignment column out of bounds".to_string()));
+    }
+    let mut updates: Vec<(usize, Vec<u8>, usize)> = Vec::with_capacity(sorted.len());
+    let mut pos = 2usize;
+    let mut assign_idx = 0usize;
+    for col_idx in 0..count {
+        if assign_idx >= sorted.len() {
+            break;
+        }
+        let len = match crate::storage::value_length_at(record, pos) {
+            Ok(len) => len,
+            Err(err) => return Err(err.into()),
+        };
+        if col_idx == sorted[assign_idx].0 {
+            let (current, new_pos) = match crate::storage::decode_value_at(record, pos) {
+                Ok(result) => result,
+                Err(err) => return Err(err.into()),
+            };
+            let assignment = &sorted[assign_idx].1;
+            let column = &columns[col_idx];
+            let updated = match &assignment.action {
+                FastUpdateAction::Set(value) => apply_affinity(value.clone(), &column.data_type),
+                FastUpdateAction::Add(delta) => {
+                    let delta = apply_affinity(delta.clone(), &column.data_type);
+                    let value = apply_binary_op(&BinaryOperator::Plus, current, delta)?;
+                    apply_affinity(value, &column.data_type)
+                }
+                FastUpdateAction::Sub(delta) => {
+                    let delta = apply_affinity(delta.clone(), &column.data_type);
+                    let value = apply_binary_op(&BinaryOperator::Minus, current, delta)?;
+                    apply_affinity(value, &column.data_type)
+                }
+            };
+            let encoded = match crate::storage::encode_value_to_vec(&updated) {
+                Ok(encoded) => encoded,
+                Err(err) => return Err(err.into()),
+            };
+            if encoded.len() != len {
+                return Ok(None);
+            }
+            updates.push((pos, encoded, len));
+            pos = new_pos;
+            assign_idx += 1;
+        } else {
+            pos = pos.saturating_add(len);
+        }
+    }
+    if updates.is_empty() {
+        return Ok(None);
+    }
+    let mut new_record = record.to_vec();
+    for (offset, encoded, len) in updates {
+        new_record[offset..offset + len].copy_from_slice(&encoded);
+    }
+    Ok(Some(new_record))
 }
 
 fn fast_select_eq_index<'a>(

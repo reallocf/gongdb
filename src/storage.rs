@@ -1360,6 +1360,17 @@ impl StorageEngine {
         }
     }
 
+    pub(crate) fn read_record_at(
+        &self,
+        location: &RowLocation,
+    ) -> Result<Vec<u8>, StorageError> {
+        let page = self.read_page(location.page_id)?;
+        match record_slice_at_slot(&page, location.slot)? {
+            Some(record) => Ok(record.to_vec()),
+            None => Err(StorageError::NotFound("row deleted".to_string())),
+        }
+    }
+
     pub(crate) fn update_rows_at(
         &mut self,
         updates: &[(RowLocation, Vec<Value>)],
@@ -1367,14 +1378,28 @@ impl StorageEngine {
         if updates.is_empty() {
             return Ok(());
         }
-        self.clear_index_eq_cache();
-        let mut updates_by_page: HashMap<u32, Vec<(u16, Vec<u8>)>> = HashMap::new();
+        let mut encoded_updates = Vec::with_capacity(updates.len());
         for (location, row) in updates {
             let encoded = encode_row(row)?;
+            encoded_updates.push((*location, encoded));
+        }
+        self.update_encoded_rows_at(&encoded_updates)
+    }
+
+    pub(crate) fn update_encoded_rows_at(
+        &mut self,
+        updates: &[(RowLocation, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.clear_index_eq_cache();
+        let mut updates_by_page: HashMap<u32, Vec<(u16, Vec<u8>)>> = HashMap::new();
+        for (location, encoded) in updates {
             updates_by_page
                 .entry(location.page_id)
                 .or_default()
-                .push((location.slot, encoded));
+                .push((location.slot, encoded.clone()));
         }
 
         let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
@@ -2721,6 +2746,10 @@ fn decode_row(record: &[u8]) -> Result<Vec<Value>, StorageError> {
     Ok(values)
 }
 
+pub(crate) fn decode_row_from_record(record: &[u8]) -> Result<Vec<Value>, StorageError> {
+    decode_row(record)
+}
+
 fn encode_index_key(values: &[Value]) -> Result<Vec<u8>, StorageError> {
     let mut buf = Vec::new();
     if values.len() > u16::MAX as usize {
@@ -3130,6 +3159,54 @@ fn decode_value(record: &[u8], pos: usize) -> Result<(Value, usize), StorageErro
         }
     };
     Ok((value, cursor))
+}
+
+pub(crate) fn decode_value_at(record: &[u8], pos: usize) -> Result<(Value, usize), StorageError> {
+    decode_value(record, pos)
+}
+
+pub(crate) fn encode_value_to_vec(value: &Value) -> Result<Vec<u8>, StorageError> {
+    let mut buf = Vec::new();
+    encode_value(value, &mut buf)?;
+    Ok(buf)
+}
+
+pub(crate) fn value_length_at(record: &[u8], pos: usize) -> Result<usize, StorageError> {
+    if pos >= record.len() {
+        return Err(StorageError::Corrupt("invalid value".to_string()));
+    }
+    let tag = record[pos];
+    let mut cursor = pos + 1;
+    let len = match tag {
+        0 => 1,
+        1 | 2 => {
+            let end = cursor + 8;
+            if end > record.len() {
+                return Err(StorageError::Corrupt("invalid numeric".to_string()));
+            }
+            1 + 8
+        }
+        3 | 4 => {
+            let end = cursor + 4;
+            if end > record.len() {
+                return Err(StorageError::Corrupt("invalid text/blob".to_string()));
+            }
+            let len = read_u32(record, cursor) as usize;
+            cursor = end;
+            let end = cursor + len;
+            if end > record.len() {
+                return Err(StorageError::Corrupt("invalid text/blob length".to_string()));
+            }
+            1 + 4 + len
+        }
+        _ => {
+            return Err(StorageError::Corrupt(format!(
+                "unknown value tag {}",
+                tag
+            )))
+        }
+    };
+    Ok(len)
 }
 
 fn column_index_map(columns: &[Column]) -> HashMap<String, usize> {
