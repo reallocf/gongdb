@@ -1295,24 +1295,38 @@ impl GongDB {
             assignment_indices.push((idx, assignment.clone()));
         }
         let mut best_index: Option<IndexMeta> = None;
+        let mut best_prefix_index: Option<(IndexMeta, usize)> = None;
         for index in self.storage.list_indexes() {
             if !index.table.eq_ignore_ascii_case(&plan.table) {
                 continue;
             }
-            let mut matches = true;
+            let mut prefix_len = 0usize;
+            let mut matches_all = true;
             for column in &index.columns {
-                if !predicate_values.contains_key(&column.name.value.to_ascii_lowercase()) {
-                    matches = false;
+                if predicate_values.contains_key(&column.name.value.to_ascii_lowercase()) {
+                    prefix_len += 1;
+                } else {
+                    matches_all = false;
                     break;
                 }
             }
-            if matches {
+            if matches_all {
                 let replace = match &best_index {
                     Some(best) => index.columns.len() > best.columns.len(),
                     None => true,
                 };
                 if replace {
                     best_index = Some(index);
+                }
+                continue;
+            }
+            if prefix_len > 0 {
+                let replace = match &best_prefix_index {
+                    Some((_, best_len)) => prefix_len > *best_len,
+                    None => true,
+                };
+                if replace {
+                    best_prefix_index = Some((index, prefix_len));
                 }
             }
         }
@@ -1415,6 +1429,66 @@ impl GongDB {
                         }
                         Err(err) => return Some(Err(err)),
                     }
+                }
+            }
+        } else if let Some((index, prefix_len)) = best_prefix_index {
+            let mut prefix = Vec::with_capacity(prefix_len);
+            for column in index.columns.iter().take(prefix_len) {
+                let value = predicate_values
+                    .get(&column.name.value.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap();
+                prefix.push(value);
+            }
+            let lower = build_index_bound(index.columns.len(), &prefix, None, Value::Null);
+            let upper = build_index_bound(
+                index.columns.len(),
+                &prefix,
+                None,
+                Value::Blob(Vec::new()),
+            );
+            let locations = match self
+                .storage
+                .scan_index_range(&index.name, Some(&lower), Some(&upper))
+            {
+                Ok(locations) => locations,
+                Err(err) => return Some(Err(err.into())),
+            };
+            for location in locations {
+                let record = match self.storage.read_record_at(&location) {
+                    Ok(record) => record,
+                    Err(StorageError::NotFound(msg)) if msg == "row deleted" => continue,
+                    Err(err) => return Some(Err(err.into())),
+                };
+                let matches = match fast_record_matches_predicates(&record, &predicate_indices) {
+                    Ok(matches) => matches,
+                    Err(err) => return Some(Err(err)),
+                };
+                if !matches {
+                    continue;
+                }
+                match apply_fast_update_record_bytes(
+                    &table.columns,
+                    &record,
+                    &assignment_indices,
+                ) {
+                    Ok(Some(updated)) => encoded_updates.push((location, updated)),
+                    Ok(None) => {
+                        let row = match crate::storage::decode_row_from_record(&record) {
+                            Ok(row) => row,
+                            Err(err) => return Some(Err(err.into())),
+                        };
+                        let new_row = match apply_fast_update_assignments(
+                            &table.columns,
+                            &row,
+                            &assignment_indices,
+                        ) {
+                            Ok(new_row) => new_row,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        updates.push((location, new_row));
+                    }
+                    Err(err) => return Some(Err(err)),
                 }
             }
         } else {

@@ -2619,7 +2619,11 @@ impl StorageEngine {
                     pages.resize(idx + 1, vec![0; PAGE_SIZE]);
                     self.reserved_pages = pages.len() as u32;
                 }
-                pages[idx] = data.to_vec();
+                if data.len() == PAGE_SIZE && pages[idx].len() == PAGE_SIZE {
+                    pages[idx].copy_from_slice(data);
+                } else {
+                    pages[idx] = data.to_vec();
+                }
                 Ok(())
             }
             StorageMode::OnDisk { file: _ } => {
