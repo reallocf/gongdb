@@ -225,6 +225,9 @@ impl GongDB {
         if let Some(result) = self.try_fast_insert(sql) {
             return result;
         }
+        if let Some(result) = self.try_fast_stock_update(sql) {
+            return result;
+        }
         if let Some(result) = self.try_fast_delivery_customer_update(sql) {
             return result;
         }
@@ -1307,45 +1310,52 @@ impl GongDB {
                     Err(err) => return Some(Err(err.into())),
                 };
                 if let Some(location) = location {
-                    let outcome = match self.storage.with_record_at(&location, |record| {
-                        let matches = if index_plan.all_predicates_covered {
-                            true
-                        } else {
-                            match fast_record_matches_predicates(record, &predicate_indices) {
-                                Ok(matches) => matches,
-                                Err(err) => {
-                                    return Err(StorageError::Invalid(err.to_string()))
+                    let mut row_update: Option<Vec<Value>> = None;
+                    let applied = match self.storage.update_record_fields_at_with(
+                        location,
+                        |record| {
+                            let matches = if index_plan.all_predicates_covered {
+                                true
+                            } else {
+                                match fast_record_matches_predicates(record, &predicate_indices) {
+                                    Ok(matches) => matches,
+                                    Err(err) => {
+                                        return Err(StorageError::Invalid(err.to_string()))
+                                    }
                                 }
+                            };
+                            if !matches {
+                                return Ok(None);
                             }
-                        };
-                        if !matches {
-                            return Ok(None);
-                        }
-                        let outcome =
-                            match build_fast_update_outcome(&table.columns, record, &assignment_indices)
-                            {
+                            let outcome = match build_fast_update_outcome(
+                                &table.columns,
+                                record,
+                                &assignment_indices,
+                            ) {
                                 Ok(outcome) => outcome,
                                 Err(err) => {
                                     return Err(StorageError::Invalid(err.to_string()))
                                 }
                             };
-                        Ok(Some(outcome))
-                    }) {
-                        Ok(outcome) => outcome,
+                            match outcome {
+                                FastUpdateOutcome::InPlace(fields) => Ok(Some(fields)),
+                                FastUpdateOutcome::Row(new_row) => {
+                                    row_update = Some(new_row);
+                                    Ok(None)
+                                }
+                            }
+                        },
+                    ) {
+                        Ok(applied) => applied,
                         Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
                             return Some(Ok(DBOutput::StatementComplete(0)))
                         }
                         Err(err) => return Some(Err(err.into())),
                     };
-                    if let Some(outcome) = outcome {
-                        match outcome {
-                            FastUpdateOutcome::InPlace(fields) => {
-                                in_place_updates.push((location, fields));
-                            }
-                            FastUpdateOutcome::Row(new_row) => {
-                                updates.push((location, new_row));
-                            }
-                        }
+                    if let Some(new_row) = row_update {
+                        updates.push((location, new_row));
+                    } else if applied {
+                        // Applied in place above.
                     }
                 }
             } else {
@@ -1508,6 +1518,134 @@ impl GongDB {
         }
         self.select_cache.borrow_mut().clear();
         self.invalidate_table_stats(&plan.table);
+        Some(Ok(DBOutput::StatementComplete(0)))
+    }
+
+    fn try_fast_stock_update(
+        &mut self,
+        sql: &str,
+    ) -> Option<Result<DBOutput<DefaultColumnType>, GongDBError>> {
+        let plan = parse_fast_stock_update(sql)?;
+        let mut target_index: Option<IndexMeta> = None;
+        for index in self.storage.list_indexes() {
+            if !index.table.eq_ignore_ascii_case("stock") || !index.unique {
+                continue;
+            }
+            if index.columns.len() != 2 {
+                continue;
+            }
+            let first = index.columns[0].name.value.to_ascii_lowercase();
+            let second = index.columns[1].name.value.to_ascii_lowercase();
+            if first == "s_w_id" && second == "s_i_id" {
+                target_index = Some(index.clone());
+                break;
+            }
+        }
+        let index = match target_index {
+            Some(index) => index,
+            None => return None,
+        };
+        let key = vec![Value::Integer(plan.w_id), Value::Integer(plan.i_id)];
+        let location = match self.storage.scan_index_first_location(&index.name, &key) {
+            Ok(location) => location,
+            Err(err) => return Some(Err(err.into())),
+        };
+        let location = match location {
+            Some(location) => location,
+            None => return Some(Ok(DBOutput::StatementComplete(0))),
+        };
+        let mut fallback_needed = false;
+        let applied = match self.storage.update_record_fields_at_with(location, |record| {
+            let offsets = match fast_stock_update_offsets(record, plan.remote) {
+                Ok(Some(offsets)) => offsets,
+                Ok(None) => {
+                    fallback_needed = true;
+                    return Ok(None);
+                }
+                Err(err) => return Err(StorageError::Invalid(err.to_string())),
+            };
+            let quantity = match read_i64_at(record, offsets.quantity + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(None);
+                }
+            };
+            let ytd = match read_i64_at(record, offsets.ytd + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(None);
+                }
+            };
+            let order_cnt = match read_i64_at(record, offsets.order_cnt + 1) {
+                Some(value) => value,
+                None => {
+                    fallback_needed = true;
+                    return Ok(None);
+                }
+            };
+            let remote_cnt = if let Some(offset) = offsets.remote_cnt {
+                match read_i64_at(record, offset + 1) {
+                    Some(value) => Some(value),
+                    None => {
+                        fallback_needed = true;
+                        return Ok(None);
+                    }
+                }
+            } else {
+                None
+            };
+            let remote_ok = offsets
+                .remote_cnt
+                .map(|offset| record[offset] == 1)
+                .unwrap_or(true);
+            if record[offsets.quantity] != 1
+                || record[offsets.ytd] != 1
+                || record[offsets.order_cnt] != 1
+                || !remote_ok
+            {
+                fallback_needed = true;
+                return Ok(None);
+            }
+            let next_quantity = quantity.wrapping_sub(plan.quantity);
+            let next_ytd = ytd.wrapping_add(plan.ytd);
+            let next_order_cnt = order_cnt.wrapping_add(1);
+            let next_remote_cnt = remote_cnt.map(|value| value.wrapping_add(1));
+            let mut updates = Vec::with_capacity(if offsets.remote_cnt.is_some() { 4 } else { 3 });
+            updates.push(crate::storage::FieldUpdate {
+                offset: offsets.quantity,
+                bytes: encode_i64_field(next_quantity),
+            });
+            updates.push(crate::storage::FieldUpdate {
+                offset: offsets.ytd,
+                bytes: encode_i64_field(next_ytd),
+            });
+            updates.push(crate::storage::FieldUpdate {
+                offset: offsets.order_cnt,
+                bytes: encode_i64_field(next_order_cnt),
+            });
+            if let (Some(offset), Some(next)) = (offsets.remote_cnt, next_remote_cnt) {
+                updates.push(crate::storage::FieldUpdate {
+                    offset,
+                    bytes: encode_i64_field(next),
+                });
+            }
+            Ok(Some(updates))
+        }) {
+            Ok(applied) => applied,
+            Err(StorageError::NotFound(msg)) if msg == "row deleted" => {
+                return Some(Ok(DBOutput::StatementComplete(0)))
+            }
+            Err(err) => return Some(Err(err.into())),
+        };
+        if fallback_needed {
+            return None;
+        }
+        if applied {
+            self.select_cache.borrow_mut().clear();
+            self.invalidate_table_stats("stock");
+        }
         Some(Ok(DBOutput::StatementComplete(0)))
     }
 
@@ -6277,6 +6415,58 @@ fn parse_fast_stock_level(sql: &str) -> Option<(i64, i64, i64, i64)> {
     Some((w_id, d_id, next_o_id, threshold))
 }
 
+fn parse_fast_stock_update(sql: &str) -> Option<FastStockUpdatePlan> {
+    let mut input = sql.trim();
+    if let Some(stripped) = input.strip_suffix(';') {
+        input = stripped.trim();
+    }
+    let rest = strip_prefix_ci(input, "UPDATE")?.trim_start();
+    let (table, rest) = parse_fast_ident(rest)?;
+    if !table.eq_ignore_ascii_case("stock") {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    rest = strip_prefix_ci(rest, "SET")?.trim_start();
+    let (quantity, after_qty) = parse_stock_self_assignment(rest, "s_quantity", '-')?;
+    let mut rest = after_qty.trim_start();
+    if !rest.starts_with(',') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    let (ytd, after_ytd) = parse_stock_self_assignment(rest, "s_ytd", '+')?;
+    let mut rest = after_ytd.trim_start();
+    if !rest.starts_with(',') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    let after_order_cnt = parse_stock_increment_one(rest, "s_order_cnt")?;
+    let mut rest = after_order_cnt.trim_start();
+    let mut remote = false;
+    if rest.starts_with(',') {
+        let after_comma = rest[1..].trim_start();
+        if let Some(after_remote) = parse_stock_increment_one(after_comma, "s_remote_cnt") {
+            remote = true;
+            rest = after_remote;
+        }
+    }
+    rest = rest.trim_start();
+    rest = strip_prefix_ci(rest, "WHERE")?.trim_start();
+    let (w_id, after_w) = parse_fast_stock_eq(rest, "s_w_id")?;
+    let mut rest = after_w.trim_start();
+    rest = strip_prefix_ci(rest, "AND")?.trim_start();
+    let (i_id, after_i) = parse_fast_stock_eq(rest, "s_i_id")?;
+    if !after_i.trim().is_empty() {
+        return None;
+    }
+    Some(FastStockUpdatePlan {
+        quantity,
+        ytd,
+        w_id,
+        i_id,
+        remote,
+    })
+}
+
 fn parse_fast_delivery_customer_update(sql: &str) -> Option<(i64, i64, i64)> {
     let mut input = sql.trim();
     if let Some(stripped) = input.strip_suffix(';') {
@@ -6348,6 +6538,48 @@ fn parse_fast_i64(input: &str) -> Option<(i64, &str)> {
     Some((value, rest))
 }
 
+fn parse_stock_self_assignment<'a>(
+    input: &'a str,
+    column: &str,
+    op: char,
+) -> Option<(i64, &'a str)> {
+    let mut rest = input.trim_start();
+    rest = strip_prefix_ci(rest, column)?;
+    rest = rest.trim_start();
+    if !rest.starts_with('=') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    rest = strip_prefix_ci(rest, column)?;
+    rest = rest.trim_start();
+    if !rest.starts_with(op) {
+        return None;
+    }
+    rest = &rest[1..];
+    parse_fast_i64(rest)
+}
+
+fn parse_stock_increment_one<'a>(input: &'a str, column: &str) -> Option<&'a str> {
+    let mut rest = input.trim_start();
+    rest = strip_prefix_ci(rest, column)?;
+    rest = rest.trim_start();
+    if !rest.starts_with('=') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    rest = strip_prefix_ci(rest, column)?;
+    rest = rest.trim_start();
+    if !rest.starts_with('+') {
+        return None;
+    }
+    rest = rest[1..].trim_start();
+    let (value, rest) = parse_fast_i64(rest)?;
+    if value != 1 {
+        return None;
+    }
+    Some(rest)
+}
+
 #[derive(Clone)]
 struct FastUpdateAssignment {
     column: String,
@@ -6364,6 +6596,21 @@ enum FastUpdateAction {
 enum FastUpdateOutcome {
     InPlace(Vec<crate::storage::FieldUpdate>),
     Row(Vec<Value>),
+}
+
+struct FastStockUpdatePlan {
+    quantity: i64,
+    ytd: i64,
+    w_id: i64,
+    i_id: i64,
+    remote: bool,
+}
+
+struct FastStockUpdateOffsets {
+    quantity: usize,
+    ytd: usize,
+    order_cnt: usize,
+    remote_cnt: Option<usize>,
 }
 
 struct FastUpdatePlan {
@@ -6922,6 +7169,62 @@ fn parse_fast_literal(input: &str) -> Option<(Value, &str)> {
     Some((Value::Integer(value), remainder))
 }
 
+fn fast_stock_update_offsets(
+    record: &[u8],
+    include_remote: bool,
+) -> Result<Option<FastStockUpdateOffsets>, GongDBError> {
+    if record.len() < 2 {
+        return Err(GongDBError::new("record too small".to_string()));
+    }
+    let count = u16::from_le_bytes([record[0], record[1]]) as usize;
+    if count <= 15 {
+        return Ok(None);
+    }
+    let mut pos = 2usize;
+    let mut quantity = None;
+    let mut ytd = None;
+    let mut order_cnt = None;
+    let mut remote_cnt = None;
+    for col_idx in 0..count {
+        if col_idx == 2 {
+            quantity = Some(pos);
+        } else if col_idx == 13 {
+            ytd = Some(pos);
+        } else if col_idx == 14 {
+            order_cnt = Some(pos);
+        } else if col_idx == 15 {
+            remote_cnt = Some(pos);
+        }
+        let len = crate::storage::value_length_at(record, pos).map_err(GongDBError::Storage)?;
+        pos = pos.saturating_add(len);
+        if col_idx >= 15 && quantity.is_some() && ytd.is_some() && order_cnt.is_some() {
+            break;
+        }
+    }
+    let quantity = match quantity {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let ytd = match ytd {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let order_cnt = match order_cnt {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let remote_cnt = if include_remote { remote_cnt } else { None };
+    if include_remote && remote_cnt.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(FastStockUpdateOffsets {
+        quantity,
+        ytd,
+        order_cnt,
+        remote_cnt,
+    }))
+}
+
 fn fast_row_matches_predicates(row: &[Value], predicates: &[(usize, Value)]) -> bool {
     for (idx, value) in predicates {
         if !values_equal(&row[*idx], value) {
@@ -7130,6 +7433,13 @@ fn read_i64_at(record: &[u8], pos: usize) -> Option<i64> {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&record[pos..end]);
     Some(i64::from_le_bytes(buf))
+}
+
+fn encode_i64_field(value: i64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(9);
+    encoded.push(1);
+    encoded.extend_from_slice(&value.to_le_bytes());
+    encoded
 }
 
 fn read_f64_at(record: &[u8], pos: usize) -> Option<f64> {

@@ -1626,6 +1626,85 @@ impl StorageEngine {
         self.update_record_fields_at_internal(updates, false)
     }
 
+    pub(crate) fn update_record_fields_at_with(
+        &mut self,
+        location: RowLocation,
+        f: impl FnOnce(&[u8]) -> Result<Option<Vec<FieldUpdate>>, StorageError>,
+    ) -> Result<bool, StorageError> {
+        if matches!(self.mode, StorageMode::InMemory { .. }) {
+            return self.with_page_mut(location.page_id, |page| {
+                let slot_count = read_u16(page, 1) as usize;
+                let slot = location.slot as usize;
+                if slot >= slot_count {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+                let record_offset = read_u16(page, slot_offset) as usize;
+                let record_len = read_u16(page, slot_offset + 2) as usize;
+                if record_len == 0 {
+                    return Err(StorageError::NotFound("row deleted".to_string()));
+                }
+                if record_offset + record_len > PAGE_SIZE {
+                    return Err(StorageError::Corrupt("invalid row location".to_string()));
+                }
+                let record = &page[record_offset..record_offset + record_len];
+                let updates = f(record)?;
+                if let Some(fields) = updates {
+                    for update in fields {
+                        let end = update
+                            .offset
+                            .checked_add(update.bytes.len())
+                            .ok_or_else(|| StorageError::Corrupt("invalid row update".to_string()))?;
+                        if end > record_len {
+                            return Err(StorageError::Corrupt("invalid row update".to_string()));
+                        }
+                        let start = record_offset + update.offset;
+                        let end = start + update.bytes.len();
+                        page[start..end].copy_from_slice(&update.bytes);
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            });
+        }
+        let mut page = self.read_page(location.page_id)?;
+        let slot_count = read_u16(&page, 1) as usize;
+        let slot = location.slot as usize;
+        if slot >= slot_count {
+            return Err(StorageError::Corrupt("invalid row location".to_string()));
+        }
+        let slot_offset = PAGE_SIZE - (slot + 1) * 4;
+        let record_offset = read_u16(&page, slot_offset) as usize;
+        let record_len = read_u16(&page, slot_offset + 2) as usize;
+        if record_len == 0 {
+            return Err(StorageError::NotFound("row deleted".to_string()));
+        }
+        if record_offset + record_len > PAGE_SIZE {
+            return Err(StorageError::Corrupt("invalid row location".to_string()));
+        }
+        let record = &page[record_offset..record_offset + record_len];
+        let updates = f(record)?;
+        if let Some(fields) = updates {
+            for update in fields {
+                let end = update
+                    .offset
+                    .checked_add(update.bytes.len())
+                    .ok_or_else(|| StorageError::Corrupt("invalid row update".to_string()))?;
+                if end > record_len {
+                    return Err(StorageError::Corrupt("invalid row update".to_string()));
+                }
+                let start = record_offset + update.offset;
+                let end = start + update.bytes.len();
+                page[start..end].copy_from_slice(&update.bytes);
+            }
+            self.write_page(location.page_id, &page)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn update_record_fields_at_internal(
         &mut self,
         updates: &[(RowLocation, Vec<FieldUpdate>)],
