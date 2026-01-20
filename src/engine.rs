@@ -986,15 +986,23 @@ impl GongDB {
                 ))))
             }
         };
-        let row = match build_insert_row_from_owned_values_no_columns(self, &table, values) {
-            Ok(row) => row,
-            Err(err) => return Some(Err(err)),
-        };
-        if let Err(err) = self.storage.insert_row(&table_name, &row) {
+        let mut rows = Vec::with_capacity(values.len());
+        for row_values in values {
+            let row = match build_insert_row_from_owned_values_no_columns(
+                self,
+                &table,
+                row_values,
+            ) {
+                Ok(row) => row,
+                Err(err) => return Some(Err(err)),
+            };
+            rows.push(row);
+        }
+        if let Err(err) = self.storage.insert_rows(&table_name, &rows) {
             return Some(Err(err.into()));
         }
         self.invalidate_table_stats(&table_name);
-        Some(Ok(DBOutput::StatementComplete(1)))
+        Some(Ok(DBOutput::StatementComplete(rows.len() as u64)))
     }
 
     fn invalidate_table_stats(&self, table_name: &str) {
@@ -4851,7 +4859,7 @@ fn strip_prefix_ci<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Value>)> {
+fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Vec<Value>>)> {
     let mut input = sql.trim();
     if let Some(stripped) = input.strip_suffix(';') {
         input = stripped.trim();
@@ -4859,26 +4867,48 @@ fn parse_fast_insert(sql: &str) -> Option<(String, Vec<Value>)> {
     let rest = strip_prefix_ci(input, "INSERT INTO")?;
     let mut rest = rest.trim_start();
     let table_end = rest
-        .find(char::is_whitespace)
+        .find(|ch: char| ch.is_whitespace() || ch == '(')
         .unwrap_or_else(|| rest.len());
     if table_end == 0 {
         return None;
     }
     let table_name = rest[..table_end].trim().to_string();
     rest = rest[table_end..].trim_start();
+    if rest.starts_with('(') {
+        return None;
+    }
     rest = strip_prefix_ci(rest, "VALUES")?.trim_start();
-    if rest.contains("),") {
+    let (rows, remainder) = parse_fast_rows(rest)?;
+    if rows.is_empty() {
         return None;
     }
-    if !rest.starts_with('(') {
-        return None;
-    }
-    let (values, remainder) = parse_fast_values(&rest[1..])?;
     let remainder = remainder.trim_start();
     if !remainder.is_empty() {
         return None;
     }
-    Some((table_name, values))
+    Some((table_name, rows))
+}
+
+fn parse_fast_rows(input: &str) -> Option<(Vec<Vec<Value>>, &str)> {
+    let mut rows = Vec::new();
+    let mut rest = input;
+    loop {
+        rest = rest.trim_start();
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let (values, next) = parse_fast_values(&rest[1..])?;
+        if values.is_empty() {
+            return None;
+        }
+        rows.push(values);
+        rest = next.trim_start();
+        if rest.starts_with(',') {
+            rest = &rest[1..];
+            continue;
+        }
+        return Some((rows, rest));
+    }
 }
 
 fn parse_fast_values(input: &str) -> Option<(Vec<Value>, &str)> {
@@ -4909,21 +4939,22 @@ fn parse_fast_value(input: &str) -> Option<(Value, &str)> {
         return None;
     }
     if rest.starts_with('\'') {
-        let mut out = String::new();
+        let bytes = rest.as_bytes();
+        let mut out = Vec::new();
         let mut idx = 1;
-        let chars: Vec<char> = rest.chars().collect();
-        while idx < chars.len() {
-            let ch = chars[idx];
-            if ch == '\'' {
-                if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
-                    out.push('\'');
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            if byte == b'\'' {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                    out.push(b'\'');
                     idx += 2;
                     continue;
                 }
+                let text = String::from_utf8(out).ok()?;
                 let remainder = &rest[idx + 1..];
-                return Some((Value::Text(out), remainder));
+                return Some((Value::Text(text), remainder));
             }
-            out.push(ch);
+            out.push(byte);
             idx += 1;
         }
         return None;
