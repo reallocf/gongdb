@@ -122,6 +122,7 @@ pub struct GongDB {
     fast_update_cache: RefCell<HashMap<String, FastUpdateTemplate>>,
     index_cache: RefCell<HashMap<String, Vec<IndexMeta>>>,
     column_index_cache: RefCell<HashMap<String, HashMap<String, usize>>>,
+    insert_validation_cache: RefCell<HashMap<String, InsertValidationInfo>>,
     fast_stock_offsets_cache: RefCell<Option<FastStockOffsetsCache>>,
 }
 
@@ -140,6 +141,12 @@ struct CachedSelect {
 struct CachedStatement {
     statement: Statement,
     param_count: usize,
+}
+
+#[derive(Clone)]
+struct InsertValidationInfo {
+    not_null_indices: Vec<usize>,
+    has_check_constraints: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +196,7 @@ impl GongDB {
             fast_update_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(HashMap::new()),
             column_index_cache: RefCell::new(HashMap::new()),
+            insert_validation_cache: RefCell::new(HashMap::new()),
             fast_stock_offsets_cache: RefCell::new(None),
         })
     }
@@ -216,6 +224,7 @@ impl GongDB {
             fast_update_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(HashMap::new()),
             column_index_cache: RefCell::new(HashMap::new()),
+            insert_validation_cache: RefCell::new(HashMap::new()),
             fast_stock_offsets_cache: RefCell::new(None),
         })
     }
@@ -224,6 +233,7 @@ impl GongDB {
         self.fast_update_cache.borrow_mut().clear();
         self.index_cache.borrow_mut().clear();
         self.column_index_cache.borrow_mut().clear();
+        self.insert_validation_cache.borrow_mut().clear();
         self.fast_stock_offsets_cache.borrow_mut().take();
     }
 
@@ -250,6 +260,18 @@ impl GongDB {
         let map = column_index_map_fast(&table.columns);
         self.column_index_cache.borrow_mut().insert(key, map.clone());
         map
+    }
+
+    fn insert_validation_info_cached(&self, table: &TableMeta) -> InsertValidationInfo {
+        let key = table.name.to_ascii_lowercase();
+        if let Some(info) = self.insert_validation_cache.borrow().get(&key) {
+            return info.clone();
+        }
+        let info = build_insert_validation_info(table);
+        self.insert_validation_cache
+            .borrow_mut()
+            .insert(key, info.clone());
+        info
     }
 
     /// Execute a single SQL statement and return the result.
@@ -7907,42 +7929,60 @@ fn eval_insert_expr(db: &GongDB, expr: &Expr) -> Result<Value, GongDBError> {
     eval_expr(db, expr, &scope, None)
 }
 
+fn build_insert_validation_info(table: &TableMeta) -> InsertValidationInfo {
+    let mut pk_columns = HashSet::new();
+    let mut has_check_constraints = false;
+    for constraint in &table.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey(columns) => {
+                for column in columns {
+                    pk_columns.insert(column.value.to_ascii_lowercase());
+                }
+            }
+            TableConstraint::Check(_) => {
+                has_check_constraints = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mut not_null_indices = Vec::new();
+    for (idx, column) in table.columns.iter().enumerate() {
+        let mut not_null = pk_columns.contains(&column.name.to_ascii_lowercase());
+        if !not_null {
+            for constraint in &column.constraints {
+                if matches!(constraint, ColumnConstraint::NotNull | ColumnConstraint::PrimaryKey) {
+                    not_null = true;
+                    break;
+                }
+            }
+        }
+        if not_null {
+            not_null_indices.push(idx);
+        }
+    }
+    InsertValidationInfo {
+        not_null_indices,
+        has_check_constraints,
+    }
+}
+
 fn validate_insert_row(
     db: &GongDB,
     table: &TableMeta,
     row: &[Value],
 ) -> Result<(), GongDBError> {
-    let mut pk_columns = HashSet::new();
-    for constraint in &table.constraints {
-        if let TableConstraint::PrimaryKey(columns) = constraint {
-            for column in columns {
-                pk_columns.insert(column.value.to_lowercase());
-            }
-        }
-    }
-
-    for (idx, column) in table.columns.iter().enumerate() {
-        let mut not_null = false;
-        for constraint in &column.constraints {
-            match constraint {
-                ColumnConstraint::NotNull | ColumnConstraint::PrimaryKey => {
-                    not_null = true;
-                }
-                _ => {}
-            }
-        }
-        if pk_columns.contains(&column.name.to_lowercase()) {
-            not_null = true;
-        }
-        if not_null && matches!(row[idx], Value::Null) {
+    let info = db.insert_validation_info_cached(table);
+    for &idx in &info.not_null_indices {
+        if matches!(row.get(idx), Some(Value::Null)) {
             return Err(GongDBError::constraint(format!(
                 "NOT NULL constraint failed: {}.{}",
-                table.name, column.name
+                table.name, table.columns[idx].name
             )));
         }
     }
 
-    if !table.constraints.is_empty() {
+    if info.has_check_constraints {
         let table_scope = TableScope {
             table_name: Some(table.name.clone()),
             table_alias: None,
