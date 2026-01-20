@@ -1251,7 +1251,7 @@ impl GongDB {
             None
         };
         let cte_context = owned_cte_context.as_ref().or(cte_context);
-        if !select.compounds.is_empty() {
+        let mut result = if !select.compounds.is_empty() {
             let mut result =
                 self.evaluate_select_values_core(select, view_stack, outer, cte_context)?;
             for compound in &select.compounds {
@@ -1306,9 +1306,12 @@ impl GongDB {
                     }
                 }
             }
-            return Ok(result);
-        }
-        self.evaluate_select_values_core(select, view_stack, outer, cte_context)
+            result
+        } else {
+            self.evaluate_select_values_core(select, view_stack, outer, cte_context)?
+        };
+        result.rows = apply_limit_offset_rows(self, select, result.rows)?;
+        Ok(result)
     }
 
     fn evaluate_select_values_core(
@@ -3514,6 +3517,90 @@ fn eval_constant_expr_checked(db: &GongDB, expr: &Expr) -> Result<Value, GongDBE
         column_lookup: None,
     };
     eval_expr(db, expr, &scope, None)
+}
+
+fn eval_limit_offset_value(
+    db: &GongDB,
+    expr: &Expr,
+    label: &str,
+) -> Result<Option<i64>, GongDBError> {
+    if !expr_is_constant(expr) {
+        return Err(GongDBError::new(format!(
+            "{} expression must be constant",
+            label
+        )));
+    }
+    let value = eval_constant_expr_checked(db, expr)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Integer(value) => Ok(Some(value)),
+        Value::Real(value) => Ok(Some(value as i64)),
+        Value::Text(value) => value.parse::<i64>().map(Some).map_err(|_| {
+            GongDBError::new(format!("{} expression must be numeric", label))
+        }),
+        Value::Blob(_) => Err(GongDBError::new(format!(
+            "{} expression must be numeric",
+            label
+        ))),
+    }
+}
+
+fn eval_limit_offset(
+    db: &GongDB,
+    select: &Select,
+) -> Result<(Option<usize>, usize), GongDBError> {
+    let limit = match select.limit.as_ref() {
+        Some(expr) => eval_limit_offset_value(db, expr, "LIMIT")?,
+        None => None,
+    };
+    let offset = match select.offset.as_ref() {
+        Some(expr) => eval_limit_offset_value(db, expr, "OFFSET")?,
+        None => None,
+    };
+    let limit = limit.map(|value| {
+        if value <= 0 {
+            0
+        } else {
+            value as usize
+        }
+    });
+    let offset = offset.unwrap_or(0);
+    let offset = if offset <= 0 { 0 } else { offset as usize };
+    Ok((limit, offset))
+}
+
+fn apply_limit_offset_rows(
+    db: &GongDB,
+    select: &Select,
+    rows: Vec<Vec<Value>>,
+) -> Result<Vec<Vec<Value>>, GongDBError> {
+    if select.limit.is_none() && select.offset.is_none() {
+        return Ok(rows);
+    }
+    let (limit, offset) = eval_limit_offset(db, select)?;
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    let mut skipped = 0usize;
+    let mut taken = 0usize;
+    for row in rows {
+        if skipped < offset {
+            skipped += 1;
+            continue;
+        }
+        if let Some(limit) = limit {
+            if taken >= limit {
+                break;
+            }
+        }
+        output.push(row);
+        taken += 1;
+    }
+    Ok(output)
 }
 
 fn expr_is_constant(expr: &Expr) -> bool {
