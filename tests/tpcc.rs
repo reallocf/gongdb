@@ -62,6 +62,23 @@ fn format_result(name: &str, gongdb_time: f64, rusqlite_time: f64, duckdb_time: 
     );
 }
 
+fn flush_insert_batch<F>(
+    table: &str,
+    batch: &mut Vec<String>,
+    mut exec: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnMut(&str) -> Result<(), Box<dyn std::error::Error>>,
+{
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let sql = format!("INSERT INTO {} VALUES {}", table, batch.join(","));
+    batch.clear();
+    exec(&sql)?;
+    Ok(())
+}
+
 /// TPC-C Benchmark test
 #[test]
 fn test_tpcc_benchmark() {
@@ -397,53 +414,115 @@ fn load_tpcc_data(
     customers_per_district: usize,
     items: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let batch_size = 100;
     // Load warehouses
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        db.run_statement(&format!(
-            "INSERT INTO warehouse VALUES ({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
+        batch.push(format!(
+            "({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
             w_id, w_id
-        ))?;
-    }
-    
-    // Load districts
-    for w_id in 1..=warehouses {
-        for d_id in 1..=districts_per_warehouse {
-            db.run_statement(&format!(
-                "INSERT INTO district VALUES ({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
-                d_id, w_id, d_id
-            ))?;
+        ));
+        if batch.len() >= batch_size {
+            flush_insert_batch("warehouse", &mut batch, |sql| {
+                db.run_statement(sql)?;
+                Ok(())
+            })?;
         }
     }
+    flush_insert_batch("warehouse", &mut batch, |sql| {
+        db.run_statement(sql)?;
+        Ok(())
+    })?;
     
-    // Load customers
+    // Load districts
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
-            for c_id in 1..=customers_per_district {
-                db.run_statement(&format!(
-                    "INSERT INTO customer VALUES ({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
-                    c_id, d_id, w_id, c_id, c_id
-                ))?;
+            batch.push(format!(
+                "({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
+                d_id, w_id, d_id
+            ));
+            if batch.len() >= batch_size {
+                flush_insert_batch("district", &mut batch, |sql| {
+                    db.run_statement(sql)?;
+                    Ok(())
+                })?;
             }
         }
     }
+    flush_insert_batch("district", &mut batch, |sql| {
+        db.run_statement(sql)?;
+        Ok(())
+    })?;
     
-    // Load items
-    for i_id in 1..=items {
-        db.run_statement(&format!(
-            "INSERT INTO item VALUES ({}, {}, 'Item{}', {}, 'Data{}')",
-            i_id, i_id % 100, i_id, 1.0 + (i_id as f64) * 0.01, i_id
-        ))?;
-    }
-    
-    // Load stock
+    // Load customers
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        for i_id in 1..=items {
-            db.run_statement(&format!(
-                "INSERT INTO stock VALUES ({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
-                i_id, w_id, 10 + (i_id % 90)
-            ))?;
+        for d_id in 1..=districts_per_warehouse {
+            for c_id in 1..=customers_per_district {
+                batch.push(format!(
+                    "({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
+                    c_id, d_id, w_id, c_id, c_id
+                ));
+                if batch.len() >= batch_size {
+                    flush_insert_batch("customer", &mut batch, |sql| {
+                        db.run_statement(sql)?;
+                        Ok(())
+                    })?;
+                }
+            }
         }
     }
+    flush_insert_batch("customer", &mut batch, |sql| {
+        db.run_statement(sql)?;
+        Ok(())
+    })?;
+    
+    // Load items
+    let mut batch = Vec::with_capacity(batch_size);
+    for i_id in 1..=items {
+        batch.push(format!(
+            "({}, {}, 'Item{}', {}, 'Data{}')",
+            i_id,
+            i_id % 100,
+            i_id,
+            1.0 + (i_id as f64) * 0.01,
+            i_id
+        ));
+        if batch.len() >= batch_size {
+            flush_insert_batch("item", &mut batch, |sql| {
+                db.run_statement(sql)?;
+                Ok(())
+            })?;
+        }
+    }
+    flush_insert_batch("item", &mut batch, |sql| {
+        db.run_statement(sql)?;
+        Ok(())
+    })?;
+    
+    // Load stock
+    let mut batch = Vec::with_capacity(batch_size);
+    for w_id in 1..=warehouses {
+        for i_id in 1..=items {
+            batch.push(format!(
+                "({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
+                i_id,
+                w_id,
+                10 + (i_id % 90)
+            ));
+            if batch.len() >= batch_size {
+                flush_insert_batch("stock", &mut batch, |sql| {
+                    db.run_statement(sql)?;
+                    Ok(())
+                })?;
+            }
+        }
+    }
+    flush_insert_batch("stock", &mut batch, |sql| {
+        db.run_statement(sql)?;
+        Ok(())
+    })?;
     
     Ok(())
 }
@@ -455,68 +534,115 @@ fn load_tpcc_data_rusqlite(
     customers_per_district: usize,
     items: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let batch_size = 100;
     // Load warehouses
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        conn.execute(
-            &format!(
-                "INSERT INTO warehouse VALUES ({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
-                w_id, w_id
-            ),
-            []
-        )?;
-    }
-    
-    // Load districts
-    for w_id in 1..=warehouses {
-        for d_id in 1..=districts_per_warehouse {
-            conn.execute(
-                &format!(
-                    "INSERT INTO district VALUES ({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
-                    d_id, w_id, d_id
-                ),
-                []
-            )?;
+        batch.push(format!(
+            "({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
+            w_id, w_id
+        ));
+        if batch.len() >= batch_size {
+            flush_insert_batch("warehouse", &mut batch, |sql| {
+                conn.execute(sql, [])?;
+                Ok(())
+            })?;
         }
     }
+    flush_insert_batch("warehouse", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
     
-    // Load customers
+    // Load districts
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
-            for c_id in 1..=customers_per_district {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO customer VALUES ({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
-                        c_id, d_id, w_id, c_id, c_id
-                    ),
-                    []
-                )?;
+            batch.push(format!(
+                "({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
+                d_id, w_id, d_id
+            ));
+            if batch.len() >= batch_size {
+                flush_insert_batch("district", &mut batch, |sql| {
+                    conn.execute(sql, [])?;
+                    Ok(())
+                })?;
             }
         }
     }
+    flush_insert_batch("district", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
     
-    // Load items
-    for i_id in 1..=items {
-        conn.execute(
-            &format!(
-                "INSERT INTO item VALUES ({}, {}, 'Item{}', {}, 'Data{}')",
-                i_id, i_id % 100, i_id, 1.0 + (i_id as f64) * 0.01, i_id
-            ),
-            []
-        )?;
-    }
-    
-    // Load stock
+    // Load customers
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        for i_id in 1..=items {
-            conn.execute(
-                &format!(
-                    "INSERT INTO stock VALUES ({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
-                    i_id, w_id, 10 + (i_id % 90)
-                ),
-                []
-            )?;
+        for d_id in 1..=districts_per_warehouse {
+            for c_id in 1..=customers_per_district {
+                batch.push(format!(
+                    "({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
+                    c_id, d_id, w_id, c_id, c_id
+                ));
+                if batch.len() >= batch_size {
+                    flush_insert_batch("customer", &mut batch, |sql| {
+                        conn.execute(sql, [])?;
+                        Ok(())
+                    })?;
+                }
+            }
         }
     }
+    flush_insert_batch("customer", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
+    
+    // Load items
+    let mut batch = Vec::with_capacity(batch_size);
+    for i_id in 1..=items {
+        batch.push(format!(
+            "({}, {}, 'Item{}', {}, 'Data{}')",
+            i_id,
+            i_id % 100,
+            i_id,
+            1.0 + (i_id as f64) * 0.01,
+            i_id
+        ));
+        if batch.len() >= batch_size {
+            flush_insert_batch("item", &mut batch, |sql| {
+                conn.execute(sql, [])?;
+                Ok(())
+            })?;
+        }
+    }
+    flush_insert_batch("item", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
+    
+    // Load stock
+    let mut batch = Vec::with_capacity(batch_size);
+    for w_id in 1..=warehouses {
+        for i_id in 1..=items {
+            batch.push(format!(
+                "({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
+                i_id,
+                w_id,
+                10 + (i_id % 90)
+            ));
+            if batch.len() >= batch_size {
+                flush_insert_batch("stock", &mut batch, |sql| {
+                    conn.execute(sql, [])?;
+                    Ok(())
+                })?;
+            }
+        }
+    }
+    flush_insert_batch("stock", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
     
     Ok(())
 }
@@ -528,68 +654,115 @@ fn load_tpcc_data_duckdb(
     customers_per_district: usize,
     items: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let batch_size = 100;
     // Load warehouses
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        conn.execute(
-            &format!(
-                "INSERT INTO warehouse VALUES ({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
-                w_id, w_id
-            ),
-            []
-        )?;
-    }
-    
-    // Load districts
-    for w_id in 1..=warehouses {
-        for d_id in 1..=districts_per_warehouse {
-            conn.execute(
-                &format!(
-                    "INSERT INTO district VALUES ({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
-                    d_id, w_id, d_id
-                ),
-                []
-            )?;
+        batch.push(format!(
+            "({}, 'Warehouse{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 300000.0)",
+            w_id, w_id
+        ));
+        if batch.len() >= batch_size {
+            flush_insert_batch("warehouse", &mut batch, |sql| {
+                conn.execute(sql, [])?;
+                Ok(())
+            })?;
         }
     }
+    flush_insert_batch("warehouse", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
     
-    // Load customers
+    // Load districts
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
         for d_id in 1..=districts_per_warehouse {
-            for c_id in 1..=customers_per_district {
-                conn.execute(
-                    &format!(
-                        "INSERT INTO customer VALUES ({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
-                        c_id, d_id, w_id, c_id, c_id
-                    ),
-                    []
-                )?;
+            batch.push(format!(
+                "({}, {}, 'District{}', 'Street1', 'Street2', 'City', 'ST', '12345', 0.0825, 30000.0, 3001)",
+                d_id, w_id, d_id
+            ));
+            if batch.len() >= batch_size {
+                flush_insert_batch("district", &mut batch, |sql| {
+                    conn.execute(sql, [])?;
+                    Ok(())
+                })?;
             }
         }
     }
+    flush_insert_batch("district", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
     
-    // Load items
-    for i_id in 1..=items {
-        conn.execute(
-            &format!(
-                "INSERT INTO item VALUES ({}, {}, 'Item{}', {}, 'Data{}')",
-                i_id, i_id % 100, i_id, 1.0 + (i_id as f64) * 0.01, i_id
-            ),
-            []
-        )?;
-    }
-    
-    // Load stock
+    // Load customers
+    let mut batch = Vec::with_capacity(batch_size);
     for w_id in 1..=warehouses {
-        for i_id in 1..=items {
-            conn.execute(
-                &format!(
-                    "INSERT INTO stock VALUES ({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
-                    i_id, w_id, 10 + (i_id % 90)
-                ),
-                []
-            )?;
+        for d_id in 1..=districts_per_warehouse {
+            for c_id in 1..=customers_per_district {
+                batch.push(format!(
+                    "({}, {}, {}, 'First{}', 'M', 'Last{}', 'Street1', 'Street2', 'City', 'ST', '12345', '555-1234', '2024-01-01', 'GC', 50000.0, 0.05, -10.0, 10.0, 1, 0, 'Data')",
+                    c_id, d_id, w_id, c_id, c_id
+                ));
+                if batch.len() >= batch_size {
+                    flush_insert_batch("customer", &mut batch, |sql| {
+                        conn.execute(sql, [])?;
+                        Ok(())
+                    })?;
+                }
+            }
         }
     }
+    flush_insert_batch("customer", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
+    
+    // Load items
+    let mut batch = Vec::with_capacity(batch_size);
+    for i_id in 1..=items {
+        batch.push(format!(
+            "({}, {}, 'Item{}', {}, 'Data{}')",
+            i_id,
+            i_id % 100,
+            i_id,
+            1.0 + (i_id as f64) * 0.01,
+            i_id
+        ));
+        if batch.len() >= batch_size {
+            flush_insert_batch("item", &mut batch, |sql| {
+                conn.execute(sql, [])?;
+                Ok(())
+            })?;
+        }
+    }
+    flush_insert_batch("item", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
+    
+    // Load stock
+    let mut batch = Vec::with_capacity(batch_size);
+    for w_id in 1..=warehouses {
+        for i_id in 1..=items {
+            batch.push(format!(
+                "({}, {}, {}, 'S_DIST_01', 'S_DIST_02', 'S_DIST_03', 'S_DIST_04', 'S_DIST_05', 'S_DIST_06', 'S_DIST_07', 'S_DIST_08', 'S_DIST_09', 'S_DIST_10', 0, 0, 0, 'S_DATA')",
+                i_id,
+                w_id,
+                10 + (i_id % 90)
+            ));
+            if batch.len() >= batch_size {
+                flush_insert_batch("stock", &mut batch, |sql| {
+                    conn.execute(sql, [])?;
+                    Ok(())
+                })?;
+            }
+        }
+    }
+    flush_insert_batch("stock", &mut batch, |sql| {
+        conn.execute(sql, [])?;
+        Ok(())
+    })?;
     
     Ok(())
 }
@@ -648,6 +821,7 @@ fn run_new_order(
     ))?;
     
     // Create order lines
+    let mut order_line_values = Vec::with_capacity(ol_cnt);
     for ol_number in 1..=ol_cnt {
         let ol_i_id = (txn_id * ol_number) % items + 1;
         let ol_quantity = 1 + (txn_id % 10);
@@ -667,11 +841,11 @@ fn run_new_order(
         
         // Get district info from stock (s_dist_XX where XX = d_id)
         let dist_info = format!("S_DIST_{:02}", d_id);
-        
-        db.run_statement(&format!(
-            "INSERT INTO order_line VALUES ({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
+
+        order_line_values.push(format!(
+            "({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
             o_id, d_id, w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, dist_info
-        ))?;
+        ));
         
         // Update stock (TPC-C spec: update s_quantity, s_ytd, s_order_cnt, s_remote_cnt)
         if ol_supply_w_id != w_id {
@@ -687,6 +861,13 @@ fn run_new_order(
                 ol_quantity, ol_quantity, ol_supply_w_id, ol_i_id
             ))?;
         }
+    }
+
+    if !order_line_values.is_empty() {
+        db.run_statement(&format!(
+            "INSERT INTO order_line VALUES {}",
+            order_line_values.join(",")
+        ))?;
     }
     
     db.run_statement("COMMIT")?;
@@ -745,6 +926,7 @@ fn run_new_order_rusqlite(
         []
     )?;
     
+    let mut order_line_values = Vec::with_capacity(ol_cnt);
     for ol_number in 1..=ol_cnt {
         let ol_i_id = (txn_id * ol_number) % items + 1;
         let ol_quantity = 1 + (txn_id % 10);
@@ -759,14 +941,11 @@ fn run_new_order_rusqlite(
         let item_price = 1.0 + (ol_i_id as f64) * 0.01;
         let ol_amount = item_price * (ol_quantity as f64);
         let dist_info = format!("S_DIST_{:02}", d_id);
-        
-        tx.execute(
-            &format!(
-                "INSERT INTO order_line VALUES ({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
-                o_id, d_id, w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, dist_info
-            ),
-            []
-        )?;
+
+        order_line_values.push(format!(
+            "({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
+            o_id, d_id, w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, dist_info
+        ));
         
         // Update stock (TPC-C spec: update s_quantity, s_ytd, s_order_cnt, s_remote_cnt)
         if ol_supply_w_id != w_id {
@@ -786,6 +965,16 @@ fn run_new_order_rusqlite(
                 []
             )?;
         }
+    }
+
+    if !order_line_values.is_empty() {
+        tx.execute(
+            &format!(
+                "INSERT INTO order_line VALUES {}",
+                order_line_values.join(",")
+            ),
+            []
+        )?;
     }
     
     tx.commit()?;
@@ -840,6 +1029,7 @@ fn run_new_order_duckdb(
         []
     )?;
     
+    let mut order_line_values = Vec::with_capacity(ol_cnt);
     for ol_number in 1..=ol_cnt {
         let ol_i_id = (txn_id * ol_number) % items + 1;
         let ol_quantity = 1 + (txn_id % 10);
@@ -853,14 +1043,11 @@ fn run_new_order_duckdb(
         let item_price = 1.0 + (ol_i_id as f64) * 0.01;
         let ol_amount = item_price * (ol_quantity as f64);
         let dist_info = format!("S_DIST_{:02}", d_id);
-        
-        conn.execute(
-            &format!(
-                "INSERT INTO order_line VALUES ({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
-                o_id, d_id, w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, dist_info
-            ),
-            []
-        )?;
+
+        order_line_values.push(format!(
+            "({}, {}, {}, {}, {}, {}, NULL, {}, {}, '{}')",
+            o_id, d_id, w_id, ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, dist_info
+        ));
         
         if ol_supply_w_id != w_id {
             conn.execute(
@@ -879,6 +1066,16 @@ fn run_new_order_duckdb(
                 []
             )?;
         }
+    }
+
+    if !order_line_values.is_empty() {
+        conn.execute(
+            &format!(
+                "INSERT INTO order_line VALUES {}",
+                order_line_values.join(",")
+            ),
+            []
+        )?;
     }
     
     conn.execute("COMMIT", [])?;

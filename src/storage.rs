@@ -1046,8 +1046,55 @@ impl StorageEngine {
         if rows.is_empty() {
             return Ok(());
         }
+        self.clear_index_eq_cache();
+        let table = self
+            .tables
+            .get(table_name)
+            .ok_or_else(|| StorageError::NotFound(format!("table not found: {}", table_name)))?
+            .clone();
+        let column_map = column_index_map(&table.columns);
+        let indexes: Vec<IndexMeta> = self
+            .indexes
+            .values()
+            .filter(|index| index.table == table_name)
+            .cloned()
+            .collect();
+        let mut page_id = table.last_page;
+        let mut page = self.read_page(page_id)?;
+
         for row in rows {
-            let _ = self.insert_row_with_location_internal(table_name, row, false)?;
+            let mut index_keys = Vec::with_capacity(indexes.len());
+            for index in &indexes {
+                let key = index_key_from_row(index, &column_map, row)?;
+                if index.unique && !key_has_null(&key) && self.index_contains_key(index, &key)? {
+                    return Err(unique_violation(index));
+                }
+                index_keys.push((index.name.clone(), key));
+            }
+
+            let record = encode_row(row)?;
+            if !has_space_for_record(&page, record.len()) {
+                let new_page_id = self.allocate_data_page()?;
+                set_next_page_id(&mut page, new_page_id);
+                self.write_page(page_id, &page)?;
+                page_id = new_page_id;
+                page = init_data_page();
+                if let Some(table) = self.tables.get_mut(table_name) {
+                    table.last_page = new_page_id;
+                }
+            }
+
+            let slot = insert_record(&mut page, &record)?;
+            let location = RowLocation { page_id, slot };
+            for (index_name, key) in index_keys {
+                let entry = IndexEntry { key, row: location };
+                self.insert_index_record(&index_name, &entry)?;
+            }
+        }
+
+        self.write_page(page_id, &page)?;
+        if let Some(table) = self.tables.get_mut(table_name) {
+            table.row_count = table.row_count.saturating_add(rows.len() as u64);
         }
         self.write_catalog()?;
         Ok(())
