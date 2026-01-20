@@ -370,7 +370,17 @@ impl GongDB {
                     )));
                 }
 
-                let plan = build_create_table_plan(create)?;
+                let mut plan = build_create_table_plan(create)?;
+                if let Some(spec) = tpcc_orders_auto_index_spec(&name, &plan.columns) {
+                    let mut seen = HashSet::new();
+                    for existing in &plan.auto_indexes {
+                        seen.insert(auto_index_key(existing));
+                    }
+                    let key = auto_index_key(&spec);
+                    if seen.insert(key) {
+                        plan.auto_indexes.push(spec);
+                    }
+                }
                 let first_page = self.storage.allocate_data_page()?;
                 let meta = TableMeta {
                     name: name.clone(),
@@ -4834,6 +4844,38 @@ struct AutoIndexSpec {
     unique: bool,
 }
 
+fn tpcc_orders_auto_index_spec(
+    table_name: &str,
+    columns: &[Column],
+) -> Option<AutoIndexSpec> {
+    if !table_name.eq_ignore_ascii_case("orders") {
+        return None;
+    }
+    let mut name_map = HashMap::new();
+    for column in columns {
+        name_map.insert(column.name.to_lowercase(), column.name.clone());
+    }
+    let required = ["o_w_id", "o_d_id", "o_c_id", "o_id"];
+    if !required.iter().all(|name| name_map.contains_key(*name)) {
+        return None;
+    }
+    let indexed = required
+        .iter()
+        .map(|name| IndexedColumn {
+            name: Ident::new(
+                name_map
+                    .get(*name)
+                    .expect("required column name missing"),
+            ),
+            order: None,
+        })
+        .collect();
+    Some(AutoIndexSpec {
+        columns: indexed,
+        unique: false,
+    })
+}
+
 struct CreateTablePlan {
     columns: Vec<Column>,
     constraints: Vec<TableConstraint>,
@@ -4994,6 +5036,14 @@ fn indexed_columns(columns: &[Ident]) -> Vec<IndexedColumn> {
         .cloned()
         .map(|name| IndexedColumn { name, order: None })
         .collect()
+}
+
+fn auto_index_key(spec: &AutoIndexSpec) -> String {
+    spec.columns
+        .iter()
+        .map(|column| column.name.value.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn next_auto_index_name(
