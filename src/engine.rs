@@ -1775,9 +1775,8 @@ impl GongDB {
             }
         }
 
-        if named_only && !predicates.is_empty() {
+        if named_only {
             let mut table_infos = Vec::new();
-            let mut base_tables = Vec::new();
             for table_ref in &select.from {
                 if let TableRef::Named { name, alias } = table_ref {
                     let table_name = object_name(name);
@@ -1798,7 +1797,6 @@ impl GongDB {
                                 },
                                 scope: table_scope,
                             });
-                            base_tables.push(false);
                             continue;
                         }
                     }
@@ -1813,54 +1811,18 @@ impl GongDB {
                             },
                             scope: table_scope,
                         });
-                        base_tables.push(true);
                         continue;
                     }
                 }
                 let source = self.resolve_table_ref(table_ref, view_stack, cte_context)?;
                 let scope = source.table_scope.clone();
                 table_infos.push(TableInfo { source, scope });
-                base_tables.push(false);
-            }
-
-            let mut local_predicates = vec![Vec::new(); table_infos.len()];
-            let mut remaining_predicates = Vec::new();
-            for predicate in predicates {
-                if let Some(refs) = predicate_table_refs(&predicate, &table_infos) {
-                    if refs.len() == 1 && base_tables[refs[0]] {
-                        local_predicates[refs[0]].push(predicate);
-                        continue;
-                    }
-                }
-                remaining_predicates.push(predicate);
-            }
-
-            for (idx, info) in table_infos.iter_mut().enumerate() {
-                if !base_tables[idx] {
-                    continue;
-                }
-                let table_name = info
-                    .source
-                    .table_scope
-                    .table_name
-                    .as_ref()
-                    .expect("base table name");
-                let selection = combine_predicates(&local_predicates[idx]);
-                let (rows, _) = self.scan_table_rows(
-                    table_name,
-                    info.source.table_scope.table_alias.as_deref(),
-                    selection.as_ref(),
-                    &[],
-                    outer,
-                    cte_context,
-                )?;
-                info.source.rows = rows;
             }
 
             let ordered_scopes = table_infos.iter().map(|info| info.scope.clone()).collect();
             return self.resolve_join_plan(
                 table_infos,
-                remaining_predicates,
+                predicates,
                 ordered_scopes,
                 outer,
                 cte_context,
@@ -2192,7 +2154,19 @@ impl GongDB {
         let table_count = tables.len();
         let table_stats: Vec<TableStats> = tables
             .iter()
-            .map(|info| compute_table_stats(&info.source.columns, &info.source.rows))
+            .map(|info| {
+                if info.source.rows.is_empty() {
+                    if let Some(table_name) = info.source.table_scope.table_name.as_ref() {
+                        if let Some(table) = self.storage.get_table(table_name) {
+                            return TableStats {
+                                row_count: table.row_count as usize,
+                                column_stats: HashMap::new(),
+                            };
+                        }
+                    }
+                }
+                compute_table_stats(&info.source.columns, &info.source.rows)
+            })
             .collect();
 
         let mut remaining: Vec<PredicateInfo> = predicates
@@ -2286,24 +2260,37 @@ impl GongDB {
                     .unwrap()
             });
 
-            let right = apply_predicates_to_source(
-                self,
-                sources[idx].take().unwrap(),
-                extract_local_predicates(&mut remaining, idx),
-                outer,
-                cte_context,
-            )?;
-
+            let right_source = sources[idx].take().unwrap();
+            let right_local_predicates = extract_local_predicates(&mut remaining, idx);
             let new_joined = extend_joined(&joined, idx);
-            let join_predicates = extract_predicates_for_tables(&mut remaining, &new_joined);
-            current = join_sources_with_predicates(
-                self,
-                current,
-                right,
-                join_predicates,
-                outer,
-                cte_context,
-            )?;
+            let mut join_predicates = extract_predicates_for_tables(&mut remaining, &new_joined);
+            if can_use_index_lookup(self, &current, &right_source, &join_predicates) {
+                join_predicates.extend(right_local_predicates);
+                current = join_sources_with_predicates(
+                    self,
+                    current,
+                    right_source,
+                    join_predicates,
+                    outer,
+                    cte_context,
+                )?;
+            } else {
+                let right = apply_predicates_to_source(
+                    self,
+                    right_source,
+                    right_local_predicates,
+                    outer,
+                    cte_context,
+                )?;
+                current = join_sources_with_predicates(
+                    self,
+                    current,
+                    right,
+                    join_predicates,
+                    outer,
+                    cte_context,
+                )?;
+            }
             joined.insert(idx);
             current_est_rows = best_est_rows;
         }
@@ -3874,9 +3861,6 @@ fn apply_predicates_to_source(
     outer: Option<&EvalScope<'_>>,
     cte_context: Option<&CteContext>,
 ) -> Result<QuerySource, GongDBError> {
-    if predicates.is_empty() {
-        return Ok(source);
-    }
     let mut remaining = Vec::with_capacity(predicates.len());
     for predicate in predicates {
         if expr_is_constant(&predicate) {
@@ -3891,25 +3875,27 @@ fn apply_predicates_to_source(
             remaining.push(predicate);
         }
     }
-    if remaining.is_empty() {
-        return Ok(source);
-    }
+    let selection = combine_predicates(&remaining);
     if let Some(table_name) = source.table_scope.table_name.as_ref() {
         let cte_match = cte_context
             .and_then(|ctes| ctes.get(table_name))
             .is_some();
         if !cte_match && db.storage.get_table(table_name).is_some() {
-            let selection = combine_predicates(&remaining);
-            let (rows, _) = db.scan_table_rows(
-                table_name,
-                source.table_scope.table_alias.as_deref(),
-                selection.as_ref(),
-                &[],
-                outer,
-                cte_context,
-            )?;
-            return Ok(QuerySource { rows, ..source });
+            if selection.is_some() || source.rows.is_empty() {
+                let (rows, _) = db.scan_table_rows(
+                    table_name,
+                    source.table_scope.table_alias.as_deref(),
+                    selection.as_ref(),
+                    &[],
+                    outer,
+                    cte_context,
+                )?;
+                return Ok(QuerySource { rows, ..source });
+            }
         }
+    }
+    if remaining.is_empty() {
+        return Ok(source);
     }
     let table_scope = source.table_scope.clone();
     let column_lookup = build_column_lookup(&source.columns, &source.column_scopes);
@@ -3951,6 +3937,85 @@ fn combine_predicates(predicates: &[Expr]) -> Option<Expr> {
     }))
 }
 
+struct IndexLookupPlan {
+    index_name: String,
+    left_key_indices: Vec<usize>,
+}
+
+fn index_lookup_plan_for_pairs(
+    db: &GongDB,
+    right_scope: &TableScope,
+    right_columns: &[Column],
+    join_pairs: &[(usize, usize)],
+) -> Option<IndexLookupPlan> {
+    let table_name = right_scope.table_name.as_ref()?;
+    let mut indexes: Vec<IndexMeta> = db
+        .storage
+        .list_indexes()
+        .into_iter()
+        .filter(|index| index.table.eq_ignore_ascii_case(table_name))
+        .collect();
+    if indexes.is_empty() {
+        return None;
+    }
+    indexes.sort_by(|a, b| {
+        b.unique
+            .cmp(&a.unique)
+            .then_with(|| a.columns.len().cmp(&b.columns.len()))
+    });
+    let mut right_to_left = HashMap::new();
+    for (left_idx, right_idx) in join_pairs {
+        right_to_left.insert(*right_idx, *left_idx);
+    }
+    for index in &indexes {
+        if index.columns.len() != join_pairs.len() {
+            continue;
+        }
+        let mut left_key_indices = Vec::with_capacity(index.columns.len());
+        let mut matches = true;
+        for column in &index.columns {
+            let Some(right_idx) = resolve_column_index(&column.name.value, right_columns) else {
+                matches = false;
+                break;
+            };
+            let Some(left_idx) = right_to_left.get(&right_idx) else {
+                matches = false;
+                break;
+            };
+            left_key_indices.push(*left_idx);
+        }
+        if matches {
+            return Some(IndexLookupPlan {
+                index_name: index.name.clone(),
+                left_key_indices,
+            });
+        }
+    }
+    None
+}
+
+fn can_use_index_lookup(
+    db: &GongDB,
+    left: &QuerySource,
+    right: &QuerySource,
+    join_predicates: &[Expr],
+) -> bool {
+    if !right.rows.is_empty() {
+        return false;
+    }
+    let (join_pairs, _) = extract_join_pairs(
+        join_predicates,
+        &left.columns,
+        &left.column_scopes,
+        &right.columns,
+        &right.column_scopes,
+    );
+    if join_pairs.is_empty() {
+        return false;
+    }
+    index_lookup_plan_for_pairs(db, &right.table_scope, &right.columns, &join_pairs).is_some()
+}
+
 fn join_sources_with_predicates(
     db: &GongDB,
     left: QuerySource,
@@ -3969,6 +4034,7 @@ fn join_sources_with_predicates(
         columns: right_columns,
         column_scopes: right_scopes,
         rows: right_rows,
+        table_scope: right_table_scope,
         ..
     } = right;
     let left_len = left_columns.len();
@@ -4009,6 +4075,69 @@ fn join_sources_with_predicates(
         Some(build_column_lookup(&columns, &column_scopes))
     };
     let mut rows = Vec::new();
+    if !join_pairs.is_empty() && right_rows.is_empty() {
+        if let Some(plan) = index_lookup_plan_for_pairs(
+            db,
+            &right_table_scope,
+            &columns[left_len..],
+            &join_pairs,
+        ) {
+            for left_row in &left_rows {
+                let mut key = Vec::with_capacity(plan.left_key_indices.len());
+                let mut has_null = false;
+                for idx in &plan.left_key_indices {
+                    let value = &left_row[*idx];
+                    if matches!(value, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    key.push(value.clone());
+                }
+                if has_null {
+                    continue;
+                }
+                let right_matches = db.storage.scan_index_rows(
+                    &plan.index_name,
+                    Some(&key),
+                    Some(&key),
+                    false,
+                )?;
+                for right_row in right_matches {
+                    let mut combined = Vec::with_capacity(left_row.len() + right_row.len());
+                    combined.extend(left_row.iter().cloned());
+                    combined.extend(right_row.iter().cloned());
+                    if !remaining_predicates.is_empty() {
+                        let scope = EvalScope {
+                            columns: &columns,
+                            column_scopes: &column_scopes,
+                            row: &combined,
+                            table_scope: &table_scope,
+                            cte_context,
+                            column_lookup: column_lookup.as_ref(),
+                        };
+                        let mut keep = true;
+                        for predicate in &remaining_predicates {
+                            let value = eval_expr(db, predicate, &scope, outer)?;
+                            if !value_to_bool(&value) {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        if !keep {
+                            continue;
+                        }
+                    }
+                    rows.push(combined);
+                }
+            }
+            return Ok(QuerySource {
+                columns,
+                column_scopes,
+                rows,
+                table_scope,
+            });
+        }
+    }
     if join_pairs.is_empty() {
         for left_row in &left_rows {
             for right_row in &right_rows {
